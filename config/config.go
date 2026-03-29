@@ -194,6 +194,7 @@ func Load() (*Config, error) {
 		// Environment variable bindings
 		viper.BindEnv("models.anthropic.api_key", "ANTHROPIC_API_KEY")   //nolint:errcheck
 		viper.BindEnv("models.openai.api_key", "OPENAI_API_KEY")         //nolint:errcheck
+		viper.BindEnv("models.openai.base_url", "OPENAI_BASE_URL")       //nolint:errcheck         //nolint:errcheck
 
 		if err := viper.ReadInConfig(); err != nil {
 			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
