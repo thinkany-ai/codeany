@@ -2,67 +2,187 @@ package tui
 
 import "github.com/charmbracelet/lipgloss"
 
-var (
-	// Colors
-	ColorPrimary   = lipgloss.Color("#7C3AED") // purple
-	ColorSecondary = lipgloss.Color("#2563EB") // blue
-	ColorSuccess   = lipgloss.Color("#10B981") // green
-	ColorWarning   = lipgloss.Color("#F59E0B") // amber
-	ColorError     = lipgloss.Color("#EF4444") // red
-	ColorMuted     = lipgloss.Color("#6B7280") // gray
-	ColorText      = lipgloss.Color("#E5E7EB") // light gray
+// Design system — modern dark theme inspired by VS Code / Warp terminal
+//
+// Background palette (dark):  #0D1117 → #161B22 → #21262D
+// Accent: soft indigo/violet  #818CF8
+// User msg:  slate blue       #3B82F6
+// Assistant: neutral text     #E6EDF3
+// Tool:      amber            #F59E0B
+// Error:     rose             #F87171
+// Success:   emerald          #34D399
+// Muted:     gray             #8B949E
 
-	// Styles
+var (
+	// Base colors (hex strings — universally supported by lipgloss)
+	clrBg0     = lipgloss.Color("#0D1117") // deepest bg
+	clrBg1     = lipgloss.Color("#161B22") // panel bg
+	clrBg2     = lipgloss.Color("#21262D") // input / statusbar bg
+	clrBg3     = lipgloss.Color("#30363D") // borders
+	clrText    = lipgloss.Color("#E6EDF3") // primary text
+	clrMuted   = lipgloss.Color("#8B949E") // secondary text
+	clrAccent  = lipgloss.Color("#818CF8") // indigo accent (header, borders)
+	clrUser    = lipgloss.Color("#3B82F6") // blue for user bubble
+	clrSuccess = lipgloss.Color("#34D399") // emerald
+	clrWarning = lipgloss.Color("#F59E0B") // amber
+	clrError   = lipgloss.Color("#F87171") // rose
+	clrTool    = lipgloss.Color("#FB923C") // orange for tool calls
+
+	// ── Message labels ──────────────────────────────────────────────────────
+	UserLabel      lipgloss.Style
+	AssistantLabel lipgloss.Style
+
+	// ── Message bodies ──────────────────────────────────────────────────────
 	UserBubble      lipgloss.Style
 	AssistantBubble lipgloss.Style
-	ToolStyle       lipgloss.Style
+
+	// ── Tool call display ───────────────────────────────────────────────────
+	ToolHeaderStyle  lipgloss.Style
+	ToolResultStyle  lipgloss.Style
+	ToolErrorStyle   lipgloss.Style
+
+	// ── Status bar ──────────────────────────────────────────────────────────
 	StatusBar       lipgloss.Style
-	InputStyle      lipgloss.Style
-	ErrorStyle      lipgloss.Style
-	HeaderStyle     lipgloss.Style
-	MutedStyle      lipgloss.Style
+	StatusModel     lipgloss.Style
+	StatusTokens    lipgloss.Style
+	StatusDir       lipgloss.Style
+	StatusMode      lipgloss.Style
+
+	// ── Input box ───────────────────────────────────────────────────────────
+	InputStyle       lipgloss.Style
+	InputFocusStyle  lipgloss.Style
+
+	// ── Misc ────────────────────────────────────────────────────────────────
+	HeaderStyle  lipgloss.Style
+	ErrorStyle   lipgloss.Style
+	SuccessStyle lipgloss.Style
+	MutedStyle   lipgloss.Style
+	BoldStyle    lipgloss.Style
+	HintStyle    lipgloss.Style
+
+	// Legacy aliases (keep existing code compiling)
+	ToolStyle lipgloss.Style
 )
 
 func init() {
+	// ── Labels ──────────────────────────────────────────────────────────────
+	UserLabel = lipgloss.NewStyle().
+		Foreground(clrUser).
+		Bold(true)
+
+	AssistantLabel = lipgloss.NewStyle().
+		Foreground(clrAccent).
+		Bold(true)
+
+	// ── User bubble: right-aligned, blue pill ────────────────────────────────
 	UserBubble = lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#FFFFFF")).
-		Background(ColorSecondary).
-		Padding(0, 1).
-		MarginLeft(4).
-		Align(lipgloss.Right)
-
-	AssistantBubble = lipgloss.NewStyle().
-		Foreground(ColorText).
-		PaddingLeft(1).
-		MarginRight(4)
-
-	ToolStyle = lipgloss.NewStyle().
-		Foreground(ColorMuted).
+		Background(clrUser).
 		PaddingLeft(2).
-		Italic(true)
+		PaddingRight(2).
+		PaddingTop(0).
+		PaddingBottom(0).
+		MarginLeft(8)
 
+	// ── Assistant: plain text, left-padded ──────────────────────────────────
+	AssistantBubble = lipgloss.NewStyle().
+		Foreground(clrText).
+		PaddingLeft(2)
+
+	// ── Tool calls ──────────────────────────────────────────────────────────
+	ToolHeaderStyle = lipgloss.NewStyle().
+		Foreground(clrTool).
+		Bold(true).
+		PaddingLeft(2)
+
+	ToolResultStyle = lipgloss.NewStyle().
+		Foreground(clrMuted).
+		PaddingLeft(4)
+
+	ToolErrorStyle = lipgloss.NewStyle().
+		Foreground(clrError).
+		PaddingLeft(4)
+
+	ToolStyle = ToolHeaderStyle // legacy alias
+
+	// ── Status bar ──────────────────────────────────────────────────────────
 	StatusBar = lipgloss.NewStyle().
-		Foreground(ColorText).
-		Background(lipgloss.Color("#1F2937")).
-		Padding(0, 1).
-		Width(80)
-
-	InputStyle = lipgloss.NewStyle().
-		Foreground(ColorText).
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(ColorPrimary).
+		Background(clrBg2).
+		Foreground(clrMuted).
 		Padding(0, 1)
+
+	StatusModel = lipgloss.NewStyle().
+		Background(clrBg2).
+		Foreground(clrAccent).
+		Bold(true).
+		PaddingRight(1)
+
+	StatusTokens = lipgloss.NewStyle().
+		Background(clrBg2).
+		Foreground(clrMuted)
+
+	StatusDir = lipgloss.NewStyle().
+		Background(clrBg2).
+		Foreground(clrBg3) // dimmed, just context
+
+	StatusMode = lipgloss.NewStyle().
+		Background(clrBg2).
+		Foreground(clrSuccess)
+
+	// ── Input box ───────────────────────────────────────────────────────────
+	// Use NormalBorder instead of RoundedBorder to avoid the ANSI escape issue
+	// on some terminals that don't support extended RGB in border rendering.
+	InputStyle = lipgloss.NewStyle().
+		Foreground(clrText).
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(clrBg3).
+		Padding(0, 1)
+
+	InputFocusStyle = lipgloss.NewStyle().
+		Foreground(clrText).
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(clrAccent).
+		Padding(0, 1)
+
+	// ── Misc ────────────────────────────────────────────────────────────────
+	HeaderStyle = lipgloss.NewStyle().
+		Foreground(clrAccent).
+		Bold(true)
 
 	ErrorStyle = lipgloss.NewStyle().
-		Foreground(ColorError).
+		Foreground(clrError).
 		Bold(true).
-		PaddingLeft(1)
+		PaddingLeft(2)
 
-	HeaderStyle = lipgloss.NewStyle().
-		Foreground(ColorPrimary).
-		Bold(true).
-		Padding(0, 1)
+	SuccessStyle = lipgloss.NewStyle().
+		Foreground(clrSuccess)
 
 	MutedStyle = lipgloss.NewStyle().
-		Foreground(ColorMuted)
+		Foreground(clrMuted)
+
+	BoldStyle = lipgloss.NewStyle().
+		Foreground(clrText).
+		Bold(true)
+
+	HintStyle = lipgloss.NewStyle().
+		Foreground(clrMuted).
+		Italic(true)
+}
+
+// ColorFor returns a status-appropriate color string.
+func ColorFor(kind string) lipgloss.Color {
+	switch kind {
+	case "error":
+		return clrError
+	case "success":
+		return clrSuccess
+	case "warning":
+		return clrWarning
+	case "tool":
+		return clrTool
+	case "accent":
+		return clrAccent
+	default:
+		return clrMuted
+	}
 }

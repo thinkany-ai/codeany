@@ -399,13 +399,22 @@ func (a *App) renderStatusBar() string {
 
 // renderInput renders the input area at the bottom.
 func (a *App) renderInput() string {
-	prompt := "> "
+	var prompt, content string
 	if a.pendingPermission != nil {
-		prompt = "[y/n] > "
+		prompt = MutedStyle.Render("[y/n] ")
+		content = a.input
+	} else if a.running {
+		prompt = MutedStyle.Render("  ")
+		content = MutedStyle.Render("processing...")
+	} else {
+		prompt = MutedStyle.Render("> ")
+		content = a.input
 	}
 
-	display := prompt + a.input + "_"
-	return InputStyle.Width(a.width - 2).Render(display)
+	// Use a block cursor (safer than injecting escape codes)
+	cursor := "█"
+	line := prompt + content + MutedStyle.Render(cursor)
+	return InputFocusStyle.Width(a.width - 2).Render(line)
 }
 
 // formatToolInput formats a tool input map for display.
