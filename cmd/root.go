@@ -60,6 +60,39 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
+	// First run: config was just created — show setup guide
+	if cfg.FirstRun {
+		fmt.Fprintf(os.Stderr, `
+╔══════════════════════════════════════════════════════════════╗
+║           Welcome to CodeAny! 👋  First-time setup          ║
+╚══════════════════════════════════════════════════════════════╝
+
+A config file has been created at:
+  %s
+
+Open it and add your API key, then run codeany again.
+
+Quick start options:
+  • Anthropic Claude (recommended):
+      export ANTHROPIC_API_KEY="sk-ant-..."
+      codeany
+
+  • OpenAI:
+      export OPENAI_API_KEY="sk-..."
+      codeany -m gpt-4o
+
+  • Local (Ollama, no API key needed):
+      ollama pull llama3.2
+      # set base_url in config, then:
+      codeany -m llama3.2
+
+  • Edit config directly:
+      %s
+
+`, config.ConfigFile(), "open "+config.ConfigFile())
+		return nil
+	}
+
 	// Apply flag overrides
 	if flagDir != "" {
 		cfg.WorkingDir = flagDir

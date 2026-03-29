@@ -26,13 +26,14 @@ type Config struct {
 	PrintMode  bool   `mapstructure:"-"`
 	NoMemory   bool   `mapstructure:"-"`
 	NoLSP      bool   `mapstructure:"-"`
+	FirstRun   bool   `mapstructure:"-"` // true when config was just created
 }
 
 // MCPServerConfig defines an MCP server entry.
 type MCPServerConfig struct {
-	Name    string   `mapstructure:"name"`
-	Command string   `mapstructure:"command"`
-	Args    []string `mapstructure:"args"`
+	Name    string            `mapstructure:"name"`
+	Command string            `mapstructure:"command"`
+	Args    []string          `mapstructure:"args"`
 	Env     map[string]string `mapstructure:"env"`
 }
 
@@ -58,6 +59,77 @@ var (
 	once         sync.Once
 )
 
+// defaultConfigTemplate is written to ~/.codeany/config.yaml on first run.
+const defaultConfigTemplate = `# CodeAny configuration
+# Docs: https://github.com/thinkany-ai/codeany
+#
+# ─── Quick Start ──────────────────────────────────────────────────────────────
+#
+#  Option A — Anthropic Claude (default):
+#    1. Get a key at https://console.anthropic.com
+#    2. Set api_key below or: export ANTHROPIC_API_KEY="sk-ant-..."
+#    3. Run: codeany
+#
+#  Option B — OpenAI:
+#    1. Set openai.api_key below or: export OPENAI_API_KEY="sk-..."
+#    2. Run: codeany -m gpt-4o
+#
+#  Option C — Local model (Ollama, no internet needed):
+#    1. Install Ollama: https://ollama.ai
+#    2. Pull a model: ollama pull llama3.2
+#    3. Set openai.base_url to http://localhost:11434/v1
+#    4. Run: codeany -m llama3.2
+#
+#  Option D — OpenAI-compatible providers (DeepSeek, Qwen, etc.):
+#    Set openai.api_key + openai.base_url for your provider
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Default model. Examples:
+#   Anthropic : claude-sonnet-4-5 | claude-opus-4-5
+#   OpenAI    : gpt-4o | gpt-4o-mini | o3
+#   DeepSeek  : deepseek-chat | deepseek-coder
+#   Qwen      : qwen-max | qwen-turbo
+#   Ollama    : llama3.2 | mistral | phi4
+default_model: claude-sonnet-4-5
+
+# Permission mode: default | auto | plan
+permission_mode: default
+
+# Agent settings
+max_iterations: 25
+compact_threshold: 0.85
+
+# Features
+memory_enabled: true
+lsp_enabled: true
+
+models:
+  anthropic:
+    # Anthropic API key (claude-* models)
+    # Override with env: ANTHROPIC_API_KEY
+    api_key: ""
+
+  openai:
+    # OpenAI or OpenAI-compatible API key
+    # Override with env: OPENAI_API_KEY
+    api_key: ""
+
+    # Base URL — change for other providers:
+    #   OpenAI (default) : https://api.openai.com/v1
+    #   Ollama (local)   : http://localhost:11434/v1
+    #   DeepSeek         : https://api.deepseek.com/v1
+    #   Qwen             : https://dashscope.aliyuncs.com/compatible-mode/v1
+    #   Groq             : https://api.groq.com/openai/v1
+    #   Together AI      : https://api.together.xyz/v1
+    base_url: "https://api.openai.com/v1"
+
+# MCP servers (optional)
+# mcp_servers:
+#   - name: filesystem
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+`
+
 // HomeDir returns the codeany home directory (~/.codeany).
 func HomeDir() string {
 	home, err := os.UserHomeDir()
@@ -67,7 +139,13 @@ func HomeDir() string {
 	return filepath.Join(home, ".codeany")
 }
 
+// ConfigFile returns the path to the config file.
+func ConfigFile() string {
+	return filepath.Join(HomeDir(), "config.yaml")
+}
+
 // Load reads and returns the application config.
+// If no config file exists, it creates one and sets cfg.FirstRun = true.
 func Load() (*Config, error) {
 	var loadErr error
 	once.Do(func() {
@@ -92,6 +170,14 @@ func Load() (*Config, error) {
 			return
 		}
 
+		// Auto-create config file on first run
+		cfgFile := ConfigFile()
+		if _, err := os.Stat(cfgFile); os.IsNotExist(err) {
+			if writeErr := os.WriteFile(cfgFile, []byte(defaultConfigTemplate), 0600); writeErr == nil {
+				globalConfig.FirstRun = true
+			}
+		}
+
 		viper.SetConfigName("config")
 		viper.SetConfigType("yaml")
 		viper.AddConfigPath(configDir)
@@ -106,8 +192,8 @@ func Load() (*Config, error) {
 		viper.SetDefault("models.openai.base_url", globalConfig.Models.OpenAI.BaseURL)
 
 		// Environment variable bindings
-		viper.BindEnv("models.anthropic.api_key", "ANTHROPIC_API_KEY")
-		viper.BindEnv("models.openai.api_key", "OPENAI_API_KEY")
+		viper.BindEnv("models.anthropic.api_key", "ANTHROPIC_API_KEY")   //nolint:errcheck
+		viper.BindEnv("models.openai.api_key", "OPENAI_API_KEY")         //nolint:errcheck
 
 		if err := viper.ReadInConfig(); err != nil {
 			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -124,13 +210,24 @@ func Load() (*Config, error) {
 	return globalConfig, loadErr
 }
 
-// Get returns the global config. Must call Load() first.
+// Get returns the global config (loads if needed).
 func Get() *Config {
 	if globalConfig == nil {
 		cfg, _ := Load()
 		return cfg
 	}
 	return globalConfig
+}
+
+// HasAPIKey returns true if any usable API key is configured.
+func (c *Config) HasAPIKey() bool {
+	if c.Models.Anthropic.APIKey != "" || os.Getenv("ANTHROPIC_API_KEY") != "" {
+		return true
+	}
+	if c.Models.OpenAI.APIKey != "" || os.Getenv("OPENAI_API_KEY") != "" {
+		return true
+	}
+	return false
 }
 
 // MemoryDir returns the memory directory for the current project.
