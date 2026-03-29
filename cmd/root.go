@@ -76,31 +76,62 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	cfg.NoMemory = flagNoMem
 	cfg.NoLSP = flagNoLSP
 
-	// Resolve API key
-	apiKey := cfg.Models.Anthropic.APIKey
-	baseURL := cfg.Models.OpenAI.BaseURL
-	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+	// Resolve API keys (config file > env vars)
+	anthropicKey := cfg.Models.Anthropic.APIKey
+	if anthropicKey == "" {
+		anthropicKey = os.Getenv("ANTHROPIC_API_KEY")
 	}
 	openaiKey := cfg.Models.OpenAI.APIKey
 	if openaiKey == "" {
 		openaiKey = os.Getenv("OPENAI_API_KEY")
 	}
+	// Also check generic key env (for OpenAI-compatible providers)
+	if openaiKey == "" {
+		openaiKey = os.Getenv("OPENAI_COMPATIBLE_API_KEY")
+	}
+	baseURL := cfg.Models.OpenAI.BaseURL
 
-	// Create LLM client
+	// Create LLM client based on model name or provider config
 	model := cfg.DefaultModel
 	var client llm.Client
-	if isOpenAI(model) {
+	if isAnthropicModel(model) {
+		if anthropicKey == "" {
+			return fmt.Errorf(`no Anthropic API key found.
+
+Set it via environment variable:
+  export ANTHROPIC_API_KEY="sk-ant-..."
+
+Or in config file (~/.codeany/config.yaml):
+  models:
+    anthropic:
+      api_key: "sk-ant-..."
+
+Get a key at: https://console.anthropic.com`)
+		}
+		client = llm.NewAnthropicClient(model, anthropicKey)
+	} else {
+		// OpenAI or OpenAI-compatible (any other model)
 		if openaiKey == "" {
-			return fmt.Errorf("OPENAI_API_KEY not set. Set it in env or ~/.codeany/config.yaml")
+			return fmt.Errorf(`no API key found for model "%s".
+
+For OpenAI models, set:
+  export OPENAI_API_KEY="sk-..."
+
+For OpenAI-compatible providers (Ollama, DeepSeek, Qwen, etc.), set:
+  export OPENAI_API_KEY="your-key"
+
+And configure base URL in ~/.codeany/config.yaml:
+  models:
+    openai:
+      api_key: "your-key"
+      base_url: "http://localhost:11434/v1"  # Ollama example
+
+Supported model prefixes: gpt-, o1-, o3-, o4-, deepseek-, qwen-, gemini-, llama, mistral, phi, etc.
+To use Anthropic models, set ANTHROPIC_API_KEY and use: claude-*`, model)
 		}
 		client = llm.NewOpenAIClient(model, openaiKey, baseURL)
-	} else {
-		if apiKey == "" {
-			return fmt.Errorf("ANTHROPIC_API_KEY not set. Set it in env or ~/.codeany/config.yaml")
-		}
-		client = llm.NewAnthropicClient(model, apiKey)
 	}
+	apiKey := anthropicKey // keep for permission manager
 
 	// Create permission manager
 	permMode := permissions.Mode(cfg.PermissionMode)
@@ -148,13 +179,10 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func isOpenAI(model string) bool {
-	for _, prefix := range []string{"gpt-", "o1-", "o3-", "o4-"} {
-		if strings.HasPrefix(model, prefix) {
-			return true
-		}
-	}
-	return false
+// isAnthropicModel returns true for Claude models (use Anthropic API).
+// Everything else is treated as OpenAI-compatible.
+func isAnthropicModel(model string) bool {
+	return strings.HasPrefix(model, "claude-")
 }
 
 // SetVersion sets the version string (called from main.go with ldflags value).
