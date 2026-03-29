@@ -5,17 +5,17 @@ REPO="thinkany-ai/codeany"
 BINARY="codeany"
 INSTALL_DIR="/usr/local/bin"
 
-# Colors
+# Colors (output to stderr so they don't pollute stdout captures)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-info()    { printf "${BLUE}[codeany]${NC} %s\n" "$1"; }
-success() { printf "${GREEN}[codeany]${NC} %s\n" "$1"; }
-warn()    { printf "${YELLOW}[codeany]${NC} %s\n" "$1"; }
-error()   { printf "${RED}[codeany]${NC} %s\n" "$1" >&2; exit 1; }
+info()    { printf "${BLUE}[codeany]${NC} %s\n" "$1" >&2; }
+success() { printf "${GREEN}[codeany]${NC} %s\n" "$1" >&2; }
+warn()    { printf "${YELLOW}[codeany]${NC} %s\n" "$1" >&2; }
+error()   { printf "${RED}[codeany]${NC} ERROR: %s\n" "$1" >&2; exit 1; }
 
 # Detect OS and arch
 detect_platform() {
@@ -54,7 +54,7 @@ get_latest_version() {
     fi
 }
 
-# Download binary
+# Download binary to a temp file, print path to stdout
 download_binary() {
     FILENAME="${BINARY}_${PLATFORM}"
     if [ "$OS" = "windows" ]; then
@@ -66,22 +66,23 @@ download_binary() {
     TMP_FILE="${TMP_DIR}/${BINARY}"
 
     info "Downloading ${BINARY} ${VERSION} for ${PLATFORM}..."
+    info "URL: ${URL}"
 
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$URL" -o "$TMP_FILE" || error "Download failed: $URL"
+        curl -fsSL "$URL" -o "$TMP_FILE" || error "Download failed. Is v${VERSION} released? Check: https://github.com/${REPO}/releases"
     else
-        wget -qO "$TMP_FILE" "$URL" || error "Download failed: $URL"
+        wget -qO "$TMP_FILE" "$URL" || error "Download failed. Check: https://github.com/${REPO}/releases"
     fi
 
     chmod +x "$TMP_FILE"
-    echo "$TMP_FILE"
+    # Only print the path to stdout — all other output above goes to stderr
+    printf "%s" "$TMP_FILE"
 }
 
 # Install binary
 install_binary() {
     TMP_FILE="$1"
 
-    # Try /usr/local/bin first, fallback to ~/bin
     if [ -w "$INSTALL_DIR" ]; then
         mv "$TMP_FILE" "${INSTALL_DIR}/${BINARY}"
         success "Installed to ${INSTALL_DIR}/${BINARY}"
@@ -93,7 +94,7 @@ install_binary() {
         mkdir -p "$LOCAL_BIN"
         mv "$TMP_FILE" "${LOCAL_BIN}/${BINARY}"
         success "Installed to ${LOCAL_BIN}/${BINARY}"
-        warn "Add ~/.local/bin to your PATH: export PATH=\"\$HOME/.local/bin:\$PATH\""
+        warn "Add to PATH: export PATH=\"\$HOME/.local/bin:\$PATH\""
     fi
 }
 
@@ -101,16 +102,16 @@ install_binary() {
 verify_install() {
     if command -v "$BINARY" >/dev/null 2>&1; then
         INSTALLED_VERSION=$("$BINARY" --version 2>/dev/null || echo "unknown")
-        success "✓ ${BINARY} installed successfully! (${INSTALLED_VERSION})"
+        success "✓ ${BINARY} installed! (${INSTALLED_VERSION})"
     else
-        warn "${BINARY} installed but not found in PATH. You may need to restart your shell."
+        warn "${BINARY} installed but not in PATH. Restart your shell or run: hash -r"
     fi
 }
 
 main() {
-    printf "\n"
+    printf "\n" >&2
     info "Installing CodeAny - AI Coding Agent"
-    printf "\n"
+    printf "\n" >&2
 
     detect_platform
     info "Platform: ${PLATFORM}"
@@ -122,15 +123,15 @@ main() {
     install_binary "$TMP_FILE"
     verify_install
 
-    printf "\n"
+    printf "\n" >&2
     success "🎉 CodeAny is ready!"
-    printf "\n"
-    printf "  Set your API key and start:\n"
-    printf "  ${YELLOW}export ANTHROPIC_API_KEY=\"sk-ant-...\"${NC}\n"
-    printf "  ${GREEN}codeany${NC}\n"
-    printf "\n"
-    printf "  Docs: https://github.com/${REPO}\n"
-    printf "\n"
+    printf "\n" >&2
+    printf "  Set your API key and start:\n" >&2
+    printf "  ${YELLOW}export ANTHROPIC_API_KEY=\"sk-ant-...\"${NC}\n" >&2
+    printf "  ${GREEN}codeany${NC}\n" >&2
+    printf "\n" >&2
+    printf "  Docs: https://github.com/${REPO}\n" >&2
+    printf "\n" >&2
 }
 
 main
