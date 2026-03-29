@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}_${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: linux
+            arch: arm
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+          - os: windows
+            arch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY_NAME="codeany_${{ matrix.os }}_${{ matrix.arch }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+          go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" -o "dist/${BINARY_NAME}" .
+          echo "Built: dist/${BINARY_NAME}"
+          ls -lh dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeany_${{ matrix.os }}_${{ matrix.arch }}
+          path: dist/
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${{ github.ref_name }}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "CodeAny ${{ github.ref_name }}"
+          body: |
+            ## CodeAny ${{ github.ref_name }}
+
+            ### Installation
+
+            **One-line install (macOS/Linux):**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/thinkany-ai/codeany/main/install.sh | sh
+            ```
+
+            **Manual download:** Pick the binary for your platform below.
+
+            ### Platforms
+
+            | Platform | File |
+            |----------|------|
+            | macOS (Apple Silicon) | `codeany_darwin_arm64` |
+            | macOS (Intel) | `codeany_darwin_amd64` |
+            | Linux (x86_64) | `codeany_linux_amd64` |
+            | Linux (ARM64) | `codeany_linux_arm64` |
+            | Linux (ARMv7) | `codeany_linux_arm` |
+            | Windows (x86_64) | `codeany_windows_amd64.exe` |
+
+            ### Quick Start
+
+            ```bash
+            export ANTHROPIC_API_KEY="sk-ant-..."
+            codeany
+            ```
+
+            See [README](https://github.com/thinkany-ai/codeany#readme) for full documentation.
+          files: |
+            dist/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

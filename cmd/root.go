@@ -17,7 +17,7 @@ import (
 	"github.com/idoubi/codeany/tui"
 )
 
-const version = "0.2.0"
+var appVersion = "dev"
 
 var (
 	flagModel   string
@@ -33,7 +33,7 @@ var rootCmd = &cobra.Command{
 	Use:   "codeany [flags] [initial_prompt]",
 	Short: "CodeAny - AI coding agent",
 	Long:  "CodeAny is a production-grade AI coding agent that supports multiple LLM providers, tool use, MCP/LSP integration, and more.",
-	Version: version,
+	Version: appVersion,
 	RunE:  runRoot,
 }
 
@@ -155,4 +155,12 @@ func isOpenAI(model string) bool {
 		}
 	}
 	return false
+}
+
+// SetVersion sets the version string (called from main.go with ldflags value).
+func SetVersion(v string) {
+	if v != "" && v != "dev" {
+		appVersion = v
+		rootCmd.Version = v
+	}
 }

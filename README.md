@@ -5,8 +5,10 @@
 
   <p>
     <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go" />
+    <img src="https://img.shields.io/github/v/release/thinkany-ai/codeany?style=flat&label=release&color=brightgreen" />
     <img src="https://img.shields.io/badge/License-MIT-green?style=flat" />
     <img src="https://img.shields.io/badge/Providers-Anthropic%20%7C%20OpenAI-blueviolet?style=flat" />
+    <img src="https://img.shields.io/github/actions/workflow/status/thinkany-ai/codeany/release.yml?style=flat&label=CI" />
   </p>
 </div>
 
@@ -38,6 +40,33 @@
 - **Configurable everything** — permission mode, context limits, model, memory, LSP all configurable
 
 ## Installation
+
+### One-line Install (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/thinkany-ai/codeany/main/install.sh | sh
+```
+
+The script auto-detects your OS and architecture, downloads the latest binary from GitHub Releases, and installs it to `/usr/local/bin`.
+
+### Manual Download
+
+Download the pre-built binary for your platform from [GitHub Releases](https://github.com/thinkany-ai/codeany/releases/latest):
+
+| Platform | File |
+|----------|------|
+| macOS (Apple Silicon) | `codeany_darwin_arm64` |
+| macOS (Intel) | `codeany_darwin_amd64` |
+| Linux (x86_64) | `codeany_linux_amd64` |
+| Linux (ARM64) | `codeany_linux_arm64` |
+| Windows (x86_64) | `codeany_windows_amd64.exe` |
+
+```bash
+# Example: macOS Apple Silicon
+curl -fsSL https://github.com/thinkany-ai/codeany/releases/latest/download/codeany_darwin_arm64 -o codeany
+chmod +x codeany
+sudo mv codeany /usr/local/bin/
+```
 
 ### From Source
 
