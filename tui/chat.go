@@ -178,7 +178,7 @@ func (cv *ChatView) renderMarkdown(content string, width int) string {
 	}
 
 	r, err := glamour.NewTermRenderer(
-		glamour.WithStylePath("dark"),
+		glamour.WithAutoStyle(),
 		glamour.WithWordWrap(width),
 	)
 	if err != nil {
