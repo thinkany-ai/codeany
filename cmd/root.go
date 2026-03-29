@@ -109,62 +109,26 @@ Quick start options:
 	cfg.NoMemory = flagNoMem
 	cfg.NoLSP = flagNoLSP
 
-	// Resolve API keys (config file > env vars)
-	anthropicKey := cfg.Models.Anthropic.APIKey
-	if anthropicKey == "" {
-		anthropicKey = os.Getenv("ANTHROPIC_API_KEY")
-	}
-	openaiKey := cfg.Models.OpenAI.APIKey
-	if openaiKey == "" {
-		openaiKey = os.Getenv("OPENAI_API_KEY")
-	}
-	// Also check generic key env (for OpenAI-compatible providers)
-	if openaiKey == "" {
-		openaiKey = os.Getenv("OPENAI_COMPATIBLE_API_KEY")
-	}
-	baseURL := cfg.Models.OpenAI.BaseURL
-
-	// Create LLM client based on model name or provider config
+	// Resolve provider for the selected model
 	model := cfg.DefaultModel
+	apiKey, baseURL := cfg.ResolveProvider(model)
+
+	// Create LLM client
 	var client llm.Client
 	if isAnthropicModel(model) {
-		if anthropicKey == "" {
-			return fmt.Errorf(`no Anthropic API key found.
-
-Set it via environment variable:
-  export ANTHROPIC_API_KEY="sk-ant-..."
-
-Or in config file (~/.codeany/config.yaml):
-  models:
-    anthropic:
-      api_key: "sk-ant-..."
-
-Get a key at: https://console.anthropic.com`)
+		if apiKey == "" {
+			return fmt.Errorf("no Anthropic API key found for model %q\n\nSet it via:\n  export ANTHROPIC_API_KEY=\"sk-ant-...\"\nOr in ~/.codeany/config.yaml:\n  models:\n    anthropic:\n      api_key: \"sk-ant-...\"\n\nGet a key at: https://console.anthropic.com", model)
 		}
-		client = llm.NewAnthropicClient(model, anthropicKey)
+		client = llm.NewAnthropicClient(model, apiKey)
 	} else {
-		// OpenAI or OpenAI-compatible (any other model)
-		if openaiKey == "" {
-			return fmt.Errorf(`no API key found for model "%s".
-
-For OpenAI models, set:
-  export OPENAI_API_KEY="sk-..."
-
-For OpenAI-compatible providers (Ollama, DeepSeek, Qwen, etc.), set:
-  export OPENAI_API_KEY="your-key"
-
-And configure base URL in ~/.codeany/config.yaml:
-  models:
-    openai:
-      api_key: "your-key"
-      base_url: "http://localhost:11434/v1"  # Ollama example
-
-Supported model prefixes: gpt-, o1-, o3-, o4-, deepseek-, qwen-, gemini-, llama, mistral, phi, etc.
-To use Anthropic models, set ANTHROPIC_API_KEY and use: claude-*`, model)
+		// OpenAI-compatible: OpenAI / OpenRouter / Ollama / custom
+		// Ollama doesn't need a key; all others do
+		isOllama := baseURL != "" && (len(baseURL) >= 16 && baseURL[:16] == "http://localhost" || len(baseURL) >= 17 && baseURL[:17] == "http://127.0.0.1")
+		if apiKey == "" && !isOllama {
+			return fmt.Errorf("no API key found for model %q\n\nOptions:\n  OpenAI:      export OPENAI_API_KEY=\"sk-...\"\n  OpenRouter:  export OPENROUTER_API_KEY=\"sk-or-v1-...\"\n  Custom:      set models.custom in ~/.codeany/config.yaml\n  Ollama:      no key needed, set models.ollama.base_url", model)
 		}
-		client = llm.NewOpenAIClient(model, openaiKey, baseURL)
+		client = llm.NewOpenAIClient(model, apiKey, baseURL)
 	}
-	apiKey := anthropicKey // keep for permission manager
 
 	// Create permission manager
 	permMode := permissions.Mode(cfg.PermissionMode)
@@ -212,10 +176,8 @@ To use Anthropic models, set ANTHROPIC_API_KEY and use: claude-*`, model)
 	return nil
 }
 
-// isAnthropicModel returns true for Claude models (use Anthropic API).
-// Everything else is treated as OpenAI-compatible.
 func isAnthropicModel(model string) bool {
-	return strings.HasPrefix(model, "claude-")
+	return len(model) > 7 && model[:7] == "claude-"
 }
 
 // SetVersion sets the version string (called from main.go with ldflags value).

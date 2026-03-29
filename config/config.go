@@ -26,10 +26,9 @@ type Config struct {
 	PrintMode  bool   `mapstructure:"-"`
 	NoMemory   bool   `mapstructure:"-"`
 	NoLSP      bool   `mapstructure:"-"`
-	FirstRun   bool   `mapstructure:"-"` // true when config was just created
+	FirstRun   bool   `mapstructure:"-"`
 }
 
-// MCPServerConfig defines an MCP server entry.
 type MCPServerConfig struct {
 	Name    string            `mapstructure:"name"`
 	Command string            `mapstructure:"command"`
@@ -37,21 +36,40 @@ type MCPServerConfig struct {
 	Env     map[string]string `mapstructure:"env"`
 }
 
-// ModelsConfig holds per-provider configuration.
 type ModelsConfig struct {
-	Anthropic AnthropicConfig `mapstructure:"anthropic"`
-	OpenAI    OpenAIConfig    `mapstructure:"openai"`
+	Anthropic  AnthropicConfig  `mapstructure:"anthropic"`
+	OpenAI     OpenAIConfig     `mapstructure:"openai"`
+	OpenRouter OpenRouterConfig `mapstructure:"openrouter"`
+	Ollama     OllamaConfig     `mapstructure:"ollama"`
+	Custom     []CustomProvider `mapstructure:"custom"`
 }
 
-// AnthropicConfig holds Anthropic-specific settings.
 type AnthropicConfig struct {
 	APIKey string `mapstructure:"api_key"`
 }
 
-// OpenAIConfig holds OpenAI-specific settings.
 type OpenAIConfig struct {
 	APIKey  string `mapstructure:"api_key"`
 	BaseURL string `mapstructure:"base_url"`
+}
+
+// OpenRouterConfig is a first-class provider — no need to touch OpenAI settings.
+type OpenRouterConfig struct {
+	APIKey string `mapstructure:"api_key"`
+}
+
+// OllamaConfig for local models — no API key needed.
+type OllamaConfig struct {
+	BaseURL string `mapstructure:"base_url"` // default: http://localhost:11434/v1
+}
+
+// CustomProvider allows arbitrary OpenAI-compatible endpoints.
+type CustomProvider struct {
+	Name    string `mapstructure:"name"`
+	APIKey  string `mapstructure:"api_key"`
+	BaseURL string `mapstructure:"base_url"`
+	// Model prefix that routes to this provider (e.g. "my-" → my-model → this provider)
+	ModelPrefix string `mapstructure:"model_prefix"`
 }
 
 var (
@@ -59,37 +77,22 @@ var (
 	once         sync.Once
 )
 
-// defaultConfigTemplate is written to ~/.codeany/config.yaml on first run.
 const defaultConfigTemplate = `# CodeAny configuration
 # Docs: https://github.com/thinkany-ai/codeany
 #
 # ─── Quick Start ──────────────────────────────────────────────────────────────
-#
-#  Option A — Anthropic Claude (default):
-#    1. Get a key at https://console.anthropic.com
-#    2. Set api_key below or: export ANTHROPIC_API_KEY="sk-ant-..."
-#    3. Run: codeany
-#
-#  Option B — OpenAI:
-#    1. Set openai.api_key below or: export OPENAI_API_KEY="sk-..."
-#    2. Run: codeany -m gpt-4o
-#
-#  Option C — Local model (Ollama, no internet needed):
-#    1. Install Ollama: https://ollama.ai
-#    2. Pull a model: ollama pull llama3.2
-#    3. Set openai.base_url to http://localhost:11434/v1
-#    4. Run: codeany -m llama3.2
-#
-#  Option D — OpenAI-compatible providers (DeepSeek, Qwen, etc.):
-#    Set openai.api_key + openai.base_url for your provider
+#  1. Pick a provider below and fill in the api_key
+#  2. Set default_model to a model from that provider
+#  3. Run: codeany
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Default model. Examples:
-#   Anthropic : claude-sonnet-4-5 | claude-opus-4-5
-#   OpenAI    : gpt-4o | gpt-4o-mini | o3
-#   DeepSeek  : deepseek-chat | deepseek-coder
-#   Qwen      : qwen-max | qwen-turbo
-#   Ollama    : llama3.2 | mistral | phi4
+# Default model. Use the provider's own model name format.
+# Examples:
+#   Anthropic   : claude-sonnet-4-5 | claude-opus-4-5
+#   OpenAI      : gpt-4o | gpt-4o-mini | o3
+#   OpenRouter  : anthropic/claude-sonnet-4-5 | openai/gpt-4o | google/gemini-2.0-flash
+#   DeepSeek    : deepseek-chat | deepseek-coder
+#   Ollama      : llama3.2 | mistral | phi4  (no key needed)
 default_model: claude-sonnet-4-5
 
 # Permission mode: default | auto | plan
@@ -104,24 +107,43 @@ memory_enabled: true
 lsp_enabled: true
 
 models:
+  # ── Anthropic ─────────────────────────────────────────────
+  # Models: claude-sonnet-4-5, claude-opus-4-5, claude-haiku-4-5
+  # Env override: ANTHROPIC_API_KEY
   anthropic:
-    # Anthropic API key (claude-* models)
-    # Override with env: ANTHROPIC_API_KEY
     api_key: ""
 
+  # ── OpenAI ────────────────────────────────────────────────
+  # Models: gpt-4o, gpt-4o-mini, o3, o1
+  # Env override: OPENAI_API_KEY
   openai:
-    # OpenAI or OpenAI-compatible API key
-    # Override with env: OPENAI_API_KEY
+    api_key: ""
+    base_url: "https://api.openai.com/v1"
+
+  # ── OpenRouter ────────────────────────────────────────────
+  # Access 200+ models through one key: https://openrouter.ai
+  # Models: anthropic/claude-sonnet-4-5, openai/gpt-4o, google/gemini-2.0-flash, etc.
+  # Env override: OPENROUTER_API_KEY
+  openrouter:
     api_key: ""
 
-    # Base URL — change for other providers:
-    #   OpenAI (default) : https://api.openai.com/v1
-    #   Ollama (local)   : http://localhost:11434/v1
-    #   DeepSeek         : https://api.deepseek.com/v1
-    #   Qwen             : https://dashscope.aliyuncs.com/compatible-mode/v1
-    #   Groq             : https://api.groq.com/openai/v1
-    #   Together AI      : https://api.together.xyz/v1
-    base_url: "https://api.openai.com/v1"
+  # ── Ollama (local, no API key needed) ─────────────────────
+  # Install: https://ollama.ai  then: ollama pull llama3.2
+  # Models: llama3.2, mistral, phi4, gemma3, qwen2.5-coder, etc.
+  ollama:
+    base_url: "http://localhost:11434/v1"
+
+  # ── Custom OpenAI-compatible providers ────────────────────
+  # Add as many as you need. model_prefix routes models to this provider.
+  # custom:
+  #   - name: deepseek
+  #     api_key: "sk-..."
+  #     base_url: "https://api.deepseek.com/v1"
+  #     model_prefix: "deepseek-"
+  #   - name: qwen
+  #     api_key: "sk-..."
+  #     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  #     model_prefix: "qwen-"
 
 # MCP servers (optional)
 # mcp_servers:
@@ -130,7 +152,6 @@ models:
 #     args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 `
 
-// HomeDir returns the codeany home directory (~/.codeany).
 func HomeDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -139,13 +160,10 @@ func HomeDir() string {
 	return filepath.Join(home, ".codeany")
 }
 
-// ConfigFile returns the path to the config file.
 func ConfigFile() string {
 	return filepath.Join(HomeDir(), "config.yaml")
 }
 
-// Load reads and returns the application config.
-// If no config file exists, it creates one and sets cfg.FirstRun = true.
 func Load() (*Config, error) {
 	var loadErr error
 	once.Do(func() {
@@ -161,6 +179,9 @@ func Load() (*Config, error) {
 				OpenAI: OpenAIConfig{
 					BaseURL: "https://api.openai.com/v1",
 				},
+				Ollama: OllamaConfig{
+					BaseURL: "http://localhost:11434/v1",
+				},
 			},
 		}
 
@@ -170,7 +191,6 @@ func Load() (*Config, error) {
 			return
 		}
 
-		// Auto-create config file on first run
 		cfgFile := ConfigFile()
 		if _, err := os.Stat(cfgFile); os.IsNotExist(err) {
 			if writeErr := os.WriteFile(cfgFile, []byte(defaultConfigTemplate), 0600); writeErr == nil {
@@ -190,11 +210,13 @@ func Load() (*Config, error) {
 		viper.SetDefault("memory_enabled", globalConfig.MemoryEnabled)
 		viper.SetDefault("lsp_enabled", globalConfig.LSPEnabled)
 		viper.SetDefault("models.openai.base_url", globalConfig.Models.OpenAI.BaseURL)
+		viper.SetDefault("models.ollama.base_url", globalConfig.Models.Ollama.BaseURL)
 
-		// Environment variable bindings
-		viper.BindEnv("models.anthropic.api_key", "ANTHROPIC_API_KEY")   //nolint:errcheck
-		viper.BindEnv("models.openai.api_key", "OPENAI_API_KEY")         //nolint:errcheck
-		viper.BindEnv("models.openai.base_url", "OPENAI_BASE_URL")       //nolint:errcheck         //nolint:errcheck
+		viper.BindEnv("models.anthropic.api_key", "ANTHROPIC_API_KEY")     //nolint:errcheck
+		viper.BindEnv("models.openai.api_key", "OPENAI_API_KEY")           //nolint:errcheck
+		viper.BindEnv("models.openai.base_url", "OPENAI_BASE_URL")         //nolint:errcheck
+		viper.BindEnv("models.openrouter.api_key", "OPENROUTER_API_KEY")   //nolint:errcheck
+		viper.BindEnv("models.ollama.base_url", "OLLAMA_BASE_URL")         //nolint:errcheck
 
 		if err := viper.ReadInConfig(); err != nil {
 			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
@@ -211,7 +233,6 @@ func Load() (*Config, error) {
 	return globalConfig, loadErr
 }
 
-// Get returns the global config (loads if needed).
 func Get() *Config {
 	if globalConfig == nil {
 		cfg, _ := Load()
@@ -220,7 +241,6 @@ func Get() *Config {
 	return globalConfig
 }
 
-// HasAPIKey returns true if any usable API key is configured.
 func (c *Config) HasAPIKey() bool {
 	if c.Models.Anthropic.APIKey != "" || os.Getenv("ANTHROPIC_API_KEY") != "" {
 		return true
@@ -228,10 +248,74 @@ func (c *Config) HasAPIKey() bool {
 	if c.Models.OpenAI.APIKey != "" || os.Getenv("OPENAI_API_KEY") != "" {
 		return true
 	}
+	if c.Models.OpenRouter.APIKey != "" || os.Getenv("OPENROUTER_API_KEY") != "" {
+		return true
+	}
 	return false
 }
 
-// MemoryDir returns the memory directory for the current project.
+// ResolveProvider returns (apiKey, baseURL) for the given model name.
+// Priority: anthropic > openrouter > custom providers > openai > ollama (fallback)
+func (c *Config) ResolveProvider(model string) (apiKey, baseURL string) {
+	// Anthropic models
+	if isAnthropicModel(model) {
+		key := c.Models.Anthropic.APIKey
+		if key == "" {
+			key = os.Getenv("ANTHROPIC_API_KEY")
+		}
+		return key, "" // Anthropic SDK doesn't need baseURL
+	}
+
+	// OpenRouter: model contains "/" (e.g. anthropic/claude-sonnet-4-5)
+	if containsSlash(model) {
+		key := c.Models.OpenRouter.APIKey
+		if key == "" {
+			key = os.Getenv("OPENROUTER_API_KEY")
+		}
+		return key, "https://openrouter.ai/api/v1"
+	}
+
+	// Custom providers by model prefix
+	for _, p := range c.Models.Custom {
+		if p.ModelPrefix != "" && len(model) >= len(p.ModelPrefix) && model[:len(p.ModelPrefix)] == p.ModelPrefix {
+			return p.APIKey, p.BaseURL
+		}
+	}
+
+	// Ollama: no key needed, local base URL
+	ollamaURL := c.Models.Ollama.BaseURL
+	if ollamaURL == "" {
+		ollamaURL = "http://localhost:11434/v1"
+	}
+	// If OpenAI key is set, prefer OpenAI; otherwise fall back to Ollama
+	openaiKey := c.Models.OpenAI.APIKey
+	if openaiKey == "" {
+		openaiKey = os.Getenv("OPENAI_API_KEY")
+	}
+	openaiURL := c.Models.OpenAI.BaseURL
+	if u := os.Getenv("OPENAI_BASE_URL"); u != "" {
+		openaiURL = u
+	}
+	if openaiKey != "" {
+		return openaiKey, openaiURL
+	}
+	// Fallback: Ollama (no key)
+	return "", ollamaURL
+}
+
+func isAnthropicModel(model string) bool {
+	return len(model) > 7 && model[:7] == "claude-"
+}
+
+func containsSlash(s string) bool {
+	for _, c := range s {
+		if c == '/' {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Config) MemoryDir() string {
 	dir := c.WorkingDir
 	if dir == "" {
@@ -241,12 +325,10 @@ func (c *Config) MemoryDir() string {
 	return filepath.Join(HomeDir(), "memory", hash)
 }
 
-// PluginsDir returns the plugins directory.
 func (c *Config) PluginsDir() string {
 	return filepath.Join(HomeDir(), "plugins")
 }
 
-// SkillsDir returns the project-level skills directory.
 func (c *Config) SkillsDir() string {
 	dir := c.WorkingDir
 	if dir == "" {
