@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-62 -62 636 636">
+  <defs>
+    <linearGradient id="whale-fill" x1="80" y1="0" x2="432" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset=".5" stop-color="#FAF9F6"/>
+      <stop offset="1" stop-color="#EEECE6"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#4E6BFE"/>
+  <rect x="2" y="2" width="508" height="508" rx="110" fill="none" stroke="#FFFFFF" stroke-opacity=".24" stroke-width="4"/>
+  <g transform="matrix(1.28 0 0 1.28 -71.68 -71.68)">
+    <g fill="url(#whale-fill)">
+      <rect x="180" y="169" width="215" height="180" rx="46"/>
+      <path d="M194 210H166L117 178V231L158 254L117 287V342L178 292H194Z"/>
+      <rect x="264" y="340" width="39" height="54"/>
+      <rect x="305" y="144" width="16" height="25"/>
+      <rect x="279" y="121" width="19" height="19"/>
+      <rect x="326" y="116" width="19" height="19"/>
+    </g>
+    <rect x="340" y="222" width="18" height="32" fill="#111217"/>
+  </g>
+</svg>
