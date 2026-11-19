@@ -234,7 +234,7 @@ mod tests {
     use crate::threads::ChatItem;
 
     fn temp_db(name: &str) -> (Db, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("dscode-db-test-{name}-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("codeany-db-test-{name}-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         (Db::open(&path).unwrap(), path)
     }

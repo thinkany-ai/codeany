@@ -10,6 +10,7 @@ mod icons;
 mod model_picker;
 mod settings;
 mod paths;
+mod remote;
 mod search_palette;
 mod style;
 mod surface_host;
@@ -26,7 +27,7 @@ use gpui_kit::*;
 use crate::workspace::Workspace;
 
 actions!(
-    dscode,
+    codeany,
     [
         Quit,
         OpenFolder,
@@ -45,6 +46,12 @@ actions!(
 );
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("serve" | "link")) {
+        agl_bridge::set_home();
+        std::process::exit(remote::serve_cli(&args));
+    }
+
     let initial_root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
@@ -52,10 +59,9 @@ fn main() {
         .filter(|path| path.is_dir());
 
     agl_bridge::set_home();
-    // Start agl early, off the main thread: it reads the login shell's PATH.
-    std::thread::spawn(|| {
-        let _ = agl_bridge::get();
-    });
+    // Start agl early: it reads the login shell's PATH.
+    agl_bridge::start_local();
+    remote::init();
 
     gpui_kit::application()
         .with_assets(style::Assets)
@@ -82,16 +88,14 @@ fn main() {
 
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_app_quit(|_| async {
-                if let Ok(agl) = agl_bridge::get() {
-                    agl.shutdown();
-                }
+                agl_bridge::shutdown();
             })
             .detach();
             cx.set_menus([
-                Menu::new("dscode").items([
+                Menu::new("CodeAny").items([
                     MenuItem::action("Settings…", OpenSettings),
                     MenuItem::separator(),
-                    MenuItem::action("Quit dscode", Quit),
+                    MenuItem::action("Quit CodeAny", Quit),
                 ]),
                 Menu::new("File").items([
                     MenuItem::action("New Thread", NewThread),
@@ -114,7 +118,7 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("dscode".into()),
+                    title: Some("CodeAny".into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(14.), px(13.))),
                 }),

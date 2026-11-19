@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 PROJECT=${1:-$PWD}
 # `make dev PROJECT=~/x` passes the tilde through unexpanded.
 case $PROJECT in "~"*) PROJECT="$HOME${PROJECT#"~"}" ;; esac
-APP_BIN=target/dscode.app/Contents/MacOS/dscode
+APP_BIN=target/codeany.app/Contents/MacOS/codeany
 STAMP=target/.dev-stamp
 WATCH="src assets Cargo.toml Cargo.lock"
 APP_PID=

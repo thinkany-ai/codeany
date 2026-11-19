@@ -65,6 +65,8 @@ struct Row {
 }
 
 pub struct ModelPicker {
+    /// The machine the agents run on (a nex device id); `None` is this one.
+    machine: Option<String>,
     agents: Vec<AgentInfo>,
     models: HashMap<String, Models>,
     tab: Tab,
@@ -107,6 +109,7 @@ impl ModelPicker {
         })];
         Self {
             agents: Vec::new(),
+            machine: None,
             models: HashMap::new(),
             tab: Tab::Favorites,
             favorites: Vec::new(),
@@ -119,6 +122,16 @@ impl ModelPicker {
     }
 
     /// Installed agents, from agl's detection.
+    /// Agents and models come from another machine from now on.
+    pub fn set_machine(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
+        if self.machine != machine {
+            self.machine = machine;
+            self.agents.clear();
+            self.models.clear();
+            cx.notify();
+        }
+    }
+
     pub fn set_agents(&mut self, agents: &[AgentInfo], cx: &mut Context<Self>) {
         self.agents = agents.iter().filter(|a| a.available).cloned().collect();
         cx.notify();
@@ -163,19 +176,15 @@ impl ModelPicker {
         }
         self.models.insert(agent.to_string(), Models::Loading);
         let id = agent.to_string();
+        let machine = self.machine.clone();
+        let models = agl_bridge::backend(machine.as_deref()).list_models(&id);
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let id = id.clone();
-                    async move {
-                        agl_bridge::get()
-                            .map_err(anyhow::Error::msg)
-                            .and_then(|agl| agl.list_models(&id))
-                    }
-                })
-                .await;
+            let result = models.await;
             this.update(cx, |this, cx| {
+                // Switched machines meanwhile: these are the other one's.
+                if this.machine != machine {
+                    return;
+                }
                 let models = match result {
                     Ok(models) => Models::Ready(models),
                     Err(err) => Models::Failed(format!("{err:#}")),

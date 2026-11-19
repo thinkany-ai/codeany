@@ -116,7 +116,7 @@ impl TerminalView {
         let mut env = std::collections::HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        env.insert("TERM_PROGRAM".to_string(), "dscode".to_string());
+        env.insert("TERM_PROGRAM".to_string(), "codeany".to_string());
         let options = tty::Options {
             shell: None,
             working_directory: cwd,

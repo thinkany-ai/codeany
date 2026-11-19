@@ -1,4 +1,4 @@
-# dscode
+# CodeAny
 
 A lightweight coding-agent app with an editor window, built with [GPUI](https://gpui.rs) and
 [gpui-kit](https://gpui-kit.com).
@@ -43,10 +43,11 @@ the error and keeps the running app. Ctrl-C stops both.
 | ⌘J or ⌃\`     | Toggle terminal     |
 | ⌘C / ⌘V / ⌘K  | Terminal copy / paste / clear |
 
-Data lives in `~/.dscode` (override with `DSCODE_HOME`): threads, settings and favorites in
-`dscode.db` (SQLite, WAL), screenshots in `images/`, and agl's sessions and history in `agl/`
-(its `AGL_HOME`, apart from `~/.agl`). The first start moves data from the earlier
-`~/Library/Application Support/dscode` location and keeps `threads.json.migrated` as a backup.
+Data lives in `~/.codeany` (override with `CODEANY_HOME`): threads, settings and favorites in
+`codeany.db` (SQLite, WAL), screenshots in `images/`, and agl's sessions and history in `agl/`
+(its `AGL_HOME`, apart from `~/.agl`). CodeAny was called dscode before: the first start moves
+the database, `agl/` and `nex.json` over from `~/.dscode`, and data from the even earlier
+`~/Library/Application Support/dscode` location, keeping `threads.json.migrated` as a backup.
 
 ## Layout
 

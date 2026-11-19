@@ -145,7 +145,9 @@ impl AgentPanel {
         cx.spawn(async move |this, cx| {
             let agents = cx
                 .background_executor()
-                .spawn(async { agl_bridge::get().map(|agl| agl.detect()) })
+                .spawn(async {
+                    agl_bridge::backend(None).detect().await.map_err(|err| format!("{err:#}"))
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if let Ok(agents) = &agents {
@@ -357,7 +359,7 @@ impl AgentPanel {
         }));
     }
 
-    /// The dscode thread a terminal session was imported into.
+    /// The CodeAny thread a terminal session was imported into.
     fn imported_thread(&self, session: &ExternalSession) -> Option<u64> {
         self.store
             .threads
@@ -421,9 +423,7 @@ impl AgentPanel {
 
     fn delete_thread(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(session) = self.sessions.remove(&id) {
-            if let Ok(agl) = agl_bridge::get() {
-                agl.close(session.id);
-            }
+            agl_bridge::backend(None).close(session.id);
         }
         self.running.remove(&id);
         if let Some(thread) = self.store.threads.iter().find(|t| t.id == id) {
@@ -454,9 +454,8 @@ impl AgentPanel {
                 return Ok(session.id.clone());
             }
         }
-        let agl = agl_bridge::get()?;
-        let meta = agl
-            .open_session(
+        let agl = agl_bridge::backend(None);
+        let meta = futures::executor::block_on(agl.open_session(
                 thread.session_name(),
                 SessionOptions {
                     agent: thread.agent.clone(),
@@ -466,7 +465,7 @@ impl AgentPanel {
                     access: thread.access.clone(),
                     resume: thread.native_ids.get(&thread.agent).cloned(),
                 },
-            )
+            ))
             .map_err(|err| format!("{err:#}"))?;
         let agent = thread.agent.clone();
 
@@ -534,8 +533,8 @@ impl AgentPanel {
         let result = self.ensure_session(id, cx).and_then(|session_id| {
             // While a turn runs, steer it where the agent supports that; else queue.
             let steer = running && self.sessions[&id].features.iter().any(|f| f == "steer");
-            let agl = agl_bridge::get()?;
-            agl.prompt(&session_id, context + &text, if steer { "steer" } else { "queue" })
+            let agl = agl_bridge::backend(None);
+            futures::executor::block_on(agl.prompt(&session_id, context + &text, if steer { "steer" } else { "queue" }))
                 .map_err(|err| format!("{err:#}"))
         });
         if let Err(err) = result {
@@ -553,15 +552,15 @@ impl AgentPanel {
 
     fn stop(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.active else { return };
-        if let (Some(session), Ok(agl)) = (self.sessions.get(&id), agl_bridge::get()) {
-            let _ = agl.abort(&session.id);
+        if let Some(session) = self.sessions.get(&id) {
+            agl_bridge::backend(None).abort(&session.id);
         }
         cx.notify();
     }
 
     fn answer(&mut self, thread_id: u64, request_id: String, decision: &str, cx: &mut Context<Self>) {
-        if let (Some(session), Ok(agl)) = (self.sessions.get(&thread_id), agl_bridge::get()) {
-            agl.approve(session.id.clone(), request_id, decision.to_string());
+        if let Some(session) = self.sessions.get(&thread_id) {
+            agl_bridge::backend(None).approve(session.id.clone(), request_id, decision.to_string());
         }
         cx.notify();
     }
@@ -687,8 +686,8 @@ impl AgentPanel {
             }
             // Same agent: change the model in place; agl keeps the conversation.
             if same_agent {
-                if let (Some(session), Ok(agl)) = (self.sessions.get(&id), agl_bridge::get()) {
-                    let _ = agl.configure(&session.id, None, Some(model.clone().unwrap_or_else(|| "default".into())), None);
+                if let Some(session) = self.sessions.get(&id) {
+                    agl_bridge::backend(None).configure(&session.id, None, Some(model.clone().unwrap_or_else(|| "default".into())), None);
                 }
             }
             self.scroll.scroll_to_bottom();
@@ -709,8 +708,8 @@ impl AgentPanel {
             if let Some(thread) = self.thread_mut(id) {
                 thread.effort = effort.clone();
             }
-            if let (Some(session), Ok(agl)) = (self.sessions.get(&id), agl_bridge::get()) {
-                let _ = agl.configure(&session.id, None, None, effort);
+            if let Some(session) = self.sessions.get(&id) {
+                agl_bridge::backend(None).configure(&session.id, None, None, effort);
             }
         }
         self.store.save();
@@ -740,8 +739,8 @@ impl AgentPanel {
             if let Some(thread) = self.thread_mut(id) {
                 thread.access = access.to_string();
             }
-            if let (Some(session), Ok(agl)) = (self.sessions.get(&id), agl_bridge::get()) {
-                let _ = agl.configure(&session.id, Some(access.to_string()), None, None);
+            if let Some(session) = self.sessions.get(&id) {
+                agl_bridge::backend(None).configure(&session.id, Some(access.to_string()), None, None);
             }
         }
         self.store.save();
@@ -1081,7 +1080,7 @@ impl AgentPanel {
             .into_any_element()
     }
 
-    /// A terminal session not yet opened in dscode.
+    /// A terminal session not yet opened in CodeAny.
     fn render_external_row(&self, session: &ExternalSession, _indent: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let open = session.clone();
@@ -1516,7 +1515,7 @@ impl AgentPanel {
                                 .text_color(theme.muted_foreground)
                                 .child(Icon::new(IconName::SquareTerminal).size(ICON).flex_none())
                                 .child(div().flex_1().child(format!(
-                                    "{} is open in a terminal{}. Replies here continue it in dscode; the terminal won't see them.",
+                                    "{} is open in a terminal{}. Replies here continue it in CodeAny; the terminal won't see them.",
                                     agent_name(&session.agent),
                                     if busy { " and working" } else { "" }
                                 ))),

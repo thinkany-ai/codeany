@@ -86,7 +86,7 @@ fn logo() -> Arc<Image> {
     LOGO.get_or_init(|| {
         Arc::new(Image::from_bytes(
             ImageFormat::Png,
-            include_bytes!("../assets/dscode.png").to_vec(),
+            include_bytes!("../assets/codeany.png").to_vec(),
         ))
     })
     .clone()
@@ -346,7 +346,7 @@ impl Settings {
                 })
         };
 
-        // "System" shows both halves of dscode's own light and dark look.
+        // "System" shows both halves of CodeAny's own light and dark look.
         let system_preview = div()
             .size_full()
             .flex()
@@ -485,7 +485,7 @@ impl Settings {
             .items_center()
             .gap_2()
             .child(img(logo()).size(px(96.)))
-            .child(div().mt_2().text_size(HEADING).font_weight(FontWeight::SEMIBOLD).child("dscode"))
+            .child(div().mt_2().text_size(HEADING).font_weight(FontWeight::SEMIBOLD).child("CodeAny"))
             .child(
                 div()
                     .text_size(TEXT)

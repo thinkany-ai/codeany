@@ -484,7 +484,7 @@ fn codex_transcript(path: &Path) -> Vec<ChatItem> {
     items
 }
 
-/// A session's conversation as dscode items. Blocks.
+/// A session's conversation as CodeAny items. Blocks.
 pub fn transcript(session: &ExternalSession) -> Vec<ChatItem> {
     match session.agent.as_str() {
         "codex" => codex_transcript(&session.path),
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn claude_transcript_reads_turns_tools_and_titles() {
-        let dir = std::env::temp_dir().join("dscode-external-test");
+        let dir = std::env::temp_dir().join("codeany-external-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s1.jsonl");
         std::fs::write(

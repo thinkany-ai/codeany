@@ -149,7 +149,7 @@ pub struct Thread {
     #[serde(default)]
     pub external: Option<PathBuf>,
     /// The transcript's mtime last imported, while the thread still follows
-    /// it; cleared once the conversation continues in dscode.
+    /// it; cleared once the conversation continues in CodeAny.
     #[serde(default)]
     pub synced: Option<u64>,
     pub items: Vec<ChatItem>,
@@ -192,7 +192,7 @@ impl Thread {
 
     /// The agl session name for this thread's current agent.
     pub fn session_name(&self) -> String {
-        format!("dscode:{}:{}", self.id, self.agent)
+        format!("codeany:{}:{}", self.id, self.agent)
     }
 
     /// Agents that took part, in order of first appearance.
@@ -277,9 +277,9 @@ impl Thread {
     pub fn apply(&mut self, event: AgentEvent) {
         self.updated_at = now_secs();
         match event {
-            // dscode adds the user's message itself, without the handoff context.
+            // CodeAny adds the user's message itself, without the handoff context.
             AgentEvent::UserMessage { .. } => {}
-            AgentEvent::TextDelta { text } => match self.items.last_mut() {
+            AgentEvent::TextDelta { text, .. } => match self.items.last_mut() {
                 Some(ChatItem::Assistant(existing)) => existing.push_str(&text),
                 _ => self.items.push(ChatItem::Assistant(text)),
             },
@@ -616,7 +616,7 @@ pub fn delete_thread_images(thread: &Thread) {
 }
 
 impl Store {
-    /// Open `~/.dscode/dscode.db`, moving data from earlier versions on first use.
+    /// Open `~/.codeany/codeany.db`, moving data from earlier versions on first use.
     pub fn load() -> Self {
         let mut store = match Db::open(&crate::paths::database()) {
             Ok(db) => {
@@ -637,7 +637,7 @@ impl Store {
                 }
             }
             Err(err) => {
-                eprintln!("dscode: cannot open the database: {err}");
+                eprintln!("codeany: cannot open the database: {err}");
                 Store::default()
             }
         };
@@ -665,7 +665,7 @@ impl Store {
         db.set_setting("sidebar_tab", &self.tab);
         db.set_setting("theme", &self.theme);
         if let Err(err) = db.save_threads(&self.threads) {
-            eprintln!("dscode: saving threads failed: {err}");
+            eprintln!("codeany: saving threads failed: {err}");
         }
     }
 }
@@ -692,7 +692,7 @@ fn migrate_legacy(db: &Db) {
     }
 
     let Ok(old) = serde_json::from_str::<Store>(&text) else {
-        eprintln!("dscode: could not read {}", json_path.display());
+        eprintln!("codeany: could not read {}", json_path.display());
         return;
     };
     db.set_setting("agent", &old.agent);

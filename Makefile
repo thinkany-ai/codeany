@@ -8,7 +8,7 @@ dev:
 
 # Build and open the dev app once.
 run: bundle
-	@open -n target/dscode.app --args "$(PROJECT)"
+	@open -n target/codeany.app --args "$(PROJECT)"
 
 bundle:
 	@scripts/bundle.sh

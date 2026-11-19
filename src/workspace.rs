@@ -223,8 +223,8 @@ impl Workspace {
         }
 
         let app = match self.mode {
-            Mode::Agent => "dscode",
-            Mode::Editor => "dscode editor",
+            Mode::Agent => "CodeAny",
+            Mode::Editor => "CodeAny Editor",
         };
         let title = root
             .as_ref()
@@ -612,7 +612,7 @@ impl Workspace {
                     .text_size(HEADING)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.muted_foreground)
-                    .child("dscode"),
+                    .child("CodeAny"),
             )
             .when(self.root.is_none(), |this| {
                 this.child(
@@ -765,7 +765,7 @@ impl Workspace {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
             titlebar: Some(TitlebarOptions {
-                title: Some("dscode editor".into()),
+                title: Some("CodeAny Editor".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(14.), px(13.))),
             }),
@@ -956,7 +956,7 @@ impl Workspace {
                     .gap(layout::SPACE_2)
                     .text_size(TEXT)
                     .font_weight(FontWeight::MEDIUM)
-                    .child(if mode == Mode::Agent { "dscode" } else { "Editor" })
+                    .child(if mode == Mode::Agent { "CodeAny" } else { "Editor" })
                     .child(Icon::new(IconName::ChevronDown).size(ICON_SM).text_color(cx.theme().muted_foreground)),
             )
             .dropdown_menu(move |menu, _, _| {
@@ -974,7 +974,7 @@ impl Workspace {
                     })
                 };
                 menu.min_w(px(236.)).check_side(Side::Right)
-                    .item(entry("dscode", "Chat and work with agents")
+                    .item(entry("CodeAny", "Chat and work with agents")
                         .checked(mode == Mode::Agent)
                         .on_click(move |_, _, cx| {
                             if mode == Mode::Editor {

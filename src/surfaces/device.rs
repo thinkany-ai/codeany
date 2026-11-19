@@ -114,7 +114,7 @@ fn list_devices() -> Result<Vec<Sim>, String> {
 
 /// One screenshot as a GPUI image (BGRA). Blocks.
 fn capture(udid: &str) -> Result<Arc<RenderImage>, String> {
-    let path = std::env::temp_dir().join(format!("dscode-sim-{udid}.png"));
+    let path = std::env::temp_dir().join(format!("codeany-sim-{udid}.png"));
     simctl(&["io", udid, "screenshot", "--type=png", &path.to_string_lossy()])?;
     let mut rgba = image::open(&path).map_err(|err| err.to_string())?.into_rgba8();
     for pixel in rgba.pixels_mut() {
