@@ -1,6 +1,8 @@
 //! Pull request: the current branch's PR on GitHub, through the `gh` CLI —
 //! state, checks, review, recent comments — and the repo's other open PRs.
 
+use crate::style::AppButtonStyle as _;
+
 use std::{path::PathBuf, process::Command};
 
 use gpui_kit::assets::IconName;
@@ -8,14 +10,14 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     spinner::Spinner,
-    text::TextView,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
 use super::{Extension, Host, Manifest, Request, Surface, SurfaceContext, SurfaceView, empty_state, shell_path};
-use crate::style::size::{ICON, TEXT, TEXT_SM, TITLE};
+use crate::i18n::{t, tf};
+use crate::style::size::{ICON, TEXT};
 
 const FIELDS: &str = "number,title,state,isDraft,url,headRefName,baseRefName,author,reviewDecision,\
 statusCheckRollup,comments,additions,deletions,changedFiles";
@@ -88,7 +90,7 @@ fn gh(root: &PathBuf, args: &[&str]) -> Result<String, String> {
         .env("PATH", shell_path())
         .env("GH_PROMPT_DISABLED", "1")
         .output()
-        .map_err(|_| "The GitHub CLI (gh) is not installed. Install it with `brew install gh`.".to_string())?;
+        .map_err(|_| t("The GitHub CLI (gh) is not installed. Install it with `brew install gh`.").to_string())?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -130,7 +132,7 @@ impl PrSurface {
         self.loaded_at = Some(std::time::Instant::now());
         self.state = State::Loading;
         let Some(root) = root else {
-            self.state = State::Failed("Not a git repository".into());
+            self.state = State::Failed(t("Not a git repository").into());
             return;
         };
         self._load = Some(cx.spawn(async move |this, cx| {
@@ -231,9 +233,9 @@ impl PrSurface {
                                     .rounded_full()
                                     .bg(badge_color.opacity(0.15))
                                     .text_color(badge_color)
-                                    .text_size(TEXT_SM)
+                                    .text_size(TEXT)
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child(badge),
+                                    .child(state_label(badge)),
                             )
                             .child(
                                 div()
@@ -242,22 +244,24 @@ impl PrSurface {
                                     .child(format!("#{}", pr["number"])),
                             )
                             .when_some(review, |this, (label, color)| {
-                                this.child(div().text_size(TEXT_SM).text_color(color).child(label))
+                                this.child(div().text_size(TEXT).text_color(color).child(t(label)))
                             }),
                     )
-                    .child(div().text_size(TITLE).font_weight(FontWeight::SEMIBOLD).child(s("title")))
+                    .child(div().text_size(TEXT).font_weight(FontWeight::SEMIBOLD).child(s("title")))
                     .child(
                         div()
-                            .text_size(TEXT_SM)
+                            .text_size(TEXT)
                             .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "{} → {} · {} · +{} −{} in {} files",
-                                s("headRefName"),
-                                s("baseRefName"),
-                                pr["author"]["login"].as_str().unwrap_or(""),
-                                pr["additions"],
-                                pr["deletions"],
-                                pr["changedFiles"]
+                            .child(tf(
+                                "{head} → {base} · {author} · +{added} −{removed} in {files} files",
+                                &[
+                                    ("head", s("headRefName")),
+                                    ("base", s("baseRefName")),
+                                    ("author", pr["author"]["login"].as_str().unwrap_or("").to_string()),
+                                    ("added", pr["additions"].to_string()),
+                                    ("removed", pr["deletions"].to_string()),
+                                    ("files", pr["changedFiles"].to_string()),
+                                ],
                             )),
                     )
                     .child(
@@ -265,8 +269,8 @@ impl PrSurface {
                             Button::new("open-pr")
                                 .outline()
                                 .small()
-                                .icon(IconName::ExternalLink)
-                                .label("Open on GitHub")
+                                .app_icon(IconName::ExternalLink)
+                                .app_label(t("Open on GitHub"))
                                 .on_click(cx.listener(move |this, _, window, cx| this.open(&url, window, cx))),
                         ),
                     ),
@@ -281,10 +285,11 @@ impl PrSurface {
                         .flex()
                         .flex_col()
                         .child(section_title(
-                            format!(
-                                "Checks · {}",
-                                if failed > 0 { format!("{failed} failing") } else { format!("{}", checks.len()) }
-                            ),
+                            if failed > 0 {
+                                tf("Checks · {count} failing", &[("count", failed.to_string())])
+                            } else {
+                                tf("Checks · {count}", &[("count", checks.len().to_string())])
+                            },
                             cx,
                         ))
                         .children(checks.iter().map(check_row)),
@@ -296,7 +301,7 @@ impl PrSurface {
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .child(section_title(format!("Comments · {}", comments.len()), cx))
+                        .child(section_title(tf("Comments · {count}", &[("count", comments.len().to_string())]), cx))
                         .children(comments.iter().rev().take(5).enumerate().map(|(ix, c)| {
                             div()
                                 .flex()
@@ -307,14 +312,15 @@ impl PrSurface {
                                 .bg(theme.secondary)
                                 .child(
                                     div()
-                                        .text_size(TEXT_SM)
+                                        .text_size(TEXT)
                                         .font_weight(FontWeight::MEDIUM)
                                         .child(c["author"]["login"].as_str().unwrap_or("").to_string()),
                                 )
                                 .child(
-                                    div().text_size(TEXT).child(TextView::markdown(
+                                    div().text_size(TEXT).child(crate::style::markdown(
                                         ("pr-comment", ix),
                                         c["body"].as_str().unwrap_or("").to_string(),
+                                        cx,
                                     )),
                                 )
                         })),
@@ -324,10 +330,20 @@ impl PrSurface {
     }
 }
 
+/// A PR state in the current language. "Open" alone is the verb elsewhere
+/// in the app, so the state has its own key.
+fn state_label(label: &'static str) -> &'static str {
+    match (label, crate::i18n::current()) {
+        ("Open", crate::i18n::Language::En) => "Open",
+        ("Open", _) => t("Open (pull request state)"),
+        (other, _) => t(other),
+    }
+}
+
 fn section_title(text: String, cx: &App) -> impl IntoElement {
     div()
         .mb_1()
-        .text_size(TEXT_SM)
+        .text_size(TEXT)
         .font_weight(FontWeight::MEDIUM)
         .text_color(cx.theme().muted_foreground)
         .child(text)
@@ -369,12 +385,12 @@ impl Render for PrSurface {
                 .gap_3()
                 .text_size(TEXT)
                 .text_color(theme.muted_foreground)
-                .child(format!("No pull request for {branch}"))
+                .child(tf("No pull request for {branch}", &[("branch", branch.clone())]))
                 .child(
                     Button::new("create-pr")
                         .primary()
                         .small()
-                        .label("Create pull request")
+                        .app_label(t("Create pull request"))
                         .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
                 )
                 .into_any_element(),
@@ -398,7 +414,7 @@ impl Render for PrSurface {
                     div()
                         .flex()
                         .flex_col()
-                        .child(section_title(format!("Open pull requests · {}", others.len()), cx))
+                        .child(section_title(tf("Open pull requests · {count}", &[("count", others.len().to_string())]), cx))
                         .children(others.into_iter().enumerate().map(|(ix, pr)| {
                             let url = pr["url"].as_str().unwrap_or("").to_string();
                             div()
@@ -414,7 +430,7 @@ impl Render for PrSurface {
                                 .text_size(TEXT)
                                 .child(
                                     Icon::new(IconName::GitPullRequest)
-                                        .size_3p5()
+                                        .size(ICON)
                                         .text_color(if pr["isDraft"].as_bool().unwrap_or(false) {
                                             theme.muted_foreground
                                         } else {

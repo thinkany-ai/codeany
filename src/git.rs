@@ -136,3 +136,86 @@ pub fn working_tree_diff(root: &Path) -> Option<String> {
 
     Some(patch)
 }
+
+/// Run git and return its stdout, or its stderr as the error.
+fn git_checked(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|err| format!("cannot run git: {err}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Check out `branch` of `repo` at `path`, creating the branch from `HEAD`
+/// when it does not exist yet (a worktree that was removed is restored on
+/// the branch it left behind).
+pub fn add_worktree(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
+    }
+    // Forget worktrees whose folders are gone, so their branches free up.
+    let _ = git_checked(repo, &["worktree", "prune"]);
+    let path = path.to_string_lossy();
+    let exists = git_checked(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
+    let args: Vec<&str> = if exists {
+        vec!["worktree", "add", &path, branch]
+    } else {
+        vec!["worktree", "add", "-b", branch, &path, "HEAD"]
+    };
+    git_checked(repo, &args).map(|_| ())
+}
+
+/// Remove a worktree and its branch, unless either holds work that would be
+/// lost: a worktree with uncommitted changes stays, and so does a branch
+/// with commits not merged anywhere.
+pub fn remove_worktree(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    if path.exists() {
+        git_checked(repo, &["worktree", "remove", &path.to_string_lossy()])?;
+    } else {
+        let _ = git_checked(repo, &["worktree", "prune"]);
+    }
+    git_checked(repo, &["branch", "-d", branch]).map(|_| ())
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+
+    #[test]
+    fn add_and_remove_worktree() {
+        let dir = std::env::temp_dir().join(format!("codeany-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            git_checked(&repo, args).unwrap();
+        }
+        let wt = dir.join("worktrees/repo/1");
+        add_worktree(&repo, &wt, "codeany/test").unwrap();
+        assert!(wt.join(".git").exists());
+        assert_eq!(toplevel(&wt).unwrap().canonicalize().unwrap(), wt.canonicalize().unwrap());
+
+        // A removed folder comes back on the same branch.
+        std::fs::remove_dir_all(&wt).unwrap();
+        add_worktree(&repo, &wt, "codeany/test").unwrap();
+        assert!(wt.join(".git").exists());
+
+        // Uncommitted work keeps the worktree.
+        std::fs::write(wt.join("a.txt"), "x").unwrap();
+        assert!(remove_worktree(&repo, &wt, "codeany/test").is_err());
+        assert!(wt.exists());
+        std::fs::remove_file(wt.join("a.txt")).unwrap();
+        remove_worktree(&repo, &wt, "codeany/test").unwrap();
+        assert!(!wt.exists());
+        assert!(git_checked(&repo, &["rev-parse", "--verify", "--quiet", "refs/heads/codeany/test"]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

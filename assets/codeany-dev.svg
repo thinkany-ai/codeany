@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>CodeAny Dev</title>
+  <image href="codeany.svg" width="1024" height="1024"/>
+  <rect x="605" y="738" width="264" height="132" rx="40" fill="#D63922" stroke="#FFFFFF" stroke-width="14"/>
+  <g transform="translate(637 770) scale(1.16)" fill="#FFFFFF">
+    <path fill-rule="evenodd" d="M0 0h19c18 0 29 11 29 29S37 58 19 58H0Zm14 12v34h5c10 0 15-6 15-17s-5-17-15-17Z"/>
+    <path d="M60 0h41v12H74v10h24v12H74v12h27v12H60Z"/>
+    <path d="M111 0h15l12 41 12-41h15l-20 58h-14Z"/>
+  </g>
+</svg>

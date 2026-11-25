@@ -1,20 +1,23 @@
-//! The right-hand panel that hosts surface extensions, and the "Open a
-//! surface" picker.
+//! The right-hand panel that hosts surface extensions. With nothing open,
+//! or after "+", it lists the surfaces to open in place.
+
+use crate::style::AppButtonStyle as _;
 
 use std::{path::PathBuf, rc::Rc};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _};
+use gpui_kit::component::{ActiveTheme as _, Icon};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::{
     git,
+    i18n::t,
     surfaces::{self, Extension, Host, Request, Surface, SurfaceContext},
 };
 use crate::style::{
     chrome_button,
-    size::{ICON, ICON_LG, ICON_SM, TEXT, TEXT_LG, TEXT_SM, TEXT_XS},
+    size::{ICON, TEXT},
 };
 
 pub enum SurfaceHostEvent {
@@ -31,29 +34,34 @@ pub struct SurfaceHost {
     open: Vec<OpenSurface>,
     active: Option<usize>,
     visible: bool,
+    /// Listing the surfaces to open instead of showing the active one.
+    launcher: bool,
+    launcher_focus: FocusHandle,
     ctx: SurfaceContext,
 }
 
 impl EventEmitter<SurfaceHostEvent> for SurfaceHost {}
 
 impl SurfaceHost {
-    pub fn new() -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             extensions: surfaces::builtin(),
             open: Vec::new(),
             active: None,
             visible: false,
+            launcher: false,
+            launcher_focus: cx.focus_handle(),
             ctx: SurfaceContext::default(),
         }
     }
 
-    pub fn has_open(&self) -> bool {
-        !self.open.is_empty()
-    }
-
     /// Whether the panel takes room in the window.
     pub fn is_visible(&self) -> bool {
-        self.visible && !self.open.is_empty()
+        self.visible
+    }
+
+    fn showing_launcher(&self) -> bool {
+        self.launcher || self.active.is_none()
     }
 
     pub fn set_project(&mut self, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
@@ -111,15 +119,31 @@ impl SurfaceHost {
         }
     }
 
+    /// Show or hide the panel; shown with nothing open, it lists the surfaces.
     pub fn set_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.visible = visible;
+        let launcher = self.showing_launcher();
         if let Some(open) = self.active.and_then(|ix| self.open.get(ix)) {
-            open.surface.set_active(visible, window, cx);
+            open.surface.set_active(visible && !launcher, window, cx);
+        }
+        if visible && launcher {
+            self.launcher_focus.focus(window, cx);
         }
         cx.notify();
     }
 
+    /// ⌥⌘T and "+": list the surfaces in the panel; again hides the panel.
+    pub fn show_launcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible && self.showing_launcher() {
+            self.set_visible(false, window, cx);
+            return;
+        }
+        self.launcher = true;
+        self.set_visible(true, window, cx);
+    }
+
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.launcher = false;
         if let Some(previous) = self.active.filter(|&p| p != ix).and_then(|p| self.open.get(p)) {
             previous.surface.set_active(false, window, cx);
         }
@@ -142,8 +166,10 @@ impl SurfaceHost {
             Some(active) if active == ix => Some(ix.min(self.open.len() - 1)),
             other => other,
         };
-        if let Some(ix) = self.active {
+        if let Some(ix) = self.active.filter(|_| !self.launcher) {
             self.activate(ix, window, cx);
+        } else if self.active.is_none() {
+            self.launcher_focus.focus(window, cx);
         }
         cx.notify();
     }
@@ -161,76 +187,103 @@ impl SurfaceHost {
         }
     }
 
-    /// The "Open a surface" dialog.
-    pub fn show_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.has_active_dialog(cx) {
-            window.close_dialog(cx);
-            return;
-        }
-        let items: Vec<PickerItem> = self
+    /// The surfaces to open, each with its key; unavailable ones dimmed.
+    fn render_launcher(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let items: Vec<_> = self
             .extensions
             .iter()
-            .map(|e| {
-                let m = e.manifest();
-                PickerItem {
-                    id: m.id,
-                    name: m.name,
-                    icon: m.icon.clone(),
-                    key: m.key,
-                    unavailable: e.unavailable(&self.ctx),
-                    open: self.index_of(m.id).is_some(),
-                }
-            })
+            .map(|e| (e.manifest(), e.unavailable(&self.ctx)))
             .collect();
-        // Hide a native browser view while the dialog is up.
-        if let Some(open) = self.active.and_then(|ix| self.open.get(ix)) {
-            open.surface.set_active(false, window, cx);
-        }
-        let weak = cx.entity().downgrade();
-        let picker = cx.new(|cx| SurfacePicker {
-            items,
-            focus: cx.focus_handle(),
-            on_pick: Rc::new(move |id, window, cx| {
-                window.close_dialog(cx);
-                weak.update(cx, |this, cx| {
+        let keys: Vec<(char, &'static str)> = items
+            .iter()
+            .filter(|(_, unavailable)| unavailable.is_none())
+            .map(|(m, _)| (m.key, m.id))
+            .collect();
+        div()
+            .id("surface-launcher")
+            .size_full()
+            .track_focus(&self.launcher_focus)
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                let keys_down = &event.keystroke;
+                if keys_down.modifiers.platform || keys_down.modifiers.control || keys_down.modifiers.alt {
+                    return;
+                }
+                let mut chars = keys_down.key.chars();
+                let (Some(ch), None) = (chars.next(), chars.next()) else { return };
+                if let Some((_, id)) = keys.iter().find(|(key, _)| key.eq_ignore_ascii_case(&ch)) {
+                    cx.stop_propagation();
                     this.open(id, window, cx);
-                })
-                .ok();
-            }),
-        });
-        let content = picker.clone();
-        let weak = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let weak = weak.clone();
-            dialog
-                .w(px(420.))
-                .p_0()
-                .close_button(false)
-                .on_close(move |_, window, cx| {
-                    // Bring back the surface the dialog covered.
-                    weak.update(cx, |this, cx| {
-                        let visible = this.visible;
-                        if let Some(open) = this.active.and_then(|ix| this.open.get(ix)) {
-                            open.surface.set_active(visible, window, cx);
-                        }
+                }
+            }))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .px_3()
+                    .pb_2()
+                    .text_size(TEXT)
+                    .text_color(theme.muted_foreground)
+                    .child(t("Open a surface")),
+            )
+            .children(items.into_iter().map(|(m, unavailable)| {
+                let enabled = unavailable.is_none();
+                let open = self.index_of(m.id).is_some();
+                let id = m.id;
+                div()
+                    .id(m.id)
+                    .h(px(36.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded_lg()
+                    .text_size(TEXT)
+                    .when(!enabled, |this| this.opacity(0.45))
+                    .when(enabled, |this| {
+                        this.cursor_pointer()
+                            .hover(|this| this.bg(theme.list_hover))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open(id, window, cx);
+                            }))
                     })
-                    .ok();
-                })
-                .child(content.clone())
-        });
-        window.defer(cx, move |window, cx| {
-            let focus = picker.read(cx).focus.clone();
-            focus.focus(window, cx);
-        });
+                    .child(Icon::new(m.icon.clone()).size(ICON))
+                    .child(div().flex_1().child(t(m.name)))
+                    .when_some(unavailable, |this, reason| {
+                        this.child(div().text_size(TEXT).text_color(theme.muted_foreground).child(t(reason)))
+                    })
+                    .when(open, |this| this.child(div().size(px(6.)).rounded_full().bg(theme.primary)))
+                    .child(
+                        div()
+                            .size(px(22.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(theme.secondary)
+                            .text_size(TEXT)
+                            .text_color(theme.muted_foreground)
+                            .child(m.key.to_string()),
+                    )
+            }))
+            .into_any_element()
     }
 }
 
 impl Render for SurfaceHost {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let launcher = self.showing_launcher();
+        let content = if launcher {
+            Some(self.render_launcher(cx))
+        } else {
+            self.active.and_then(|ix| self.open.get(ix)).map(|o| o.surface.view().into_any_element())
+        };
         let tabs = self.open.iter().enumerate().map(|(ix, open)| {
             let m = open.extension.manifest();
-            let active = self.active == Some(ix);
+            let active = !launcher && self.active == Some(ix);
             div()
                 .id(("surface-tab", ix))
                 .group("surface-tab")
@@ -248,8 +301,8 @@ impl Render for SurfaceHost {
                     this.text_color(theme.muted_foreground)
                         .hover(|this| this.bg(theme.list_hover))
                 })
-                .child(Icon::new(m.icon.clone()).size_3p5())
-                .child(m.name)
+                .child(Icon::new(m.icon.clone()).size(ICON))
+                .child(t(m.name))
                 .child(
                     div()
                         .id(("close-surface", ix))
@@ -262,7 +315,7 @@ impl Render for SurfaceHost {
                         .when(active, |this| this.visible())
                         .group_hover("surface-tab", |this| this.visible())
                         .hover(|this| this.bg(theme.list_hover))
-                        .child(Icon::new(IconName::X).size(ICON_SM))
+                        .child(Icon::new(IconName::X).size(ICON))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.close(ix, window, cx);
@@ -270,7 +323,6 @@ impl Render for SurfaceHost {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
         });
-        let content = self.active.and_then(|ix| self.open.get(ix)).map(|o| o.surface.view());
         div()
             .size_full()
             .flex()
@@ -301,116 +353,20 @@ impl Render for SurfaceHost {
                     )
                     .child(
                         chrome_button("add-surface")
-                            .icon(Icon::new(IconName::Plus).size(ICON))
-                            .tooltip("Open a surface (⌘T)")
-                            .on_click(cx.listener(|this, _, window, cx| this.show_picker(window, cx))),
+                            .app_icon(IconName::Plus)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.launcher = true;
+                                this.set_visible(true, window, cx);
+                            }))
+                            .app_tooltip(t("Open a surface (⌥⌘T)")),
                     )
                     .child(
                         chrome_button("hide-surfaces")
-                            .icon(Icon::new(IconName::PanelRightClose).size(ICON_LG))
-                            .tooltip("Hide panel")
-                            .on_click(cx.listener(|this, _, window, cx| this.set_visible(false, window, cx))),
+                            .app_icon(IconName::PanelRightClose)
+                            .on_click(cx.listener(|this, _, window, cx| this.set_visible(false, window, cx)))
+                            .app_tooltip(t("Hide panel")),
                     ),
             )
             .child(div().flex_1().min_h_0().when_some(content, |this, view| this.child(view)))
-    }
-}
-
-struct PickerItem {
-    id: &'static str,
-    name: &'static str,
-    icon: IconName,
-    key: char,
-    unavailable: Option<&'static str>,
-    open: bool,
-}
-
-/// "Open a surface": every extension with its key; unavailable ones dimmed.
-struct SurfacePicker {
-    items: Vec<PickerItem>,
-    focus: FocusHandle,
-    on_pick: Rc<dyn Fn(&'static str, &mut Window, &mut App)>,
-}
-
-impl Render for SurfacePicker {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        div()
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let keys = &event.keystroke;
-                if keys.modifiers.platform || keys.modifiers.control || keys.modifiers.alt {
-                    return;
-                }
-                let Some(ch) = keys.key.chars().next().filter(|_| keys.key.chars().count() == 1) else {
-                    return;
-                };
-                let pick = this
-                    .items
-                    .iter()
-                    .find(|item| item.key.eq_ignore_ascii_case(&ch) && item.unavailable.is_none())
-                    .map(|item| item.id);
-                if let Some(id) = pick {
-                    cx.stop_propagation();
-                    (this.on_pick)(id, window, cx);
-                }
-            }))
-            .px_4()
-            .py_5()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .mb_3()
-                    .text_size(TEXT_LG)
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_center()
-                    .child("Open a surface"),
-            )
-            .children(self.items.iter().map(|item| {
-                let enabled = item.unavailable.is_none();
-                let (id, on_pick) = (item.id, self.on_pick.clone());
-                div()
-                    .id(item.id)
-                    .h(px(36.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .rounded_lg()
-                    .text_size(TEXT)
-                    .when(!enabled, |this| this.opacity(0.45))
-                    .when(enabled, |this| {
-                        this.cursor_pointer()
-                            .hover(|this| this.bg(theme.list_hover))
-                            .on_click(move |_, window, cx| on_pick(id, window, cx))
-                    })
-                    .child(Icon::new(item.icon.clone()).size(ICON_LG))
-                    .child(div().flex_1().child(item.name))
-                    .when_some(item.unavailable, |this, reason| {
-                        this.child(
-                            div()
-                                .text_size(TEXT_SM)
-                                .text_color(theme.muted_foreground)
-                                .child(reason),
-                        )
-                    })
-                    .when(item.open, |this| {
-                        this.child(div().size(px(6.)).rounded_full().bg(theme.primary))
-                    })
-                    .child(
-                        div()
-                            .size(px(22.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .bg(theme.secondary)
-                            .text_size(TEXT_XS)
-                            .text_color(theme.muted_foreground)
-                            .child(item.key.to_string()),
-                    )
-            }))
     }
 }

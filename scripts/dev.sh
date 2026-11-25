@@ -1,8 +1,10 @@
 #!/bin/sh
 # Run the dev build and restart it whenever the source changes.
 #
-#   scripts/dev.sh [project-dir]
+#   scripts/dev.sh [project-dir | none]
 #
+# `none` launches without a folder, as Finder and the Dock do: the app then
+# reopens the last project, or nothing on a first run.
 # Rust cannot swap code into a running GPUI app, so "hot reload" here is a
 # rebuild and relaunch on save. A failed build leaves the running app alone.
 set -u
@@ -31,9 +33,13 @@ stop_app() {
 
 start_app() {
     # Launched from inside the bundle, so it keeps its name and Dock icon.
-    "$APP_BIN" "$PROJECT" &
+    if [ "$PROJECT" = none ]; then
+        "$APP_BIN" &
+    else
+        "$APP_BIN" "$PROJECT" &
+    fi
     APP_PID=$!
-    echo "dev: running (pid $APP_PID) on $PROJECT"
+    echo "dev: running (pid $APP_PID) on $([ "$PROJECT" = none ] && echo "no folder" || echo "$PROJECT")${CODEANY_HOME:+, data in $CODEANY_HOME}${CODEANY_AGL_PORT:+, port $CODEANY_AGL_PORT}"
 }
 
 build() {

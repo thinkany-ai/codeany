@@ -19,7 +19,7 @@ use std::{path::PathBuf, rc::Rc};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::*;
-use crate::style::size::{TEXT};
+use crate::style::size::TEXT;
 
 /// What every surface knows about where it is.
 #[derive(Clone, Debug, Default, PartialEq)]

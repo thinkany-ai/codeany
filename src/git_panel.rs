@@ -1,5 +1,7 @@
 //! The right-hand panel: every working tree change against `HEAD`.
 
+use crate::style::AppButtonStyle as _;
+
 use std::path::PathBuf;
 
 use gpui_kit::component::{
@@ -11,7 +13,8 @@ use gpui_kit::*;
 use gpui_kit::assets::IconName;
 
 use crate::git;
-use crate::style::size::{TEXT, TEXT_SM};
+use crate::i18n::{t, tf};
+use crate::style::size::TEXT;
 
 pub struct GitPanel {
     root: Option<PathBuf>,
@@ -71,7 +74,7 @@ impl GitPanel {
                 self.error = None;
                 self.diff.update(cx, |diff, cx| diff.set_files(files, cx));
             }
-            Err(err) => self.error = Some(format!("Failed to parse diff: {err}").into()),
+            Err(err) => self.error = Some(tf("Failed to parse diff: {err}", &[("err", err.to_string())]).into()),
         }
         self.patch = patch;
         cx.notify();
@@ -123,7 +126,7 @@ impl GitPanel {
                     .text_size(TEXT)
                     .cursor_pointer()
                     .hover(|this| this.bg(theme.list_hover))
-                    .child(div().w(px(10.)).text_size(TEXT_SM).text_color(color).child(letter))
+                    .child(div().w(px(10.)).text_size(TEXT).text_color(color).child(letter))
                     .child(div().flex_none().child(name))
                     .child(
                         div()
@@ -131,14 +134,14 @@ impl GitPanel {
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
-                            .text_size(TEXT_SM)
+                            .text_size(TEXT)
                             .text_color(theme.muted_foreground)
                             .child(path.clone()),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(TEXT_SM)
+                            .text_size(TEXT)
                             .flex()
                             .gap_1()
                             .child(
@@ -176,10 +179,10 @@ impl Render for GitPanel {
             .border_color(theme.border)
             .child(
                 div()
-                    .text_size(TEXT_SM)
+                    .text_size(TEXT)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.muted_foreground)
-                    .child(format!("CHANGES ({file_count})")),
+                    .child(tf("CHANGES ({count})", &[("count", file_count.to_string())])),
             )
             .child(
                 div()
@@ -189,34 +192,34 @@ impl Render for GitPanel {
                         Button::new("diff-mode")
                             .ghost()
                             .xsmall()
-                            .icon(match self.mode {
+                            .app_icon(match self.mode {
                                 DiffMode::Unified => IconName::Columns2,
                                 _ => IconName::Rows2,
                             })
-                            .tooltip(match self.mode {
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_mode(cx)))
+                            .app_tooltip(t(match self.mode {
                                 DiffMode::Unified => "Side by side",
                                 _ => "Unified",
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_mode(cx))),
+                            })),
                     )
                     .child(
                         Button::new("diff-refresh")
                             .ghost()
                             .xsmall()
-                            .icon(IconName::RefreshCw)
-                            .tooltip("Refresh")
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            .app_icon(IconName::RefreshCw)
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
+                            .app_tooltip(t("Refresh")),
                     ),
             );
 
         let body = if self.root.is_none() {
-            placeholder("No folder opened", &theme).into_any_element()
+            placeholder(t("No folder opened"), &theme).into_any_element()
         } else if !self.is_repo {
-            placeholder("Not a git repository", &theme).into_any_element()
+            placeholder(t("Not a git repository"), &theme).into_any_element()
         } else if let Some(error) = self.error.clone() {
             placeholder(error, &theme).into_any_element()
         } else if file_count == 0 {
-            placeholder("No changes", &theme).into_any_element()
+            placeholder(t("No changes"), &theme).into_any_element()
         } else {
             div()
                 .flex_1()

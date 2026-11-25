@@ -1,17 +1,17 @@
 //! The main window: sidebar, conversation or editor, and the surfaces panel.
 
+use crate::style::AppButtonStyle as _;
+
 use std::{
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, kbd::Kbd, Selectable as _, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, kbd::Kbd, Selectable as _,
     button::{Button, ButtonVariants as _},
     input::{Editor, EditorState, InputEvent},
-    notification::Notification,
-    menu::{DropdownMenu as _, PopupMenuItem},
-    Side,
+    notification::{Notification, NotificationType},
     resizable::{h_resizable, resizable_panel},
     WindowExt as _,
 };
@@ -20,7 +20,8 @@ use gpui_kit::*;
 use gpui_kit::assets::IconName;
 
 use crate::{
-    CloseTab, NewThread, OpenFolder, OpenSettings, OpenSurface, RefreshProject, Save, Search,
+    CloseTab, NewTab, NewThread, NextTab, OpenFolder, PrevTab, ReopenTab, SelectLastTab,
+    SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, OpenSettings, OpenSurface, RefreshProject, Save, Search,
     OpenEditor, ToggleGitPanel, ToggleSidebar, ToggleTerminal,
     agent_panel::{AgentPanel, AgentPanelEvent},
     search_palette::{self, Badge, SearchPalette, SearchPaletteEvent, Target},
@@ -30,7 +31,8 @@ use crate::{
 };
 use crate::style::chrome_button;
 use crate::style::layout;
-use crate::style::size::{HEADING, ICON, ICON_LG, ICON_SM, TEXT, TEXT_SM};
+use crate::style::size::{TEXT, ICON};
+use crate::i18n::{t, tf};
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -59,6 +61,9 @@ const TRAFFIC_LIGHTS_WIDTH: f32 = 86.;
 
 pub struct Workspace {
     root: Option<PathBuf>,
+    /// The active thread's worktree, shown in the file tree, surfaces and git
+    /// status in place of `root`.
+    work_dir: Option<PathBuf>,
     /// The main window shows the agent; an editor window, opened from it, the editor.
     mode: Mode,
     /// From the main window: its editor window, while open.
@@ -121,19 +126,22 @@ fn modified_at(path: &Path) -> Option<SystemTime> {
 fn load_text(path: &Path) -> Result<String, SharedString> {
     let meta = std::fs::metadata(path).map_err(|e| SharedString::from(e.to_string()))?;
     if meta.len() > MAX_FILE_BYTES {
-        return Err(format!("File is too large to open ({} MB)", meta.len() / 1024 / 1024).into());
+        return Err(tf("File is too large to open ({size} MB)", &[("size", (meta.len() / 1024 / 1024).to_string())]).into());
     }
     let bytes = std::fs::read(path).map_err(|e| SharedString::from(e.to_string()))?;
     if bytes.iter().take(8192).any(|b| *b == 0) {
-        return Err("Binary file is not displayed".into());
+        return Err(t("Binary file is not displayed").into());
     }
-    String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8".into())
+    String::from_utf8(bytes).map_err(|_| t("File is not valid UTF-8").into())
 }
 
 impl Workspace {
     /// The main window, showing the agent.
     pub fn new(root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let agent_panel = cx.new(|cx| AgentPanel::new(window, cx));
+        // Launched without a folder (from Finder or the Dock): pick up where
+        // the last run left off. The very first run opens nothing.
+        let root = root.or_else(|| agent_panel.read(cx).last_project());
         let this = Self::build(root, Mode::Agent, agent_panel, None, window, cx);
         let handle = this.agent_panel.read(cx).composer_focus_handle(cx);
         handle.focus(window, cx);
@@ -163,7 +171,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let file_tree = cx.new(FileTree::new);
-        let surfaces = cx.new(|_| SurfaceHost::new());
+        let surfaces = cx.new(SurfaceHost::new);
 
         let mut subscriptions = vec![
             cx.subscribe_in(
@@ -180,12 +188,23 @@ impl Workspace {
             cx.observe_window_appearance(window, |_, window, cx| crate::style::apply(window, cx)),
         ];
         if mode == Mode::Agent {
+            #[cfg(target_os = "macos")]
+            subscriptions.push(
+                cx.observe_global::<crate::updater::AvailableUpdate>(|_, cx| cx.notify()),
+            );
             subscriptions.push(cx.subscribe_in(&agent_panel, window, Self::on_agent_event));
-            subscriptions.push(cx.observe(&agent_panel, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe_in(&agent_panel, window, |this, panel, window, cx| {
+                let work_dir = panel.read(cx).work_dir();
+                if work_dir != this.work_dir {
+                    this.set_work_dir(work_dir, window, cx);
+                }
+                cx.notify();
+            }));
         }
 
         let mut this = Self {
             root: None,
+            work_dir: None,
             mode,
             editor_window: None,
             main_window,
@@ -208,8 +227,24 @@ impl Workspace {
         this
     }
 
+    /// The folder the file tree, surfaces and git status show.
+    fn shown_dir(&self) -> Option<PathBuf> {
+        self.work_dir.clone().or_else(|| self.root.clone())
+    }
+
+    /// Show a thread's worktree in place of the project, or (`None`) the
+    /// project again.
+    fn set_work_dir(&mut self, work_dir: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.work_dir = work_dir;
+        let dir = self.shown_dir();
+        self.git = RepoSnapshot::default();
+        self.file_tree.update(cx, |tree, cx| tree.set_root(dir.clone(), cx));
+        self.surfaces.update(cx, |surfaces, cx| surfaces.set_project(dir, window, cx));
+    }
+
     fn set_root(&mut self, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         self.root = root.clone();
+        self.work_dir = None;
         self.tabs.clear();
         self.active_tab = None;
         self.git = RepoSnapshot::default();
@@ -224,7 +259,7 @@ impl Workspace {
 
         let app = match self.mode {
             Mode::Agent => "CodeAny",
-            Mode::Editor => "CodeAny Editor",
+            Mode::Editor => t("CodeAny Editor"),
         };
         let title = root
             .as_ref()
@@ -236,7 +271,7 @@ impl Workspace {
         self._poll_task = root.map(|_| {
             cx.spawn_in(window, async move |this, cx| {
                 loop {
-                    let Ok(root) = this.read_with(cx, |this, _| this.root.clone()) else {
+                    let Ok(root) = this.read_with(cx, |this, _| this.shown_dir()) else {
                         break;
                     };
                     let Some(root) = root else { break };
@@ -261,6 +296,10 @@ impl Workspace {
     fn apply_snapshot(&mut self, snapshot: RepoSnapshot, window: &mut Window, cx: &mut Context<Self>) {
         let changed = snapshot != self.git;
         self.git = snapshot.clone();
+        if self.mode == Mode::Agent {
+            let branch = snapshot.branch.clone();
+            self.agent_panel.update(cx, |panel, cx| panel.set_branch(branch, cx));
+        }
         self.file_tree.update(cx, |tree, cx| {
             tree.set_git(snapshot, cx);
             tree.refresh(cx);
@@ -379,7 +418,7 @@ impl Workspace {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open".into()),
+            prompt: Some(t("Open").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else {
@@ -409,14 +448,24 @@ impl Workspace {
                 self.surfaces.update(cx, |surfaces, cx| surfaces.refresh(window, cx));
             }
             Err(err) => {
-                let message = format!("Failed to save {}: {err}", tab.path.display());
-                window.push_notification(Notification::error(message), cx);
+                let message = tf("Failed to save {path}: {err}", &[("path", tab.path.display().to_string()), ("err", err.to_string())]);
+                let message: SharedString = message.into();
+                window.push_notification(
+                    Notification::new()
+                        .with_type(NotificationType::Error)
+                        .content(move |_, _, _| div().text_size(TEXT).child(message.clone()).into_any_element()),
+                    cx,
+                );
             }
         }
         cx.notify();
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Agent {
+            self.agent_panel.update(cx, |panel, cx| panel.close_tab(None, window, cx));
+            return;
+        }
         if let Some(ix) = self.active_tab {
             self.close_tab_at(ix, window, cx);
         }
@@ -436,12 +485,16 @@ impl Workspace {
     }
 
     fn open_surface(&mut self, _: &OpenSurface, window: &mut Window, cx: &mut Context<Self>) {
-        self.surfaces.update(cx, |surfaces, cx| surfaces.show_picker(window, cx));
+        self.surfaces.update(cx, |surfaces, cx| surfaces.show_launcher(window, cx));
     }
 
     fn refresh_project(&mut self, _: &RefreshProject, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(root) = &self.root {
+            cx.remove_asset::<crate::project_avatar::ProjectLogo>(root);
+        }
         self.file_tree.update(cx, |tree, cx| tree.refresh(cx));
         self.surfaces.update(cx, |surfaces, cx| surfaces.refresh(window, cx));
+        cx.notify();
     }
 
     fn relative_path(&self, path: &Path) -> String {
@@ -508,7 +561,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .size(px(20.))
+                            .size(rems(1.5))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -520,7 +573,7 @@ impl Workspace {
                                 } else {
                                     this.child(
                                         Icon::new(IconName::X)
-                                            .xsmall()
+                                            .size(ICON)
                                             .text_color(theme.muted_foreground),
                                     )
                                     .invisible()
@@ -580,7 +633,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .px_3()
-                    .text_size(TEXT_SM)
+                    .text_size(TEXT)
                     .text_color(theme.muted_foreground)
                     .child(self.relative_path(&tab.path).replace('/', " › ")),
             )
@@ -596,7 +649,7 @@ impl Workspace {
                 .justify_between()
                 .w(px(280.))
                 .text_size(TEXT)
-                .child(div().text_color(theme.muted_foreground).child(label))
+                .child(div().text_color(theme.muted_foreground).child(t(label)))
                 .child(div().text_color(theme.foreground).child(keys))
         };
         div()
@@ -609,7 +662,7 @@ impl Workspace {
             .bg(theme.background)
             .child(
                 div()
-                    .text_size(HEADING)
+                    .text_size(TEXT)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.muted_foreground)
                     .child("CodeAny"),
@@ -618,7 +671,7 @@ impl Workspace {
                 this.child(
                     Button::new("open-folder")
                         .primary()
-                        .label("Open Folder…")
+                        .app_label(t("Open Folder…"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_folder(&OpenFolder, window, cx)
                         })),
@@ -644,7 +697,7 @@ impl Workspace {
         let cursor = active.and_then(|tab| match &tab.content {
             TabContent::Editor(editor) => {
                 let position = editor.read(cx).cursor_position();
-                Some(format!("Ln {}, Col {}", position.line + 1, position.character + 1))
+                Some(tf("Ln {line}, Col {col}", &[("line", (position.line + 1).to_string()), ("col", (position.character + 1).to_string())]))
             }
             TabContent::Message(_) => None,
         });
@@ -657,7 +710,7 @@ impl Workspace {
             .items_center()
             .justify_between()
             .px_2()
-            .text_size(TEXT_SM)
+            .text_size(TEXT)
             .bg(theme.title_bar)
             .border_t_1()
             .border_color(theme.border)
@@ -673,12 +726,12 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .child(Icon::new(IconName::GitBranch).size(ICON_SM))
+                                .child(Icon::new(IconName::GitBranch).size(ICON))
                                 .child(branch),
                         )
                     })
                     .when(!self.git.statuses.is_empty(), |this| {
-                        this.child(format!("{} changed", self.git.statuses.len()))
+                        this.child(tf("{n} changed", &[("n", self.git.statuses.len().to_string())]))
                     }),
             )
             .child(
@@ -704,7 +757,7 @@ impl Workspace {
     ) {
         match event {
             AgentPanelEvent::OpenFile(path) => {
-                let path = match (&self.root, path.is_relative()) {
+                let path = match (&self.shown_dir(), path.is_relative()) {
                     (Some(root), true) => root.join(path),
                     _ => path.clone(),
                 };
@@ -765,7 +818,7 @@ impl Workspace {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
             titlebar: Some(TitlebarOptions {
-                title: Some("CodeAny Editor".into()),
+                title: Some(t("CodeAny Editor").into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(14.), px(13.))),
             }),
@@ -813,6 +866,10 @@ impl Workspace {
                 .w(px(crate::settings::WIDTH))
                 .margin_top(top)
                 .p_0()
+                // The settings view draws its own background, border and
+                // corners; the dialog's would peek out around them.
+                .bg(gpui_kit::transparent_black())
+                .border_0()
                 .close_button(false)
                 .child(settings.clone())
         });
@@ -824,9 +881,9 @@ impl Workspace {
             window.close_dialog(cx);
             return;
         }
-        let command = |label: &str, icon: IconName, action: Box<dyn Action>| search_palette::Item {
+        let command = |label: &'static str, icon: IconName, action: Box<dyn Action>| search_palette::Item {
             icon,
-            label: label.into(),
+            label: t(label).into(),
             detail: None,
             badge: Badge::Keys(Kbd::binding_for_action(action.as_ref(), Some("Workspace"), window)),
             target: Target::Action(action),
@@ -905,6 +962,26 @@ impl Workspace {
         cx.notify();
     }
 
+    /// ⌘T: a new chat tab; in an editor window, the surfaces as before.
+    fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        match self.mode {
+            Mode::Agent => self.agent_panel.update(cx, |panel, cx| panel.new_tab(window, cx)),
+            Mode::Editor => self.open_surface(&OpenSurface, window, cx),
+        }
+    }
+
+    /// Run `f` on the agent panel's tabs, in the main window only.
+    fn with_tabs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut AgentPanel, &mut Window, &mut Context<AgentPanel>),
+    ) {
+        if self.mode == Mode::Agent {
+            self.agent_panel.update(cx, |panel, cx| f(panel, window, cx));
+        }
+    }
+
     fn new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
         match self.mode {
             Mode::Agent => self
@@ -936,66 +1013,15 @@ impl Workspace {
     /// The main window's way into its editor window.
     fn render_editor_button(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         chrome_button(id)
-            .child(Icon::new(IconName::SquareCode).size(ICON_LG))
-            .tooltip("Open Editor Window (⌘E)")
+            .child(Icon::new(IconName::SquareCode).size(ICON))
             .on_click(cx.listener(|this, _, window, cx| this.open_editor(&OpenEditor, window, cx)))
+            .app_tooltip(t("Open Editor Window (⌘E)"))
     }
 
-    fn render_mode_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mode = self.mode;
-        let workspace = cx.entity().downgrade();
-        Button::new("workspace-mode")
-            .ghost()
-            .small()
-            .h(layout::SIDEBAR_NAV_ROW)
-            .px(layout::SPACE_2)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(layout::SPACE_2)
-                    .text_size(TEXT)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(if mode == Mode::Agent { "CodeAny" } else { "Editor" })
-                    .child(Icon::new(IconName::ChevronDown).size(ICON_SM).text_color(cx.theme().muted_foreground)),
-            )
-            .dropdown_menu(move |menu, _, _| {
-                let agent = workspace.clone();
-                let editor = workspace.clone();
-                let entry = |title: &'static str, description: &'static str| {
-                    PopupMenuItem::element(move |_, cx| {
-                        div()
-                            .py(layout::SPACE_2)
-                            .flex()
-                            .flex_col()
-                            .gap(layout::SPACE_1)
-                            .child(div().text_size(crate::style::size::TEXT_LG).child(title))
-                            .child(div().text_size(TEXT_SM).text_color(cx.theme().muted_foreground).child(description))
-                    })
-                };
-                menu.min_w(px(236.)).check_side(Side::Right)
-                    .item(entry("CodeAny", "Chat and work with agents")
-                        .checked(mode == Mode::Agent)
-                        .on_click(move |_, _, cx| {
-                            if mode == Mode::Editor {
-                                agent.update(cx, |this, cx| this.with_main_window(cx, |_, _, _| {})).ok();
-                            }
-                        }))
-                    .item(entry("Editor", "Browse and edit project files")
-                        .checked(mode == Mode::Editor)
-                        .on_click(move |_, window, cx| {
-                            if mode == Mode::Agent {
-                                editor.update(cx, |this, cx| this.open_editor(&OpenEditor, window, cx)).ok();
-                            }
-                        }))
-            })
-    }
-
-    fn render_sidebar_nav(&self, id: &'static str, label: &'static str, icon: IconName, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_chat_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let selected = id == "nav-editor" && self.mode == Mode::Editor;
         div()
-            .id(id)
+            .id("nav-chat")
             .h(layout::SIDEBAR_NAV_ROW)
             .flex_none()
             .px(layout::SIDEBAR_ROW_INSET)
@@ -1003,17 +1029,15 @@ impl Workspace {
             .rounded(layout::RADIUS)
             .cursor_pointer().text_size(TEXT)
             .text_color(theme.foreground.opacity(0.85))
-            .when(selected, |this| this.bg(theme.list_active).text_color(theme.foreground))
             .hover(|this| this.bg(theme.list_hover).text_color(theme.foreground))
-            .child(Icon::new(icon).size(ICON_LG).flex_none().text_color(theme.muted_foreground))
-            .child(label)
-            .on_click(cx.listener(move |this, _, window, cx| match id {
-                "nav-chat" => this.new_thread(&NewThread, window, cx),
-                "nav-editor" => {
-                    if this.mode == Mode::Agent { this.open_editor(&OpenEditor, window, cx); }
-                }
-                _ => this.open_settings(&OpenSettings, window, cx),
-            }))
+            .child(
+                Icon::new(IconName::MessageCirclePlus)
+                    .size(ICON)
+                    .flex_none()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(t("New Chat"))
+            .on_click(cx.listener(|this, _, window, cx| this.new_thread(&NewThread, window, cx)))
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1024,7 +1048,7 @@ impl Workspace {
         };
         let can_back = self.mode == Mode::Agent && self.agent_panel.read(cx).can_navigate(false);
         let can_forward = self.mode == Mode::Agent && self.agent_panel.read(cx).can_navigate(true);
-        div()
+        let sidebar = div()
             .size_full().min_w_0().flex().flex_col().bg(theme.sidebar)
             .child(
                 div()
@@ -1032,74 +1056,257 @@ impl Workspace {
                     .pl(px(TRAFFIC_LIGHTS_WIDTH)).pr(layout::SIDEBAR_INSET)
                     .child(
                         chrome_button("hide-sidebar")
-                            .child(crate::icons::sidebar().size(ICON_LG))
+                            .child(crate::icons::sidebar().size(ICON))
                             .text_color(theme.muted_foreground)
-                            .tooltip("Hide Sidebar (⌘B)")
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)))
+                            .app_tooltip(t("Hide Sidebar (⌘B)")),
                     )
                     .child(
                         chrome_button("sidebar-search")
-                            .child(crate::icons::search().size(ICON_LG))
+                            .child(crate::icons::search().size(ICON))
                             .text_color(theme.muted_foreground)
-                            .tooltip("Search (⌘P)")
-                            .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
+                            .app_tooltip(t("Search (⌘P)")),
                     )
                     .child(Self::drag_region("sidebar-drag"))
                     .child(
                         chrome_button("sidebar-back").disabled(!can_back)
-                            .child(Icon::new(IconName::ArrowLeft).size(ICON_LG))
+                            .child(Icon::new(IconName::ArrowLeft).size(ICON))
                             .text_color(theme.muted_foreground)
-                            .tooltip("Previous conversation")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.agent_panel.update(cx, |panel, cx| panel.navigate(false, window, cx));
-                            })),
+                            }))
+                            .app_tooltip(t("Previous conversation")),
                     )
                     .child(
                         chrome_button("sidebar-forward").disabled(!can_forward)
-                            .child(Icon::new(IconName::ArrowRight).size(ICON_LG))
+                            .child(Icon::new(IconName::ArrowRight).size(ICON))
                             .text_color(theme.muted_foreground)
-                            .tooltip("Next conversation")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.agent_panel.update(cx, |panel, cx| panel.navigate(true, window, cx));
-                            })),
+                            }))
+                            .app_tooltip(t("Next conversation")),
                     ),
             )
             .child(
                 div().flex_none().px(layout::SIDEBAR_INSET).pt(layout::SPACE_3)
                     .flex().flex_col()
-                    .child(self.render_sidebar_nav("nav-chat", "New Chat", IconName::Send, cx))
-                    .child(self.render_sidebar_nav("nav-editor", "Editor", IconName::SquareTerminal, cx))
-                    .child(self.render_sidebar_nav("nav-customize", "Customize", IconName::Blocks, cx)),
+                    .child(self.render_new_chat_button(cx)),
             )
-            .child(div().flex_1().min_h_0().min_w_0().child(content))
-            .when(self.mode == Mode::Agent && self.root.is_none(), |this| {
+            .child(div().flex_1().min_h_0().min_w_0().child(content));
+
+        sidebar.child(self.render_sidebar_footer(cx))
+    }
+
+    /// The sidebar's foot: settings, and, when one is ready, the update on
+    /// the right.
+    fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let mode = self.mode;
+        let icon_button = |id: &'static str, icon: IconName| {
+            chrome_button(id)
+                .child(Icon::new(icon).size(ICON))
+                .text_color(theme.muted_foreground)
+        };
+        #[cfg(target_os = "macos")]
+        let update = cx
+            .try_global::<crate::updater::AvailableUpdate>()
+            .and_then(|update| update.0.clone())
+            .filter(|_| mode == Mode::Agent);
+        #[cfg(not(target_os = "macos"))]
+        let update: Option<String> = None;
+        div()
+            .h(px(52.))
+            .flex_none()
+            .px(layout::SIDEBAR_INSET)
+            .flex()
+            .items_center()
+            .gap(layout::SPACE_1)
+            .child(
+                icon_button("open-settings", IconName::Settings)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(&OpenSettings, window, cx)))
+                    .app_tooltip(t("Settings (⌘,)")),
+            )
+            .child(div().flex_1())
+            .when_some(update, |this, version| {
                 this.child(
-                    div().mx(layout::SIDEBAR_INSET).mb(layout::SPACE_2).p(layout::SPACE_3)
-                        .rounded(layout::BUBBLE_RADIUS).border_1().border_color(theme.border)
-                        .bg(theme.background.opacity(0.55)).flex().flex_col().gap(layout::SPACE_2)
-                        .child(div().text_size(TEXT).child("Your workspace"))
-                        .child(div().text_size(TEXT_SM).text_color(theme.muted_foreground).child("Open a repository to keep chats and files together."))
-                        .child(Button::new("setup-open-folder").small().w_full().label("Open Folder")
-                            .on_click(cx.listener(|this, _, window, cx| this.open_folder(&OpenFolder, window, cx)))),
+                    div()
+                        .id("install-update")
+                        .size(px(32.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(theme.foreground.opacity(0.7))
+                        .text_color(theme.foreground)
+                        .cursor_pointer()
+                        .hover(|this| this.bg(theme.list_hover))
+                        .child(Icon::new(IconName::ArrowUp).size(ICON))
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(tf("Update to {version}", &[("version", version.to_string())]))
+                                .text_size(TEXT)
+                                .build(window, cx)
+                        })
+                        .on_click(|_, _, _| {
+                            #[cfg(target_os = "macos")]
+                            crate::updater::check();
+                        }),
                 )
             })
-            .child(
-                div().h(px(56.)).flex_none().px(layout::SIDEBAR_INSET)
-                    .flex().items_center().gap(layout::SPACE_2)
+    }
+
+    /// The agent window's tabs, one per open thread, drawn like a browser's:
+    /// the active tab takes the page's color and flows into it, with curved
+    /// feet; the others sit on the darker strip, split by thin rules.
+    fn render_chat_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const RADIUS: Pixels = px(8.);
+        // × and + share a size and colour.
+        const TAB_ICON: Pixels = px(14.);
+        let theme = cx.theme().clone();
+        let (tabs, active) = self.agent_panel.read(cx).tab_items();
+        let count = tabs.len();
+        let closable = count > 1 || self.agent_panel.read(cx).has_open_thread();
+        let icon_size = crate::style::size::icon_pixels(cx);
+        // A concave corner joining the active tab to the page.
+        let foot = |left: bool| {
+            div()
+                .absolute()
+                // Down to the strip's bottom row: the curve ends the rule,
+                // instead of the rule showing under the curve.
+                .bottom_0()
+                .when(left, |this| this.left(-RADIUS))
+                .when(!left, |this| this.right(-RADIUS))
+                .size(RADIUS)
+                .bg(theme.background)
+                .child(div().size_full().bg(theme.tab_bar).map(|this| {
+                    if left { this.rounded_br(RADIUS) } else { this.rounded_bl(RADIUS) }
+                }))
+        };
+        div()
+            .id("chat-tabs")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_end()
+            .pl(RADIUS)
+            .children(tabs.into_iter().enumerate().map(|(ix, tab)| {
+                let selected = ix == active;
+                // Rules split two inactive tabs; none touches the active one.
+                let rule = ix + 1 < count && !selected && ix + 1 != active;
+                let shortcut = match ix {
+                    0..=7 => format!(" (⌘{})", ix + 1),
+                    _ => String::new(),
+                };
+                let tip = format!("{}{shortcut}", tab.title);
+                let icon = if tab.running {
+                    Icon::new(IconName::LoaderCircle)
+                        .size(ICON)
+                        .text_color(theme.primary)
+                        .with_animation(
+                            ("chat-tab-spin", ix),
+                            Animation::new(std::time::Duration::from_secs(1)).repeat(),
+                            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+                        )
+                        .into_any_element()
+                } else {
+                    match &tab.agent {
+                        Some(agent) => crate::agent_icons::agent_icon(agent, icon_size, cx),
+                        None => Icon::new(IconName::MessageCirclePlus).size(ICON).into_any_element(),
+                    }
+                };
+                div()
+                    .id(("chat-tab", ix))
+                    .group("chat-tab")
+                    .relative()
+                    // Full width until crowded, then all shrink alike.
+                    .w(px(220.))
+                    .flex_shrink(1.)
+                    .min_w(px(56.))
+                    .h(px(32.))
+                    .pl_3()
+                    .pr_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_t(RADIUS)
+                    .text_size(TEXT)
+                    .cursor_pointer()
+                    .map(|this| {
+                        if selected {
+                            // Reaches the strip's bottom row, over its rule.
+                            this.bg(theme.background)
+                                .text_color(theme.foreground)
+                                .child(foot(true))
+                                .child(foot(false))
+                        } else {
+                            this.text_color(theme.muted_foreground)
+                                .hover(|this| this.bg(theme.list_hover).text_color(theme.foreground))
+                        }
+                    })
+                    .child(div().flex_none().flex().items_center().child(icon))
                     .child(
-                        div().size(px(28.)).flex_none().rounded_full().bg(theme.foreground.opacity(0.07))
-                            .flex().items_center().justify_center()
-                            .child(Icon::new(IconName::SquareCode).size(ICON_LG).text_color(theme.muted_foreground)),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(tab.title),
                     )
-                    .child(self.render_mode_picker(cx))
-                    .child(div().flex_1())
-                    .child(
-                        chrome_button("open-settings")
-                            .child(Icon::new(IconName::Settings).size(ICON_LG))
-                            .text_color(theme.muted_foreground).tooltip("Settings (⌘,)")
-                            .on_click(cx.listener(|this, _, window, cx| this.open_settings(&OpenSettings, window, cx))),
-                    ),
+                    .when(closable, |this| {
+                        this.child(
+                            div()
+                                .id(("chat-tab-close", ix))
+                                .size(px(18.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .text_color(theme.muted_foreground)
+                                .hover(|this| this.bg(theme.foreground.opacity(0.1)).text_color(theme.foreground))
+                                .child(Icon::new(IconName::X).size(TAB_ICON))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.agent_panel.update(cx, |panel, cx| panel.close_tab(Some(ix), window, cx));
+                                })),
+                        )
+                    })
+                    .when(rule, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .right_0()
+                                .top(px(9.))
+                                .h(px(14.))
+                                .w(px(1.))
+                                .bg(theme.border)
+                                .group_hover("chat-tab", |this| this.invisible()),
+                        )
+                    })
+                    .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, window, cx| {
+                        this.agent_panel.update(cx, |panel, cx| panel.close_tab(Some(ix), window, cx));
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.agent_panel.update(cx, |panel, cx| panel.select_tab(ix, window, cx));
+                    }))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(tip.clone()).text_size(TEXT).build(window, cx)
+                    })
+            }))
+            .child(
+                div().h_full().flex_none().flex().items_center().pl_1().child(
+                    chrome_button("new-chat-tab")
+                        .text_color(theme.muted_foreground)
+                        .child(Icon::new(IconName::Plus).size(TAB_ICON))
+                        .on_click(cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)))
+                        .app_tooltip(t("New Tab (⌘T)")),
+                ),
             )
+            // The strip past the tabs drags the window.
+            .child(Self::drag_region("chat-tabs-drag"))
     }
 
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1109,15 +1316,11 @@ impl Workspace {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "No project".into())
+            .unwrap_or_else(|| t("No project").into())
             .into();
         let current: Option<String> = match self.mode {
-            Mode::Agent => Some(
-                self.agent_panel
-                    .read(cx)
-                    .active_title()
-                    .unwrap_or_else(|| "New thread".into()),
-            ),
+            // The agent window shows its tabs instead.
+            Mode::Agent => None,
             Mode::Editor => self
                 .active_tab
                 .and_then(|ix| self.tabs.get(ix))
@@ -1131,23 +1334,32 @@ impl Workspace {
             .items_center()
             .gap_2()
             .pr_2()
-            .border_b_1()
-            .border_color(theme.border)
+            // Tabs sit on a darker strip, as in a browser.
+            // A rule under the strip keeps scrolled content apart from it;
+            // the active tab covers it, joining the page.
+            .when(self.mode == Mode::Agent, |this| {
+                // Room above the tabs, so buttons centre on the tab row, not the strip.
+                this.relative().pt(px(8.)).bg(theme.tab_bar).child(
+                    // Drawn before the tabs, so the active one paints over it.
+                    div().absolute().left_0().right_0().bottom_0().h(px(1.)).bg(theme.border),
+                )
+            })
             .map(|this| {
                 if self.show_sidebar {
-                    this.pl_4()
+                    this.when(self.mode == Mode::Editor, |this| this.pl_4())
                 } else {
                     this.pl(px(TRAFFIC_LIGHTS_WIDTH)).child(
                         chrome_button("show-sidebar")
-                            .child(crate::icons::sidebar().size(ICON_LG))
-                            .tooltip("Show Sidebar (⌘B)")
+                            .child(crate::icons::sidebar().size(ICON))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.toggle_sidebar(&ToggleSidebar, window, cx)
-                            })),
+                            }))
+                            .app_tooltip(t("Show Sidebar (⌘B)")),
                     )
                 }
             })
-            .child(
+            // The agent window's tabs say enough; the editor names its project.
+            .when(self.mode == Mode::Editor, |this| this.child(
                 div()
                     .id("breadcrumb-project")
                     .min_w_0()
@@ -1161,7 +1373,7 @@ impl Workspace {
                     .child(Icon::new(IconName::Folder).size(ICON))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(project))
                     .on_click(cx.listener(|this, _, window, cx| this.open_folder(&OpenFolder, window, cx))),
-            )
+            ))
             .when_some(current, |this, current| {
                 this.child(div().text_size(TEXT).text_color(theme.muted_foreground).child("/"))
                     .child(
@@ -1174,28 +1386,21 @@ impl Workspace {
                             .child(current),
                     )
             })
-            .child(Self::drag_region("header-drag"))
+            .when(self.mode == Mode::Agent, |this| this.child(self.render_chat_tabs(cx)))
+            .when(self.mode != Mode::Agent, |this| this.child(Self::drag_region("header-drag")))
             .when(!self.show_sidebar && self.mode == Mode::Agent, |this| {
                 this.child(self.render_editor_button("header-editor", cx))
             })
             .child({
                 let visible = self.surfaces.read(cx).is_visible();
                 chrome_button("toggle-surfaces")
-                    .child(Icon::new(IconName::PanelRight).size(ICON_LG))
+                    .child(Icon::new(IconName::PanelRight).size(ICON))
                     .selected(visible)
-                    .tooltip("Surfaces (⌘T)")
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.surfaces.update(cx, |surfaces, cx| {
-                            // Nothing open yet: offer the picker instead of an empty panel.
-                            if visible {
-                                surfaces.set_visible(false, window, cx);
-                            } else if !surfaces.is_visible() && surfaces.has_open() {
-                                surfaces.set_visible(true, window, cx);
-                            } else {
-                                surfaces.show_picker(window, cx);
-                            }
-                        })
+                        // Shown with nothing open, the panel lists the surfaces.
+                        this.surfaces.update(cx, |surfaces, cx| surfaces.set_visible(!visible, window, cx))
                     }))
+                    .app_tooltip(t("Surfaces (⌥⌘T)"))
             })
     }
 }
@@ -1252,6 +1457,27 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::refresh_project))
             .on_action(cx.listener(Self::open_editor))
             .on_action(cx.listener(Self::new_thread))
+            .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(|this, _: &ReopenTab, window, cx| {
+                this.with_tabs(window, cx, |panel, window, cx| panel.reopen_tab(window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                this.with_tabs(window, cx, |panel, window, cx| panel.cycle_tab(1, window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &PrevTab, window, cx| {
+                this.with_tabs(window, cx, |panel, window, cx| panel.cycle_tab(-1, window, cx))
+            }))
+            .on_action(cx.listener(|this, _: &SelectTab1, window, cx| this.with_tabs(window, cx, |p, w, cx| p.select_tab(0, w, cx))))
+            .on_action(cx.listener(|this, _: &SelectTab2, window, cx| this.with_tabs(window, cx, |p, w, cx| p.select_tab(1, w, cx))))
+            .on_action(cx.listener(|this, _: &SelectTab3, window, cx| this.with_tabs(window, cx, |p, w, cx| p.select_tab(2, w, cx))))
+            .on_action(cx.listener(|this, _: &SelectTab4, window, cx| this.with_tabs(window, cx, |p, w, cx| p.select_tab(3, w, cx))))
+            .on_action(cx.listener(|this, _: &SelectTab5, window, cx| this.with_tabs(window, cx, |p, w, cx| p.select_tab(4, w, cx))))
+            .on_action(cx.listener(|this, _: &SelectTab6, window, cx| this.with_tabs(window, cx, |p, w, cx| p.select_tab(5, w, cx))))
+            .on_action(cx.listener(|this, _: &SelectTab7, window, cx| this.with_tabs(window, cx, |p, w, cx| p.select_tab(6, w, cx))))
+            .on_action(cx.listener(|this, _: &SelectTab8, window, cx| this.with_tabs(window, cx, |p, w, cx| p.select_tab(7, w, cx))))
+            .on_action(cx.listener(|this, _: &SelectLastTab, window, cx| {
+                this.with_tabs(window, cx, |panel, window, cx| panel.select_last_tab(window, cx))
+            }))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::search))
             .size_full()

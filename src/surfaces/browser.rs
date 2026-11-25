@@ -1,6 +1,8 @@
 //! Browser: a real web page (WKWebView through wry), for previewing what the
 //! agent builds. A blank browser offers the dev servers running locally.
 
+use crate::style::AppButtonStyle as _;
+
 use std::process::Command;
 
 use futures::{StreamExt as _, channel::mpsc};
@@ -15,7 +17,8 @@ use gpui_kit::*;
 use gpui_webview::WebView;
 
 use super::{Extension, Host, Manifest, Surface, SurfaceContext, SurfaceView, empty_state};
-use crate::style::size::{ICON, TEXT, TEXT_SM};
+use crate::i18n::{t, tf};
+use crate::style::size::{ICON, TEXT};
 
 /// Ports dev servers usually listen on.
 const DEV_PORTS: &[u16] = &[3000, 3001, 4000, 4200, 4321, 5000, 5173, 5174, 8000, 8080, 8787, 8888];
@@ -88,6 +91,8 @@ fn listening_dev_ports() -> Vec<u16> {
 
 pub struct BrowserSurface {
     address: Entity<InputState>,
+    /// The address bar's placeholder as last set, to follow language changes.
+    placeholder: &'static str,
     webview: Option<Entity<WebView>>,
     error: Option<String>,
     active: bool,
@@ -98,7 +103,8 @@ pub struct BrowserSurface {
 
 impl BrowserSurface {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let address = cx.new(|cx| InputState::new(window, cx).placeholder("Search or enter a URL"));
+        let placeholder = t("Search or enter a URL");
+        let address = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let subscriptions = vec![cx.subscribe_in(&address, window, |this, address, event: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
                 let text = address.read(cx).value().to_string();
@@ -119,6 +125,7 @@ impl BrowserSurface {
         address.update(cx, |address, cx| address.focus(window, cx));
         Self {
             address,
+            placeholder,
             webview: None,
             error: None,
             active: true,
@@ -158,7 +165,7 @@ impl BrowserSurface {
                     }
                 }));
             }
-            Err(err) => self.error = Some(format!("Could not create a web view: {err}")),
+            Err(err) => self.error = Some(tf("Could not create a web view: {err}", &[("err", err.to_string())])),
         }
         cx.notify();
     }
@@ -180,7 +187,7 @@ impl BrowserSurface {
     fn render_start(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         if self.dev_ports.is_empty() {
-            return empty_state("Enter a URL above, e.g. localhost:3000", cx).into_any_element();
+            return empty_state(t("Enter a URL above, e.g. localhost:3000"), cx).into_any_element();
         }
         div()
             .p_4()
@@ -190,9 +197,9 @@ impl BrowserSurface {
             .child(
                 div()
                     .mb_1()
-                    .text_size(TEXT_SM)
+                    .text_size(TEXT)
                     .text_color(theme.muted_foreground)
-                    .child("Running on this Mac"),
+                    .child(t("Running on this Mac")),
             )
             .children(self.dev_ports.iter().map(|port| {
                 let url = format!("http://localhost:{port}");
@@ -241,6 +248,11 @@ impl Render for BrowserSurface {
                 }
             });
         }
+        let placeholder = t("Search or enter a URL");
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            self.address.update(cx, |address, cx| address.set_placeholder(placeholder, window, cx));
+        }
         let has_page = self.webview.is_some();
         div()
             .size_full()
@@ -260,7 +272,7 @@ impl Render for BrowserSurface {
                         Button::new("browser-back")
                             .ghost()
                             .xsmall()
-                            .icon(IconName::ArrowLeft)
+                            .app_icon(IconName::ArrowLeft)
                             .disabled(!has_page)
                             .on_click(cx.listener(|this, _, _, cx| this.navigate(true, cx))),
                     )
@@ -268,7 +280,7 @@ impl Render for BrowserSurface {
                         Button::new("browser-forward")
                             .ghost()
                             .xsmall()
-                            .icon(IconName::ArrowRight)
+                            .app_icon(IconName::ArrowRight)
                             .disabled(!has_page)
                             .on_click(cx.listener(|this, _, _, cx| this.navigate(false, cx))),
                     )
@@ -276,7 +288,7 @@ impl Render for BrowserSurface {
                         Button::new("browser-reload")
                             .ghost()
                             .xsmall()
-                            .icon(IconName::RotateCw)
+                            .app_icon(IconName::RotateCw)
                             .disabled(!has_page)
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
@@ -288,7 +300,7 @@ impl Render for BrowserSurface {
                             .rounded_md()
                             .bg(theme.secondary)
                             .text_size(TEXT)
-                            .child(Input::new(&self.address).appearance(false).small()),
+                            .child(Input::new(&self.address).text_size(TEXT).appearance(false).small()),
                     ),
             )
             .child(

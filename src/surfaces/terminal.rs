@@ -6,6 +6,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::*;
 
 use super::{Extension, Host, Manifest, Surface, SurfaceContext, SurfaceView, empty_state};
+use crate::i18n::tf;
 use crate::terminal::TerminalView;
 
 pub struct TerminalExt {
@@ -42,7 +43,7 @@ pub struct TerminalSurface {
 
 impl TerminalSurface {
     fn new(cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let terminal = TerminalView::new(cwd.clone(), cx).map_err(|err| format!("Failed to start a shell: {err:#}"));
+        let terminal = TerminalView::new(cwd.clone(), cx).map_err(|err| tf("Failed to start a shell: {err}", &[("err", format!("{err:#}"))]));
         if let Ok(terminal) = &terminal {
             terminal.read(cx).focus_handle(cx).focus(window, cx);
         }

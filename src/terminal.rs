@@ -1,5 +1,5 @@
 //! An embedded terminal: `alacritty_terminal` runs the PTY and parses escape
-//! sequences, and this view paints the visible grid as styled text rows.
+//! sequences, and this view paints the visible grid in fixed-width cells.
 
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
@@ -23,9 +23,11 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-const FONT_SIZE: f32 = 13.;
-const LINE_HEIGHT: f32 = 18.;
 const PADDING: f32 = 6.;
+
+fn line_height(font_size: Pixels) -> Pixels {
+    px((f32::from(font_size) * 1.4).ceil())
+}
 
 actions!(terminal, [Copy, Paste, SendTab, SendShiftTab, Clear]);
 
@@ -54,6 +56,7 @@ struct TermSize {
     columns: usize,
     lines: usize,
     cell_width: Pixels,
+    cell_height: Pixels,
 }
 
 impl Dimensions for TermSize {
@@ -74,9 +77,17 @@ impl TermSize {
             num_lines: self.lines as u16,
             num_cols: self.columns as u16,
             cell_width: f32::from(self.cell_width) as u16,
-            cell_height: LINE_HEIGHT as u16,
+            cell_height: f32::from(self.cell_height) as u16,
         }
     }
+}
+
+struct VisibleCell {
+    row: usize,
+    column: usize,
+    width_in_cells: f32,
+    text: SharedString,
+    run: TextRun,
 }
 
 pub struct TerminalView {
@@ -103,6 +114,7 @@ impl TerminalView {
             columns: 80,
             lines: 24,
             cell_width: px(8.),
+            cell_height: line_height(cx.theme().font_size),
         };
         let (tx, mut rx) = mpsc::unbounded();
         let listener = Listener(tx);
@@ -201,14 +213,15 @@ impl TerminalView {
         self.write(bytes);
     }
 
-    fn set_bounds(&mut self, bounds: Bounds<Pixels>, cell_width: Pixels, cx: &mut Context<Self>) {
+    fn set_bounds(&mut self, bounds: Bounds<Pixels>, cell_width: Pixels, cell_height: Pixels, cx: &mut Context<Self>) {
         self.bounds = bounds;
         let columns = ((bounds.size.width / cell_width).floor() as usize).max(2);
-        let lines = ((bounds.size.height / px(LINE_HEIGHT)).floor() as usize).max(1);
+        let lines = ((bounds.size.height / cell_height).floor() as usize).max(1);
         let size = TermSize {
             columns,
             lines,
             cell_width,
+            cell_height,
         };
         if size != self.size {
             self.size = size;
@@ -221,7 +234,7 @@ impl TerminalView {
     fn grid_point(&self, position: Point<Pixels>) -> (GridPoint, Side) {
         let local = position - self.bounds.origin;
         let x = f32::from(local.x).max(0.) / f32::from(self.size.cell_width);
-        let row = (f32::from(local.y).max(0.) / LINE_HEIGHT) as usize;
+        let row = (local.y.max(px(0.)) / self.size.cell_height) as usize;
         let col = (x as usize).min(self.size.columns.saturating_sub(1));
         let side = if x.fract() < 0.5 { Side::Left } else { Side::Right };
         let offset = self.term.lock().grid().display_offset() as i32;
@@ -262,9 +275,9 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
-        let lines = (f32::from(delta.y) / LINE_HEIGHT).round() as i32;
+    fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let delta = event.delta.pixel_delta(self.size.cell_height);
+        let lines = (delta.y / self.size.cell_height).round() as i32;
         if lines == 0 {
             return;
         }
@@ -322,7 +335,7 @@ impl TerminalView {
         self.input(b"\x1b[Z".as_slice());
     }
 
-    fn render_lines(&self, font: &Font, cx: &App) -> (Vec<AnyElement>, Option<(usize, usize, CursorShape)>) {
+    fn visible_cells(&self, font: &Font, cx: &App) -> (Vec<VisibleCell>, Option<(usize, usize, CursorShape)>) {
         let term = self.term.lock();
         let content = term.renderable_content();
         let colors = content.colors;
@@ -331,10 +344,10 @@ impl TerminalView {
         let theme_fg = cx.theme().foreground;
         let selection_bg = cx.theme().selection;
 
-        let mut rows: Vec<(String, Vec<TextRun>)> = vec![(String::new(), Vec::new()); self.size.lines];
+        let mut cells = Vec::new();
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + offset;
-            if row < 0 || row as usize >= rows.len() {
+            if row < 0 || row as usize >= self.size.lines {
                 continue;
             }
             let cell = indexed.cell;
@@ -383,39 +396,35 @@ impl TerminalView {
             } else {
                 cell.c
             };
-            let (text, runs) = &mut rows[row as usize];
-            let start = text.len();
+            let strike = cell.flags.contains(Flags::STRIKEOUT);
+            if ch == ' ' && bg.is_none() && underline.is_none() && !strike && cell.zerowidth().is_none() {
+                continue;
+            }
+            let mut text = String::new();
             text.push(ch);
             if let Some(zerowidth) = cell.zerowidth() {
                 text.extend(zerowidth);
             }
-            let len = text.len() - start;
-
             let run = TextRun {
-                len,
+                len: text.len(),
                 font: run_font,
                 color: fg,
                 background_color: bg,
                 underline,
-                strikethrough: cell.flags.contains(Flags::STRIKEOUT).then(|| {
+                strikethrough: strike.then(|| {
                     StrikethroughStyle {
                         thickness: px(1.),
                         color: Some(fg),
                     }
                 }),
             };
-            match runs.last_mut() {
-                Some(last)
-                    if last.font == run.font
-                        && last.color == run.color
-                        && last.background_color == run.background_color
-                        && last.underline == run.underline
-                        && last.strikethrough == run.strikethrough =>
-                {
-                    last.len += len
-                }
-                _ => runs.push(run),
-            }
+            cells.push(VisibleCell {
+                row: row as usize,
+                column: indexed.point.column.0,
+                width_in_cells: if cell.flags.contains(Flags::WIDE_CHAR) { 2. } else { 1. },
+                text: text.into(),
+                run,
+            });
         }
 
         let cursor = (content.cursor.shape != CursorShape::Hidden && !self.exited)
@@ -427,17 +436,7 @@ impl TerminalView {
             })
             .flatten();
 
-        let lines = rows
-            .into_iter()
-            .map(|(text, runs)| {
-                div()
-                    .h(px(LINE_HEIGHT))
-                    .whitespace_nowrap()
-                    .child(StyledText::new(text).with_runs(runs))
-                    .into_any_element()
-            })
-            .collect();
-        (lines, cursor)
+        (cells, cursor)
     }
 }
 
@@ -450,18 +449,16 @@ impl Drop for TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let font = Font {
-            family: "Menlo".into(),
-            ..font(crate::style::MONO_FONT)
-        };
+        // A terminal lays text out in a grid, so it needs a monospace font.
+        let font = font(theme.mono_font_family.clone());
+        let font_size = theme.mono_font_size;
+        let cell_height = line_height(font_size);
         let font_id = window.text_system().resolve_font(&font);
-        let cell_width = window
-            .text_system()
-            .advance(font_id, px(FONT_SIZE), 'm')
-            .map(|size| size.width)
-            .unwrap_or(px(8.));
+        let cell_width = ['M', 'W', 'm', '@'].into_iter()
+            .filter_map(|ch| window.text_system().advance(font_id, font_size, ch).ok())
+            .fold(font_size * 0.55, |width, advance| width.max(advance.width));
 
-        let (lines, cursor) = self.render_lines(&font, cx);
+        let (cells, cursor) = self.visible_cells(&font, cx);
         let focused = self.focus_handle.is_focused(window);
         let view = cx.entity();
 
@@ -478,7 +475,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::send_tab))
             .on_action(cx.listener(Self::send_shift_tab))
             .on_key_down(cx.listener(Self::on_key_down))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .on_scroll(cx.listener(Self::on_scroll))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -489,41 +486,56 @@ impl Render for TerminalView {
                     .size_full()
                     .overflow_hidden()
                     .font_family(font.family.clone())
-                    .text_size(px(FONT_SIZE))
-                    .line_height(px(LINE_HEIGHT))
+                    .text_size(font_size)
+                    .line_height(cell_height)
                     .text_color(theme.foreground)
                     .child(
                         canvas(
                             move |bounds, _, cx| {
-                                view.update(cx, |this, cx| this.set_bounds(bounds, cell_width, cx))
+                                view.update(cx, |this, cx| this.set_bounds(bounds, cell_width, cell_height, cx))
                             },
-                            |_, _, _, _| {},
+                            move |bounds, _, window, cx| {
+                                for cell in cells {
+                                    let origin = bounds.origin + point(
+                                        cell_width * cell.column as f32,
+                                        cell_height * cell.row as f32,
+                                    );
+                                    let width = cell_width * cell.width_in_cells;
+                                    let cell_bounds = Bounds::new(origin, size(width, cell_height));
+                                    if let Some(background) = cell.run.background_color {
+                                        window.paint_quad(fill(cell_bounds, background));
+                                    }
+                                    let line = window.text_system().shape_line(cell.text, font_size, &[cell.run], None);
+                                    window.with_content_mask(Some(ContentMask { bounds: cell_bounds }), |window| {
+                                        let _ = line.paint(origin, cell_height, TextAlign::Center, Some(width), window, cx);
+                                    });
+                                }
+                            },
                         )
                         .absolute()
                         .size_full(),
                     )
-                    .children(lines)
                     .when_some(cursor, |this, (row, col, shape)| {
                         let left = cell_width * col as f32;
-                        let top = px(LINE_HEIGHT * row as f32);
+                        let top = cell_height * row as f32;
                         let cursor = div().absolute().left(left).top(top);
                         let cursor = match (shape, focused) {
                             (_, false) => cursor
                                 .w(cell_width)
-                                .h(px(LINE_HEIGHT))
+                                .h(cell_height)
                                 .border_1()
                                 .border_color(theme.caret),
                             (CursorShape::Beam, _) => {
-                                cursor.w(px(2.)).h(px(LINE_HEIGHT)).bg(theme.caret)
+                                cursor.w(px(2.)).h(cell_height).bg(theme.caret)
                             }
                             (CursorShape::Underline, _) => cursor
-                                .top(top + px(LINE_HEIGHT - 2.))
+                                .top(top + cell_height - px(2.))
                                 .w(cell_width)
                                 .h(px(2.))
                                 .bg(theme.caret),
                             _ => cursor
                                 .w(cell_width)
-                                .h(px(LINE_HEIGHT))
+                                .h(cell_height)
                                 .bg(theme.caret.opacity(0.6)),
                         };
                         this.child(cursor)
@@ -535,9 +547,8 @@ impl Render for TerminalView {
                                 .bottom_0()
                                 .right_0()
                                 .px_2()
-                                .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child("[process exited]"),
+                                .child(crate::i18n::t("[process exited]")),
                         )
                     }),
             )

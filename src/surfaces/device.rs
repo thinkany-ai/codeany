@@ -5,6 +5,8 @@
 //! GPUI a new image per frame would keep every decoded frame (about 12 MB on
 //! a recent iPhone) in its image cache.
 
+use crate::style::AppButtonStyle as _;
+
 use std::{
     path::PathBuf,
     process::Command,
@@ -16,14 +18,15 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _,
     button::{Button, ButtonVariants as _},
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::DropdownMenu as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
 use super::{Extension, Host, Manifest, Surface, SurfaceContext, SurfaceView, empty_state};
-use crate::style::size::{TEXT};
+use crate::i18n::{t, tf};
+use crate::style::size::TEXT;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(400);
 
@@ -61,7 +64,7 @@ fn developer_dir() -> Option<&'static PathBuf> {
 }
 
 fn simctl(args: &[&str]) -> Result<Vec<u8>, String> {
-    let dir = developer_dir().ok_or("Xcode is not installed")?;
+    let dir = developer_dir().ok_or_else(|| t("Xcode is not installed").to_string())?;
     let output = Command::new("xcrun")
         .arg("simctl")
         .args(args)
@@ -274,24 +277,20 @@ impl Render for DeviceSurface {
         let picker = Button::new("device-picker")
             .ghost()
             .small()
-            .icon(IconName::Smartphone)
-            .label(
+            .app_icon(IconName::Smartphone)
+            .app_label(
                 sim.as_ref()
                     .map(|s| format!("{} · {}", s.name, s.runtime))
-                    .unwrap_or_else(|| "No simulator".into()),
+                    .unwrap_or_else(|| t("No simulator").into()),
             )
             .dropdown_caret(true)
             .dropdown_menu(move |mut menu, _, _| {
                 for sim in &sims {
                     let (entity, udid) = (entity.clone(), sim.udid.clone());
-                    let label = format!(
-                        "{} · {}{}",
-                        sim.name,
-                        sim.runtime,
-                        if sim.booted { " · running" } else { "" }
-                    );
+                    let device = format!("{} · {}", sim.name, sim.runtime);
+                    let label = if sim.booted { tf("{device} · running", &[("device", device)]) } else { device };
                     menu = menu.item(
-                        PopupMenuItem::new(label)
+                        crate::style::menu_item(label)
                             .checked(current.as_deref() == Some(sim.udid.as_str()))
                             .on_click(move |_, _, cx| {
                                 let udid = udid.clone();
@@ -304,7 +303,7 @@ impl Render for DeviceSurface {
 
         let body: AnyElement = match (&sim, &self.frame, &self.error) {
             (_, _, Some(err)) if self.frame.is_none() => empty_state(err.clone(), cx).into_any_element(),
-            (None, _, _) => empty_state("No iOS simulators are installed", cx).into_any_element(),
+            (None, _, _) => empty_state(t("No iOS simulators are installed"), cx).into_any_element(),
             (Some(sim), _, _) if !sim.booted => div()
                 .size_full()
                 .flex()
@@ -314,12 +313,12 @@ impl Render for DeviceSurface {
                 .gap_3()
                 .text_size(TEXT)
                 .text_color(theme.muted_foreground)
-                .child(format!("{} is not running", sim.name))
+                .child(tf("{name} is not running", &[("name", sim.name.clone())]))
                 .child(
                     Button::new("boot-device")
                         .primary()
                         .small()
-                        .label("Boot")
+                        .app_label(t("Boot"))
                         .on_click(cx.listener(|this, _, _, cx| this.boot(cx))),
                 )
                 .into_any_element(),
@@ -331,7 +330,7 @@ impl Render for DeviceSurface {
                 .justify_center()
                 .child(img(frame.clone()).size_full().object_fit(ObjectFit::Contain))
                 .into_any_element(),
-            _ => empty_state("Connecting…", cx).into_any_element(),
+            _ => empty_state(t("Connecting…"), cx).into_any_element(),
         };
 
         div()
@@ -355,11 +354,11 @@ impl Render for DeviceSurface {
                             Button::new("open-simulator")
                                 .ghost()
                                 .xsmall()
-                                .icon(IconName::ExternalLink)
-                                .tooltip("Open in Simulator")
+                                .app_icon(IconName::ExternalLink)
                                 .on_click(|_, _, _| {
                                     let _ = Command::new("open").args(["-a", "Simulator"]).status();
-                                }),
+                                })
+                                .app_tooltip(t("Open in Simulator")),
                         )
                     }),
             )

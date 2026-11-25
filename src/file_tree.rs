@@ -6,13 +6,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Icon};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_kit::assets::IconName;
 
 use crate::git::{FileStatus, RepoSnapshot};
-use crate::style::size::{TEXT, TEXT_SM};
+use crate::i18n::t;
+use crate::style::size::{ICON, TEXT};
 
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 12.;
@@ -273,19 +274,19 @@ impl FileTree {
                     .when(!selected, |this| this.hover(|this| this.bg(theme.list_hover)))
                     .child(
                         div()
-                            .w(px(14.))
+                            .w(ICON)
                             .flex_none()
                             .when_some(chevron, |this, chevron| {
                                 this.child(
                                     Icon::new(chevron)
-                                        .xsmall()
+                                        .size(ICON)
                                         .text_color(theme.muted_foreground),
                                 )
                             }),
                     )
                     .child(
                         Icon::new(icon)
-                            .small()
+                            .size(ICON)
                             .flex_none()
                             .text_color(if entry.is_dir {
                                 theme.muted_foreground
@@ -306,7 +307,7 @@ impl FileTree {
                         this.child(
                             div()
                                 .flex_none()
-                                .text_size(TEXT_SM)
+                                .text_size(TEXT)
                                 .text_color(Self::status_color(status, cx))
                                 .child(status.letter()),
                         )
@@ -326,7 +327,7 @@ impl Render for FileTree {
             .as_ref()
             .and_then(|root| root.file_name())
             .map(|name| name.to_string_lossy().to_uppercase())
-            .unwrap_or_else(|| "NO FOLDER".into())
+            .unwrap_or_else(|| t("NO FOLDER").into())
             .into();
 
         div()
@@ -342,7 +343,7 @@ impl Render for FileTree {
                     .flex()
                     .items_center()
                     .px_3()
-                    .text_size(TEXT_SM)
+                    .text_size(TEXT)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.muted_foreground)
                     .child(title),

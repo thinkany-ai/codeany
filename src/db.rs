@@ -85,18 +85,6 @@ impl Db {
         })
     }
 
-    pub fn is_empty(&self) -> bool {
-        let threads: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM threads", [], |row| row.get(0))
-            .unwrap_or(0);
-        let settings: i64 = self
-            .conn
-            .query_row("SELECT count(*) FROM settings", [], |row| row.get(0))
-            .unwrap_or(0);
-        threads == 0 && settings == 0
-    }
-
     pub fn setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
         let text: String = self
             .conn

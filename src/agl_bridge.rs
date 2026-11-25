@@ -61,21 +61,34 @@ pub struct SessionOptions {
     pub resume: Option<String>,
 }
 
-/// Keep CodeAny's sessions, history and config in `~/.codeany/agl`, apart
-/// from the user's own `~/.agl`. Must run before any other thread starts.
+/// Run agl as part of CodeAny: under CodeAny's name in messages, with its
+/// state in `~/.codeany/agl` (apart from the user's own `~/.agl`), and with
+/// agents and computer use started through CodeAny's own executable, so
+/// macOS attributes them to CodeAny. Must run before any other thread
+/// starts and before anything else uses agl.
 pub fn set_home() {
-    crate::paths::migrate();
+    let brand = agl::brand::Brand {
+        cli_name: "codeany".into(),
+        display_name: "CodeAny".into(),
+        home: Some(crate::paths::agent_home()),
+        service_label: "ai.codeany.daemon".into(),
+        systemd_unit: "codeany.service".into(),
+        // Updated with the app, not through agl's releases.
+        releases: None,
+        app_launcher: std::env::current_exe().ok(),
+        product: Some(agl::brand::Product {
+            name: "CodeAny".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+        }),
+        ..agl::brand::Brand::default()
+    };
+    if let Err(err) = agl::brand::set(brand) {
+        eprintln!("codeany: {err:#}");
+    }
     if std::env::var_os("AGL_HOME").is_some() {
         return;
     }
-    let dir = crate::paths::agl_home();
-    // Sessions and history from before `~/.dscode` move along.
-    if !dir.exists() {
-        if let Some(old) = crate::paths::legacy().map(|l| l.join("agl")).filter(|p| p.is_dir()) {
-            let _ = std::fs::create_dir_all(crate::paths::home());
-            let _ = std::fs::rename(old, &dir);
-        }
-    }
+    let dir = crate::paths::agent_home();
     // SAFETY: called at the top of `main`, before any thread exists.
     unsafe { std::env::set_var("AGL_HOME", dir) };
 }
@@ -85,7 +98,7 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("agl")
+            .thread_name("codeany-agents")
             .enable_all()
             .build()
             .expect("tokio runtime")
@@ -100,7 +113,7 @@ pub fn spawn<T: Send + 'static>(
     runtime().spawn(async move {
         let _ = tx.send(fut.await);
     });
-    async move { rx.await.map_err(|_| anyhow!("agl runtime stopped"))? }
+    async move { rx.await.map_err(|_| anyhow!("the agent runtime stopped"))? }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,14 +134,7 @@ impl Endpoint {
 }
 
 /// The daemon this process runs, once started.
-struct Own {
-    pid_file_pid: u32,
-    endpoint: Endpoint,
-    /// Fires when the daemon's task returns.
-    done: Option<oneshot::Receiver<()>>,
-}
-
-static OWN: Mutex<Option<Own>> = Mutex::new(None);
+static OWN: tokio::sync::Mutex<Option<agl::daemon::EmbeddedDaemon>> = tokio::sync::Mutex::const_new(None);
 static START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn pid_alive(pid: u32) -> bool {
@@ -156,49 +162,32 @@ fn running_daemon() -> Option<(u32, Endpoint)> {
     pid_alive(pid).then_some((pid, endpoint))
 }
 
-/// This machine's daemon: the one already running for CodeAny's `AGL_HOME`
-/// (another CodeAny, say a dev build next to the installed app), or one
-/// started inside this process.
+/// This machine's daemon: the one already running for CodeAny's agent
+/// home (another CodeAny on the same data), or one hosted in this process.
 pub async fn local_endpoint() -> Result<Endpoint> {
     let _guard = START.lock().await;
-    if let Some((_, endpoint)) = running_daemon() {
+    let mut own = OWN.lock().await;
+    if let Some(d) = own.as_ref().filter(|d| d.is_running()) {
+        return Ok(Endpoint { port: d.port, token: d.token.clone() });
+    }
+    // `CODEANY_AGL_PORT` pins the port (`make dev` uses 18022); a daemon
+    // already running on another port is then not reused.
+    let port = std::env::var("CODEANY_AGL_PORT").ok().and_then(|p| p.parse::<u16>().ok());
+    if let Some((_, endpoint)) = running_daemon().filter(|(_, e)| port.is_none_or(|p| p == e.port)) {
         return Ok(endpoint);
     }
-    let token = uuid::Uuid::new_v4().simple().to_string();
     let cfg = agl::config::Config::load()?;
-    let (done_tx, done_rx) = oneshot::channel();
-    let (err_tx, mut err_rx) = tokio::sync::oneshot::channel::<String>();
     let opts = agl::daemon::DaemonOptions {
-        port: Some(0),
+        port: Some(port.unwrap_or(0)),
         parent_pid: None,
-        token: Some(token.clone()),
+        token: Some(uuid::Uuid::new_v4().simple().to_string()),
     };
-    tokio::spawn(async move {
-        if let Err(err) = agl::daemon::run(cfg, opts).await {
-            eprintln!("agl: daemon stopped: {err:#}");
-            let _ = err_tx.send(format!("{err:#}"));
-        }
-        *OWN.lock().unwrap() = None;
-        let _ = done_tx.send(());
-    });
-    let pid = std::process::id();
-    for _ in 0..300 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Ok(err) = err_rx.try_recv() {
-            bail!("agl daemon failed to start: {err}");
-        }
-        if let Some((owner, endpoint)) = running_daemon() {
-            if owner == pid && endpoint.token == token {
-                *OWN.lock().unwrap() = Some(Own {
-                    pid_file_pid: owner,
-                    endpoint: endpoint.clone(),
-                    done: Some(done_rx),
-                });
-                return Ok(endpoint);
-            }
-        }
-    }
-    bail!("agl daemon did not start; see {}", agl::config::log_path().display())
+    let d = agl::daemon::spawn_embedded(cfg, opts)
+        .await
+        .context("the agent service failed to start")?;
+    let endpoint = Endpoint { port: d.port, token: d.token.clone() };
+    *own = Some(d);
+    Ok(endpoint)
 }
 
 /// Start this machine's daemon in the background.
@@ -209,21 +198,9 @@ pub fn start_local() {
 /// Stop the daemon this process runs, and every agent process it owns.
 /// Leaves a daemon another CodeAny runs alone. Blocks for up to 5 seconds.
 pub fn shutdown() {
-    let done = {
-        let mut own = OWN.lock().unwrap();
-        match own.as_mut() {
-            Some(own) if own.pid_file_pid == std::process::id() => own.done.take(),
-            _ => None,
-        }
-    };
-    let Some(done) = done else { return };
-    let local = backend(None);
-    runtime().block_on(async move {
-        let _ = tokio::time::timeout(Duration::from_secs(5), async move {
-            let _ = local.shared.call("daemon.shutdown", json!({})).await;
-            let _ = done.await;
-        })
-        .await;
+    runtime().block_on(async {
+        let Some(d) = OWN.lock().await.take() else { return };
+        let _ = tokio::time::timeout(Duration::from_secs(5), d.shutdown()).await;
     });
 }
 
@@ -249,6 +226,8 @@ type Pending = HashMap<String, tokio::sync::oneshot::Sender<Result<Value>>>;
 
 struct Shared {
     machine: Option<String>,
+    /// The nex service on `machine`: `agl`, or CodeAny's own `codeany`.
+    service: &'static str,
     out: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
     pending: Mutex<Pending>,
     subs: Mutex<HashMap<String, Sub>>,
@@ -262,41 +241,43 @@ pub struct Backend {
     shared: Arc<Shared>,
 }
 
-static BACKENDS: Mutex<Option<HashMap<Option<String>, Arc<Backend>>>> = Mutex::new(None);
+type BackendKey = (Option<String>, &'static str);
+static BACKENDS: Mutex<Option<HashMap<BackendKey, Arc<Backend>>>> = Mutex::new(None);
 
-/// The backend for `machine` (a nex device id), `None` for this machine.
+/// The backend for `machine` (a nex device id, or a paired device's
+/// `peer:` id), `None` for this machine.
 pub fn backend(machine: Option<&str>) -> Arc<Backend> {
-    let key = machine.map(str::to_string);
+    backend_for(machine, "agl")
+}
+
+/// A connection to `service` on `machine`, kept up like [`backend`]'s.
+pub fn backend_for(machine: Option<&str>, service: &'static str) -> Arc<Backend> {
+    let key = (machine.map(str::to_string), service);
     let mut all = BACKENDS.lock().unwrap();
     all.get_or_insert_with(HashMap::new)
         .entry(key.clone())
-        .or_insert_with(|| Arc::new(Backend::start(key)))
+        .or_insert_with(|| Arc::new(Backend::start(key.0, service)))
         .clone()
 }
 
-async fn open(machine: &Option<String>) -> Result<nex::WsStream> {
+async fn open(machine: &Option<String>, service: &str) -> Result<crate::remote::Ws> {
     match machine {
         None => {
             let endpoint = local_endpoint().await?;
             let (ws, _) = tokio_tungstenite::connect_async(endpoint.url())
                 .await
-                .context("connect to the local agl daemon")?;
-            Ok(ws)
+                .context("connect to the local agent service")?;
+            Ok(Box::new(ws))
         }
-        Some(device) => {
-            let client = crate::remote::client().map_err(|e| anyhow!(e))?;
-            client
-                .connect(device, "agl")
-                .await
-                .map_err(|e| anyhow!(crate::remote::describe_error(&e)))
-        }
+        Some(device) => crate::remote::connect(device, service).await,
     }
 }
 
 impl Backend {
-    fn start(machine: Option<String>) -> Backend {
+    fn start(machine: Option<String>, service: &'static str) -> Backend {
         let shared = Arc::new(Shared {
             machine,
+            service,
             out: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             subs: Mutex::new(HashMap::new()),
@@ -347,7 +328,7 @@ impl Backend {
                 .as_str()
                 .filter(|h| !h.is_empty())
                 .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("the agl there is too old to report its home folder"))
+                .ok_or_else(|| anyhow!("CodeAny there is too old to report its home folder"))
         }
     }
 
@@ -443,12 +424,13 @@ impl Backend {
     pub fn prompt(
         &self,
         session_id: &str,
+        turn_id: &str,
         text: String,
         mode: &str,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let call = self.call(
             "session.prompt",
-            json!({ "session_id": session_id, "text": text, "mode": mode }),
+            json!({ "session_id": session_id, "turn_id": turn_id, "text": text, "mode": mode }),
         );
         async move { call.await.map(|_| ()) }
     }
@@ -458,7 +440,7 @@ impl Backend {
         let call = self.call(method, params);
         runtime().spawn(async move {
             if let Err(err) = call.await {
-                eprintln!("agl: {method} failed: {err:#}");
+                eprintln!("codeany: {method} failed: {err:#}");
             }
         });
     }
@@ -494,15 +476,15 @@ impl Backend {
 impl Shared {
     fn label(&self) -> String {
         match &self.machine {
-            None => "local agl".into(),
-            Some(device) => format!("agl on {device}"),
+            None => "the agent service".into(),
+            Some(device) => format!("CodeAny on {}", crate::remote::name_of(device)),
         }
     }
 
     async fn run(self: Arc<Self>) {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match open(&self.machine).await {
+            match open(&self.machine, self.service).await {
                 Ok(ws) => {
                     backoff = Duration::from_secs(1);
                     self.serve(ws).await;
@@ -510,7 +492,10 @@ impl Shared {
                 }
                 Err(err) => {
                     let message = format!("{err:#}");
-                    eprintln!("codeany: cannot reach {}: {message}", self.label());
+                    // Threads are polled for every device; only agents are worth a log line.
+                    if self.service == "agl" {
+                        eprintln!("codeany: cannot reach {}: {message}", self.label());
+                    }
                     self.state.send_replace(ConnState::Failed(message));
                 }
             }
@@ -519,7 +504,7 @@ impl Shared {
         }
     }
 
-    async fn serve(self: &Arc<Self>, ws: nex::WsStream) {
+    async fn serve(self: &Arc<Self>, ws: crate::remote::Ws) {
         let (mut sink, mut stream) = ws.split();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         *self.out.lock().unwrap() = Some(out_tx);
@@ -696,11 +681,12 @@ mod live_tests {
             "Run `ls` with your shell tool, then reply with exactly: DONE",
             "What file did you see? Reply with just the file name.",
         ] {
-            block_on(agl.prompt(&meta.id, prompt.into(), "queue")).unwrap();
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            block_on(agl.prompt(&meta.id, &turn_id, prompt.into(), "queue")).unwrap();
             block_on(async {
                 while let Some(event) = events.next().await {
                     match event {
-                        AgentEvent::TextDelta { text } => print!("{text}"),
+                        AgentEvent::TextDelta { text, .. } => print!("{text}"),
                         AgentEvent::PermissionRequest { request_id, .. } => {
                             agl.approve(meta.id.clone(), request_id, "allow".into())
                         }

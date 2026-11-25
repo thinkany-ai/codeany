@@ -1,5 +1,6 @@
-//! Choosing an agent and model: a rail of agents (and starred models) beside
-//! a searchable model list, like the model menus of chat apps.
+//! Choosing an agent, model and reasoning effort: a rail of agents (and
+//! starred models), a searchable model list, and the efforts the highlighted
+//! model offers.
 
 use std::collections::HashMap;
 
@@ -19,7 +20,8 @@ use crate::{
     agl_bridge::{self, ModelInfo},
     threads::agent_name,
 };
-use crate::style::size::{ICON, ICON_LG, TEXT, TEXT_SM};
+use crate::i18n::{t, tf};
+use crate::style::size::{ICON, TEXT};
 
 /// Models shown before "More models"; the rest stay folded.
 const MAIN_MODELS: usize = 5;
@@ -41,7 +43,8 @@ pub fn init(cx: &mut App) {
 }
 
 pub enum ModelPickerEvent {
-    Select { agent: String, model: Option<String> },
+    /// `effort` is `None` when only the model was picked: keep the effort.
+    Select { agent: String, model: Option<String>, effort: Option<Option<String>> },
     ToggleFavorite { agent: String, model: String },
 }
 
@@ -72,6 +75,7 @@ pub struct ModelPicker {
     tab: Tab,
     favorites: Vec<(String, String)>,
     current: (String, Option<String>),
+    effort: Option<String>,
     query: Entity<InputState>,
     highlighted: usize,
     show_more: bool,
@@ -93,7 +97,7 @@ pub fn model_display_name(agent: &str, model: &ModelInfo) -> String {
 
 impl ModelPicker {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder(t("Search models…")));
         let subscriptions = vec![cx.subscribe(&query, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Change => {
                 this.highlighted = 0;
@@ -114,6 +118,7 @@ impl ModelPicker {
             tab: Tab::Favorites,
             favorites: Vec::new(),
             current: (String::new(), None),
+            effort: None,
             query,
             highlighted: 0,
             show_more: false,
@@ -147,13 +152,15 @@ impl ModelPicker {
         &mut self,
         agent: String,
         model: Option<String>,
+        effort: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.tab = Tab::Agent(agent.clone());
         self.current = (agent.clone(), model);
-        self.highlighted = 0;
+        self.effort = effort;
         self.show_more = false;
+        self.highlighted = self.current_index(cx).unwrap_or(0);
         self.query.update(cx, |query, cx| {
             query.set_value("", window, cx);
             query.focus(window, cx);
@@ -272,12 +279,26 @@ impl ModelPicker {
         }
     }
 
+    fn is_current(&self, row: &Row) -> bool {
+        self.current.0 == row.agent
+            && match &self.current.1 {
+                Some(model) => *model == row.model.id,
+                None => row.model.default || row.model.id == "default",
+            }
+    }
+
+    /// The current model's row, when it is on screen.
+    fn current_index(&self, cx: &App) -> Option<usize> {
+        self.rows(cx).0.iter().position(|row| self.is_current(row))
+    }
+
     fn pick(&mut self, ix: usize, cx: &mut Context<Self>) {
         let (rows, _) = self.rows(cx);
         let Some(row) = rows.get(ix) else { return };
         cx.emit(ModelPickerEvent::Select {
             agent: row.agent.clone(),
             model: Some(row.model.id.clone()),
+            effort: None,
         });
     }
 
@@ -345,7 +366,7 @@ impl ModelPicker {
                     "rail-favorites".into(),
                     self.tab == Tab::Favorites,
                     Icon::new(IconName::Star)
-                        .size(ICON_LG)
+                        .size(ICON)
                         .text_color(theme.foreground)
                         .into_any_element(),
                 )
@@ -362,7 +383,7 @@ impl ModelPicker {
                 )
                 .tooltip({
                     let name = agent.name.clone();
-                    move |window, cx| Tooltip::new(name.clone()).build(window, cx)
+                    move |window, cx| Tooltip::new(name.clone()).text_size(TEXT).build(window, cx)
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select_tab(Tab::Agent(id.clone()), cx)
@@ -375,20 +396,16 @@ impl ModelPicker {
     fn render_row(&self, ix: usize, row: &Row, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let favorite = self.is_favorite(&row.agent, &row.model.id);
-        let current = self.current.0 == row.agent
-            && match &self.current.1 {
-                Some(model) => *model == row.model.id,
-                None => row.model.default || row.model.id == "default",
-            };
+        let current = self.is_current(row);
         let (agent, model) = (row.agent.clone(), row.model.id.clone());
         div()
             .id(("model-row", ix))
             .group("model-row")
+            .h(px(34.))
             .px_3()
-            .py(px(7.))
             .flex()
             .items_center()
-            .gap_3()
+            .gap_2()
             .rounded_lg()
             .cursor_pointer()
             .when(ix == self.highlighted, |this| this.bg(theme.list_active))
@@ -398,55 +415,24 @@ impl ModelPicker {
                     cx.notify();
                 }
             }))
+            .tooltip({
+                let label = self.agent_label(&row.agent);
+                move |window, cx| Tooltip::new(label.clone()).text_size(TEXT).build(window, cx)
+            })
+            .child(agent_icon(&row.agent, px(16.), cx))
             .child(
                 div()
-                    .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .text_size(TEXT)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .child(model_display_name(&row.agent, &row.model)),
-                            )
-                            .when(current, |this| {
-                                this.child(Icon::new(IconName::Check).size_3p5().text_color(theme.primary))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .text_size(TEXT_SM)
-                            .text_color(theme.muted_foreground)
-                            .child(agent_icon(&row.agent, px(14.), cx))
-                            .child(self.agent_label(&row.agent)),
-                    ),
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .text_size(TEXT)
+                    .child(model_display_name(&row.agent, &row.model)),
             )
-            .when(ix < 9, |this| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .px(px(7.))
-                        .py(px(2.))
-                        .rounded_md()
-                        .bg(theme.secondary)
-                        .text_size(TEXT_SM)
-                        .text_color(theme.muted_foreground)
-                        .child(format!("⌘{}", ix + 1)),
-                )
+            .when(current, |this| {
+                this.child(Icon::new(IconName::Check).size(ICON).text_color(theme.muted_foreground))
             })
+            .child(div().flex_1())
             .child(
                 div()
                     .id(("favorite", ix))
@@ -456,6 +442,7 @@ impl ModelPicker {
                     .items_center()
                     .justify_center()
                     .rounded_md()
+                    .when(!favorite, |this| this.invisible().group_hover("model-row", |this| this.visible()))
                     .hover(|this| this.bg(theme.list_hover))
                     .child(
                         Icon::new(IconName::Star)
@@ -473,13 +460,135 @@ impl ModelPicker {
                         }
                     })),
             )
+            .when(ix < 9, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .px(px(6.))
+                        .py(px(1.))
+                        .rounded_md()
+                        .bg(theme.secondary)
+                        .text_size(TEXT)
+                        .text_color(theme.muted_foreground)
+                        .child(format!("⌘{}", ix + 1)),
+                )
+            })
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(ModelPickerEvent::Select {
                     agent: agent.clone(),
                     model: Some(model.clone()),
+                    effort: None,
                 })
             }))
             .into_any_element()
+    }
+
+    /// The efforts of the highlighted model; picking one picks that model too.
+    fn render_reasoning(&self, rows: &[Row], cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let row = rows.get(self.highlighted).cloned();
+        let header = div()
+            .mx_3()
+            .mt_2()
+            .mb_2()
+            .h(px(32.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_size(TEXT)
+            .child(div().flex_none().text_color(theme.muted_foreground).child(t("Reasoning")))
+            .child(div().flex_1())
+            .when_some(row.as_ref(), |this, row| {
+                this.child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(theme.muted_foreground)
+                        .child(short_model_name(&model_display_name(&row.agent, &row.model))),
+                )
+            });
+        let mut list = div().id("effort-list").flex_1().min_h_0().overflow_y_scroll().px_2().flex().flex_col().gap(px(2.));
+        match row.filter(|r| !r.model.efforts.is_empty()) {
+            None => {
+                list = list.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_size(TEXT)
+                        .text_color(theme.muted_foreground)
+                        .child(t("No reasoning options for this model")),
+                );
+            }
+            Some(row) => {
+                let current = self.is_current(&row);
+                let options = std::iter::once(None).chain(row.model.efforts.iter().cloned().map(Some));
+                for (ix, option) in options.enumerate() {
+                    let checked = current && self.effort == option;
+                    let (agent, model) = (row.agent.clone(), row.model.id.clone());
+                    let label = effort_label(option.as_deref());
+                    list = list.child(
+                        div()
+                            .id(("effort", ix))
+                            .h(px(34.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .text_size(TEXT)
+                            .hover(|this| this.bg(theme.list_hover))
+                            .child(div().flex_1().child(label))
+                            .when(checked, |this| {
+                                this.child(Icon::new(IconName::Check).size(ICON).text_color(theme.muted_foreground))
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(ModelPickerEvent::Select {
+                                    agent: agent.clone(),
+                                    model: Some(model.clone()),
+                                    effort: Some(option.clone()),
+                                })
+                            })),
+                    );
+                }
+            }
+        }
+        div()
+            .w(px(220.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_color(theme.border)
+            .child(header)
+            .child(list)
+            .into_any_element()
+    }
+}
+
+/// "Claude Opus 5.5" as "Opus 5.5", for the narrow reasoning header.
+fn short_model_name(name: &str) -> String {
+    name.strip_prefix("Claude ").unwrap_or(name).to_string()
+}
+
+/// How an effort reads: `None` is the model's own choice.
+pub fn effort_label(effort: Option<&str>) -> String {
+    match effort {
+        None => t("Auto").into(),
+        Some("xhigh") => t("Extra High").into(),
+        Some("minimal") => t("Minimal").into(),
+        Some("low") => t("Low").into(),
+        Some("medium") => t("Medium").into(),
+        Some("high") => t("High").into(),
+        Some("max") => t("Max").into(),
+        Some(other) => {
+            let mut chars = other.chars();
+            chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+        }
     }
 }
 
@@ -487,6 +596,7 @@ impl Render for ModelPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let (rows, folded) = self.rows(cx);
+        let reasoning = self.render_reasoning(&rows, cx);
         let searching = !self.query.read(cx).value().trim().is_empty();
         let loading = match &self.tab {
             Tab::Agent(agent) => match self.models.get(agent) {
@@ -526,11 +636,11 @@ impl Render for ModelPicker {
                     .child(Spinner::new().small())
                     .into_any_element(),
                 (Some(Some(err)), false, _) => empty(err.clone()).into_any_element(),
-                (_, true, _) => empty("No matching models".into()).into_any_element(),
+                (_, true, _) => empty(t("No matching models").into()).into_any_element(),
                 (_, false, Tab::Favorites) => {
-                    empty("Star a model to keep it here".into()).into_any_element()
+                    empty(t("Star a model to keep it here").into()).into_any_element()
                 }
-                _ => empty("This agent lists no models".into()).into_any_element(),
+                _ => empty(t("This agent lists no models").into()).into_any_element(),
             });
         }
         for (ix, row) in rows.iter().enumerate() {
@@ -553,12 +663,12 @@ impl Render for ModelPicker {
                             .flex()
                             .flex_col()
                             .gap(px(3.))
-                            .child(div().text_size(TEXT).font_weight(FontWeight::MEDIUM).child("More models"))
+                            .child(div().text_size(TEXT).font_weight(FontWeight::MEDIUM).child(t("More models")))
                             .child(
                                 div()
-                                    .text_size(TEXT_SM)
+                                    .text_size(TEXT)
                                     .text_color(theme.muted_foreground)
-                                    .child(format!("{folded} models")),
+                                    .child(tf("{n} models", &[("n", folded.to_string())])),
                             ),
                     )
                     .child(Icon::new(IconName::ChevronRight).size(ICON).text_color(theme.muted_foreground))
@@ -580,7 +690,7 @@ impl Render for ModelPicker {
             .on_action(cx.listener(|this, _: &Pick7, _, cx| this.pick(6, cx)))
             .on_action(cx.listener(|this, _: &Pick8, _, cx| this.pick(7, cx)))
             .on_action(cx.listener(|this, _: &Pick9, _, cx| this.pick(8, cx)))
-            .w(px(520.))
+            .w(px(700.))
             .h(px(400.))
             .flex()
             .child(self.render_rail(cx))
@@ -599,7 +709,7 @@ impl Render for ModelPicker {
                             .border_color(theme.primary.opacity(0.6))
                             .text_size(TEXT)
                             .child(
-                                Input::new(&self.query)
+                                Input::new(&self.query).text_size(TEXT)
                                     .appearance(false)
                                     .prefix(
                                         Icon::new(IconName::Search)
@@ -610,5 +720,6 @@ impl Render for ModelPicker {
                     )
                     .child(list),
             )
+            .child(reasoning)
     }
 }

@@ -11,8 +11,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::i18n::{t, tf};
 use crate::threads::relative_time;
-use crate::style::size::{ICON, TEXT, TEXT_XS, TITLE};
+use crate::style::size::{ICON, TEXT};
 
 pub const WIDTH: f32 = 560.;
 /// The tallest the palette grows; its top stays put as results change.
@@ -71,7 +72,7 @@ pub struct SearchPalette {
 impl SearchPalette {
     pub fn new(commands: Vec<Item>, others: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Run a command, or search threads and projects…")
+            InputState::new(window, cx).placeholder(t("Run a command, or search threads and projects…"))
         });
         let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
             InputEvent::Change => this.filter(cx),
@@ -216,12 +217,12 @@ impl Render for SearchPalette {
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .whitespace_nowrap()
-                                .child(if item.label.is_empty() { "(untitled)".into() } else { item.label.clone() }),
+                                .child(if item.label.is_empty() { t("(untitled)").into() } else { item.label.clone() }),
                         )
                         .when_some(item.detail.clone(), |this, detail| {
                             this.child(
                                 div()
-                                    .text_size(TEXT_XS)
+                                    .text_size(TEXT)
                                     .text_color(dim)
                                     .overflow_hidden()
                                     .text_ellipsis()
@@ -234,17 +235,17 @@ impl Render for SearchPalette {
                     Badge::Keys(Some(kbd)) => this.child(
                         div()
                             .flex_none()
-                            .text_size(TEXT_XS)
+                            .text_size(TEXT)
                             .text_color(if active { theme.foreground } else { dim })
-                            .child(kbd.clone().outline()),
+                            .child(kbd.clone().outline().text_size(TEXT)),
                     ),
                     Badge::Keys(None) => this,
                     Badge::Kind(kind) => this.child(
                         div()
                             .flex_none()
-                            .text_size(TEXT_XS)
+                            .text_size(TEXT)
                             .text_color(dim)
-                            .child(kind.to_uppercase()),
+                            .child(t(kind).to_uppercase()),
                     ),
                 })
         });
@@ -265,9 +266,9 @@ impl Render for SearchPalette {
                     .py(px(10.))
                     .border_b_1()
                     .border_color(theme.border)
-                    .text_size(TITLE)
+                    .text_size(TEXT)
                     .child(crate::icons::search().size(ICON).text_color(dim))
-                    .child(Input::new(&self.input).appearance(false)),
+                    .child(Input::new(&self.input).text_size(TEXT).appearance(false)),
             )
             .child(
                 div()
@@ -282,9 +283,9 @@ impl Render for SearchPalette {
                                 .px(px(6.))
                                 .pt(px(4.))
                                 .pb(px(4.))
-                                .text_size(TEXT_XS)
+                                .text_size(TEXT)
                                 .text_color(dim)
-                                .child("COMMANDS"),
+                                .child(t("COMMANDS")),
                         )
                     })
                     .when(!query.is_empty() && self.rows.is_empty(), |this| {
@@ -294,7 +295,7 @@ impl Render for SearchPalette {
                                 .text_center()
                                 .text_size(TEXT)
                                 .text_color(dim)
-                                .child(format!("No matches for \"{}\".", self.input.read(cx).value().trim())),
+                                .child(tf("No matches for \"{query}\".", &[("query", self.input.read(cx).value().trim().to_string())])),
                         )
                     })
                     .children(rows),

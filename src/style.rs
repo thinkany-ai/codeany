@@ -3,34 +3,28 @@
 
 use std::sync::RwLock;
 
-use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, Selectable, Theme, ThemeMode, button::{Button, ButtonVariants as _}, menu::PopupMenuItem,
+    text::{TextView, TextViewStyle}, tooltip::Tooltip,
+};
 use anyhow::Result;
 use gpui_kit::*;
 
 use crate::themes::{self, Palette, parse_color};
 
-/// The type and icon scale. Every size in the UI comes from here, so the
-/// whole app reads as one family.
+/// Text and action icons follow the window's typography setting.
 pub mod size {
-    use gpui_kit::{Pixels, px};
+    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::{App, Pixels, Rems, rems};
 
-    /// Badges, shortcuts, counters.
-    pub const TEXT_XS: Pixels = px(11.);
-    /// Secondary lines: paths, timestamps, descriptions.
-    pub const TEXT_SM: Pixels = px(12.);
-    /// Rows, labels and controls.
-    pub const TEXT: Pixels = px(13.);
-    /// What is read at length: messages and the composer.
-    pub const TEXT_LG: Pixels = px(14.);
-    pub const TITLE: Pixels = px(16.);
-    pub const HEADING: Pixels = px(22.);
+    pub const TEXT: Rems = rems(1.);
 
-    /// Chevrons and close buttons.
-    pub const ICON_SM: Pixels = px(12.);
-    /// Icons beside text.
-    pub const ICON: Pixels = px(14.);
-    /// Toolbar buttons and list leaders.
-    pub const ICON_LG: Pixels = px(16.);
+    /// 16 px icons with the default 14 px text.
+    pub const ICON: Rems = rems(8. / 7.);
+
+    pub fn icon_pixels(cx: &App) -> Pixels {
+        ICON.to_pixels(cx.theme().font_size)
+    }
 }
 
 /// Shared geometry for the window, navigation and transcript.
@@ -51,19 +45,232 @@ pub mod layout {
     pub const ROW_INSET: Pixels = SPACE_2;
     pub const SIDEBAR_ROW: Pixels = px(28.);
     pub const SIDEBAR_ROW_INSET: Pixels = SPACE_2;
-    pub const SIDEBAR_CHAT_INSET: Pixels = px(32.);
     pub const SIDEBAR_NAV_ROW: Pixels = px(32.);
     pub const CONTENT_MAX: Pixels = px(720.);
 }
 
 /// A borderless icon button in the window chrome; they all share one size.
-pub fn chrome_button(id: &'static str) -> gpui_kit::component::button::Button {
-    use gpui_kit::component::{Sizable as _, button::ButtonVariants as _};
-    gpui_kit::component::button::Button::new(id).ghost().small().size(layout::CONTROL)
+pub fn chrome_button(id: &'static str) -> Button {
+    Button::new(id)
+        .ghost()
+        .size(layout::CONTROL)
+        .w(layout::CONTROL)
+        .h(layout::CONTROL)
+        .p_0()
 }
 
-/// The one monospace family: code, diffs and the terminal.
+/// The fixed-width font for code and the terminal.
 pub const MONO_FONT: &str = "Menlo";
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Typography {
+    pub family: Option<String>,
+    pub size: u8,
+}
+
+impl Default for Typography {
+    fn default() -> Self {
+        Self { family: None, size: 14 }
+    }
+}
+
+impl Global for Typography {}
+
+impl Typography {
+    pub const SIZES: std::ops::RangeInclusive<u8> = 11..=20;
+
+    fn apply(&self, theme: &mut Theme) {
+        let family = self.family.as_deref().unwrap_or(".SystemUIFont");
+        theme.font_family = family.to_owned().into();
+        // Code and the terminal need fixed-width glyphs, whatever the UI font.
+        theme.mono_font_family = MONO_FONT.into();
+        theme.font_size = px(self.size.clamp(*Self::SIZES.start(), *Self::SIZES.end()) as f32);
+        theme.mono_font_size = theme.font_size;
+    }
+}
+
+pub fn typography(cx: &App) -> Typography {
+    cx.try_global::<Typography>().cloned().unwrap_or_default()
+}
+
+pub fn set_typography(value: Typography, cx: &mut App) {
+    cx.set_global(value.clone());
+    Theme::update(cx, |theme| value.apply(theme));
+}
+
+/// App labels and icons use the same scale across button sizes.
+pub trait AppButtonStyle {
+    fn app_label(self, label: impl Into<SharedString>) -> Self;
+    fn app_icon(self, icon: impl Into<Icon>) -> Self;
+    fn app_tooltip(self, label: impl Into<SharedString>) -> AppTooltipButton;
+}
+
+impl AppButtonStyle for Button {
+    fn app_label(self, label: impl Into<SharedString>) -> Self {
+        let label = label.into();
+        self.accessibility_label(label.clone()).child(
+            div().min_w_0().truncate().text_size(size::TEXT).child(label),
+        )
+    }
+
+    fn app_icon(self, icon: impl Into<Icon>) -> Self {
+        // Button::icon applies its own size to the supplied icon.
+        self.child(icon.into().size(size::ICON))
+    }
+
+    fn app_tooltip(self, label: impl Into<SharedString>) -> AppTooltipButton {
+        AppTooltipButton { button: self, label: label.into() }
+    }
+}
+
+#[derive(IntoElement)]
+pub struct AppTooltipButton {
+    button: Button,
+    label: SharedString,
+}
+
+impl Selectable for AppTooltipButton {
+    fn selected(mut self, selected: bool) -> Self {
+        self.button = self.button.selected(selected);
+        self
+    }
+
+    fn is_selected(&self) -> bool {
+        self.button.is_selected()
+    }
+
+    fn open(mut self, open: bool) -> Self {
+        self.button = self.button.open(open);
+        self
+    }
+
+    fn is_open(&self) -> bool {
+        self.button.is_open()
+    }
+}
+
+impl RenderOnce for AppTooltipButton {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        with_tooltip(self.button.accessibility_label(self.label.clone()), self.label)
+    }
+}
+
+pub fn with_tooltip(content: impl IntoElement, label: impl Into<SharedString>) -> impl IntoElement {
+    let label = label.into();
+    div()
+        .id(SharedString::from(format!("button-tooltip:{label}")))
+        .flex_none()
+        .child(content)
+        .tooltip(move |window, cx| Tooltip::new(label.clone()).text_size(size::TEXT).build(window, cx))
+}
+
+pub fn menu_item(label: impl Into<SharedString>) -> PopupMenuItem {
+    let label = label.into();
+    PopupMenuItem::element(move |_, _| {
+        div()
+            .id("menu-item-label")
+            .role(accesskit::Role::Label)
+            .aria_label(label.clone())
+            .flex_1()
+            .text_size(size::TEXT)
+            .child(label.clone())
+    })
+}
+
+pub fn markdown(id: impl Into<ElementId>, text: impl Into<SharedString>, cx: &App) -> TextView {
+    let font_size = cx.theme().font_size;
+    let text_style = StyleRefinement::default().text_size(size::TEXT);
+    TextView::markdown(id, text)
+        .style(
+            TextViewStyle::default()
+                .heading_font_size(move |_, _| font_size)
+                .code_block(text_style.clone())
+                .table_cell(text_style.clone()),
+        )
+        .inline_code_style(text_style)
+        .on_link_click(|url, _, _, cx| open_link(url, cx))
+}
+
+/// Open a link from an answer. Agents often link files by path
+/// (`/Users/me/out/cat.png`, `~/notes.md`, `file:///…`, `src/main.rs:12`);
+/// those open in their default app, as the system cannot open them as URLs.
+pub fn open_link(url: &str, cx: &mut App) {
+    match local_path(url) {
+        Some(path) => cx.open_with_system(&path),
+        None => cx.open_url(url),
+    }
+}
+
+/// The existing local file or folder a link points to, if it is one.
+fn local_path(url: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let raw = if let Some(rest) = url.strip_prefix("file://") {
+        percent_decode(rest)
+    } else if url.contains("://") || url.starts_with("mailto:") {
+        return None;
+    } else {
+        percent_decode(url)
+    };
+    let path = match raw.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        None => PathBuf::from(&raw),
+    };
+    if !path.is_absolute() {
+        return None;
+    }
+    if path.exists() {
+        return Some(path);
+    }
+    // `file.rs:12` or `file.rs:12:5`: the file, without the position.
+    let text = path.to_string_lossy();
+    let mut trimmed = text.as_ref();
+    for _ in 0..2 {
+        match trimmed.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => trimmed = head,
+            _ => break,
+        }
+    }
+    let path = PathBuf::from(trimmed);
+    path.exists().then_some(path)
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::{local_path, percent_decode};
+
+    #[test]
+    fn finds_local_files_behind_links() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let cargo = format!("{manifest}/Cargo.toml");
+        assert_eq!(local_path(&cargo).unwrap().to_string_lossy(), cargo);
+        assert_eq!(local_path(&format!("{cargo}:12:5")).unwrap().to_string_lossy(), cargo);
+        assert_eq!(local_path(&format!("file://{}", cargo.replace(' ', "%20"))).unwrap().to_string_lossy(), cargo);
+        assert!(local_path("https://example.com/a.png").is_none());
+        assert!(local_path("/no/such/file.png").is_none());
+        assert!(local_path("relative/file.md").is_none());
+        assert_eq!(percent_decode("%E7%8C%AB.png"), "猫.png");
+    }
+}
 
 /// Lucide's icons drawn with a lighter stroke, closer to the system's.
 pub struct Assets;
@@ -139,12 +346,11 @@ pub fn apply(window: &mut Window, cx: &mut App) {
     *ANSI.write().unwrap() = None;
     Theme::sync_system_appearance(Some(window), cx);
     let dark = Theme::global(cx).is_dark();
+    let typography = typography(cx);
 
     Theme::update(cx, |theme| {
         theme.overlay = overlay(dark);
-        theme.font_size = size::TEXT_LG;
-        theme.font_family = ".SystemUIFont".into();
-        theme.mono_font_family = MONO_FONT.into();
+        typography.apply(theme);
         theme.radius = px(8.);
         theme.radius_lg = px(12.);
 
@@ -242,12 +448,11 @@ fn apply_palette(p: &Palette, window: &mut Window, cx: &mut App) {
     let sidebar = p.sidebar.map(color).unwrap_or(bg2);
     // Text on the accent: dark on light accents, white otherwise.
     let on_accent = if accent.l > 0.62 { hex(0x111111) } else { hex(0xffffff) };
+    let typography = typography(cx);
 
     Theme::update(cx, |theme| {
         theme.overlay = overlay(p.dark);
-        theme.font_size = size::TEXT_LG;
-        theme.font_family = ".SystemUIFont".into();
-        theme.mono_font_family = MONO_FONT.into();
+        typography.apply(theme);
         theme.radius = px(8.);
         theme.radius_lg = px(12.);
 
