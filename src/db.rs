@@ -10,6 +10,7 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash as _, Hasher as _},
     path::Path,
+    sync::{Mutex, OnceLock, mpsc},
 };
 
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -68,6 +69,68 @@ fn thread_meta(thread: &Thread) -> String {
         map.remove("items");
     }
     value.to_string()
+}
+
+/// Threads written on a thread of their own, so saving never holds up the
+/// window: the UI hands over a snapshot, the writer serializes, compares and
+/// writes it. Snapshots that queue up while one is written collapse into
+/// the newest.
+struct Writer {
+    tx: mpsc::Sender<Job>,
+}
+
+enum Job {
+    Save(Vec<Thread>),
+    Flush(mpsc::Sender<()>),
+}
+
+static WRITER: OnceLock<Mutex<Writer>> = OnceLock::new();
+
+/// Write threads from now on through a background connection to `path`,
+/// starting from what `db` has read or written.
+pub fn start_writer(db: &Db, path: &Path) {
+    let Ok(own) = Db::open(path) else { return };
+    *own.written.borrow_mut() = std::mem::take(&mut *db.written.borrow_mut());
+    let (tx, rx) = mpsc::channel::<Job>();
+    let spawned = std::thread::Builder::new().name("codeany-db".into()).spawn(move || {
+        while let Ok(job) = rx.recv() {
+            let mut latest = None;
+            let mut flushes = Vec::new();
+            for job in std::iter::once(job).chain(rx.try_iter()) {
+                match job {
+                    Job::Save(threads) => latest = Some(threads),
+                    Job::Flush(done) => flushes.push(done),
+                }
+            }
+            if let Some(threads) = latest {
+                if let Err(err) = own.save_threads(&threads) {
+                    eprintln!("codeany: saving threads failed: {err}");
+                }
+            }
+            for done in flushes {
+                let _ = done.send(());
+            }
+        }
+    });
+    if spawned.is_ok() {
+        let _ = WRITER.set(Mutex::new(Writer { tx }));
+    }
+}
+
+/// Queue a save; false when there is no writer (then save in place).
+pub fn save_in_background(threads: Vec<Thread>) -> bool {
+    WRITER
+        .get()
+        .is_some_and(|writer| writer.lock().unwrap().tx.send(Job::Save(threads)).is_ok())
+}
+
+/// Wait (up to a few seconds) for queued saves to reach the disk.
+pub fn flush() {
+    let Some(writer) = WRITER.get() else { return };
+    let (done, wait) = mpsc::channel();
+    if writer.lock().unwrap().tx.send(Job::Flush(done)).is_ok() {
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(5));
+    }
 }
 
 impl Db {
@@ -267,5 +330,25 @@ mod tests {
         a.save_threads(std::slice::from_ref(&mine)).unwrap();
         assert_eq!(Db::open(&path).unwrap().load_threads().len(), 2);
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    /// `CODEANY_BENCH_DB=path cargo test db::bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn save_cost() {
+        let Ok(path) = std::env::var("CODEANY_BENCH_DB") else { return };
+        let db = super::Db::open(std::path::Path::new(&path)).unwrap();
+        let threads = db.load_threads();
+        let t = std::time::Instant::now();
+        let copy = threads.clone();
+        let clone = t.elapsed();
+        let t = std::time::Instant::now();
+        db.save_threads(&copy).unwrap();
+        let save = t.elapsed();
+        let items: usize = threads.iter().map(|t| t.items.len()).sum();
+        println!("threads {} items {items}: clone {clone:?}, unchanged save {save:?}", threads.len());
     }
 }

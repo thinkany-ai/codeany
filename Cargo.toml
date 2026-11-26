@@ -1,8 +1,10 @@
 [package]
 name = "codeany"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
-description = "A lightweight code editor built with GPUI"
+description = "A local-first coding agent"
+license = "AGPL-3.0-only"
+repository = "https://github.com/thinkany-ai/codeany"
 
 [dependencies]
 gpui-kit = { version = "0.8.1", features = [
@@ -35,8 +37,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-agl = { path = "../agl" }
-nex = { path = "../nex/crates/nex" }
+agl = { git = "https://github.com/thinkany-ai/agl", tag = "v0.3.19" }
+nex = { git = "https://github.com/thinkany-ai/nex", rev = "12ea252" }
 tokio-tungstenite = "0.26"
 tokio-util = "0.7"
 reqwest = { version = "0.12", features = ["json"] }

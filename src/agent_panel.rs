@@ -19,7 +19,6 @@ use gpui_kit::component::{
     Disableable as _,
     shimmer::ShimmerText,
     spinner::Spinner,
-    tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -49,6 +48,7 @@ use crate::style::{
 enum SidebarSection {
     Projects,
     Recent,
+    Archived,
 }
 
 /// How often the account's other machines are looked up while signed in.
@@ -76,6 +76,8 @@ fn capitalize(text: &str) -> String {
 
 /// What a tab in the header shows.
 pub struct ChatTab {
+    /// The thread it shows; `None` for a new thread.
+    pub id: Option<u64>,
     pub title: String,
     /// The thread's agent, for its icon; `None` for a new thread.
     pub agent: Option<String>,
@@ -149,6 +151,8 @@ pub struct AgentPanel {
     closed_tabs: Vec<u64>,
     projects_expanded: bool,
     recent_expanded: bool,
+    /// Archived threads are listed at the foot of the sidebar, folded.
+    archived_expanded: bool,
     sort_repositories_by_name: bool,
     navigation_history: Vec<u64>,
     navigation_index: usize,
@@ -172,14 +176,23 @@ pub struct AgentPanel {
     worked: HashSet<(u64, usize)>,
     /// The answer last copied, to show a check.
     copied: Option<(u64, usize)>,
-    /// Keeps a just-opened thread at the bottom while markdown lays out.
-    _pin_bottom: Option<Task<()>>,
     composer: Entity<TextareaState>,
     /// Images pasted into the composer, sent with the next message.
     attachments: Vec<PathBuf>,
     /// The open project's git branch, from the workspace's polling.
     branch: Option<String>,
-    scroll: ScrollHandle,
+    /// The transcript, virtualized: one row per turn (and one for the
+    /// "Working…" line), laid out only while in view. It follows the tail
+    /// as a reply grows; scrolling up stops that, so a running turn cannot
+    /// drag the reader back down, and scrolling back to the end resumes it.
+    chat_list: ListState,
+    /// The thread the rows are of, its turns, and a cheap signature of each
+    /// row, to tell the list which rows to measure again.
+    chat_thread: Option<u64>,
+    chat_turns: Vec<Turn>,
+    chat_sigs: Vec<u64>,
+    /// Whether the transcript keeps to its end, as the list last reported.
+    follow: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -269,6 +282,24 @@ impl AgentPanel {
         if let Some(theme) = store.theme.clone() {
             crate::style::set_choice(theme, window, cx);
         }
+        // Rows well above and below the view stay laid out, so a fast
+        // scroll rarely shows a row being measured.
+        let chat_list = ListState::new(0, ListAlignment::Top, px(1200.));
+        chat_list.set_follow_mode(FollowMode::Tail);
+        {
+            let panel = cx.weak_entity();
+            chat_list.set_scroll_handler(move |event, _, cx| {
+                let following = event.is_following_tail;
+                panel
+                    .update(cx, |this, cx| {
+                        if this.follow != following {
+                            this.follow = following;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            });
+        }
         Self {
             machine: store.machine.clone(),
             agents_machine: store.machine.clone(),
@@ -288,6 +319,7 @@ impl AgentPanel {
             unread: HashSet::new(),
             projects_expanded: true,
             recent_expanded: true,
+            archived_expanded: false,
             sort_repositories_by_name: false,
             navigation_history: Vec::new(),
             navigation_index: 0,
@@ -306,11 +338,14 @@ impl AgentPanel {
             groups: HashMap::new(),
             worked: HashSet::new(),
             copied: None,
-            _pin_bottom: None,
             composer,
             attachments: Vec::new(),
             branch: None,
-            scroll: ScrollHandle::new(),
+            chat_list,
+            chat_thread: None,
+            chat_turns: Vec::new(),
+            chat_sigs: Vec::new(),
+            follow: true,
             _subscriptions: subscriptions,
         }
     }
@@ -386,6 +421,7 @@ impl AgentPanel {
             .map(|id| {
                 let thread = id.and_then(|id| self.store.threads.iter().find(|t| t.id == id));
                 ChatTab {
+                    id,
                     title: thread.map(|t| display_title(&t.title)).unwrap_or_else(|| t("New thread").into()),
                     agent: thread.map(|t| t.agent.clone()),
                     running: id.is_some_and(|id| self.is_busy(id)),
@@ -393,6 +429,33 @@ impl AgentPanel {
             })
             .collect();
         (items, active)
+    }
+
+    /// Give a thread a title of the user's own.
+    pub fn rename_thread(&mut self, id: u64, title: &str, cx: &mut Context<Self>) {
+        let title: String = title.trim().chars().take(120).collect();
+        if title.is_empty() {
+            return;
+        }
+        if let Some(thread) = self.thread_mut(id) {
+            thread.title = title;
+        }
+        self.store.save();
+        cx.notify();
+    }
+
+    /// Close every tab but `ix`; the threads stay in the sidebar.
+    pub fn close_other_tabs(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let closed = self.tab_set_mut().close_others(ix);
+        self.closed_tabs.extend(closed);
+        self.show_active_tab(window, cx);
+    }
+
+    /// Close the tabs after `ix`.
+    pub fn close_tabs_to_right(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let closed = self.tab_set_mut().close_right(ix);
+        self.closed_tabs.extend(closed);
+        self.show_active_tab(window, cx);
     }
 
     /// Show what the active tab holds.
@@ -569,22 +632,48 @@ impl AgentPanel {
         self.select_thread(id, window, cx);
     }
 
-    /// Scroll to the end, and keep there for a moment: markdown lays out
-    /// asynchronously and grows the transcript after the first frame.
+    /// Go to the end of the transcript and follow it again. The list keeps
+    /// to the end itself while rows below lay out (markdown grows a row
+    /// after its first frame).
     fn pin_to_bottom(&mut self, cx: &mut Context<Self>) {
-        self.scroll.scroll_to_bottom();
-        self._pin_bottom = Some(cx.spawn(async move |this, cx| {
-            for _ in 0..15 {
-                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
-                if this.update(cx, |this, _| this.scroll.scroll_to_bottom()).is_err() {
-                    break;
-                }
-            }
-        }));
+        self.follow = true;
+        self.chat_list.set_follow_mode(FollowMode::Tail);
+        cx.notify();
+    }
+
+    /// Keep to the end of the transcript if the reader is following it.
+    fn follow_to_bottom(&mut self) {
+        if self.follow {
+            self.chat_list.scroll_to_end();
+        }
+    }
+
+    /// Measure every transcript row again (the theme or text size changed).
+    pub fn remeasure_chat(&self) {
+        self.chat_list.remeasure();
     }
 
     fn delete_thread(&mut self, id: u64, cx: &mut Context<Self>) {
         self.remove_thread(id, true, cx);
+    }
+
+    /// Delete after asking: unlike archiving, it cannot be undone.
+    fn confirm_delete(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.store.threads.iter().find(|t| t.id == id) else { return };
+        let message = tf("Delete “{title}”?", &[("title", thread.title.clone())]);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some(t("The conversation is removed for good. To hide it but keep it, archive it instead.")),
+            &[PromptButton::ok(t("Delete")), PromptButton::cancel(t("Cancel"))],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| this.delete_thread(id, cx)).ok();
+            }
+        })
+        .detach();
     }
 
     /// Drop a thread; `propagate` also deletes it on the device it runs on.
@@ -647,6 +736,12 @@ impl AgentPanel {
             effort: thread.effort.clone(),
             access: thread.access.clone(),
             resume: thread.native_ids.get(&thread.agent).cloned(),
+            // Only this machine's agents take the arguments set here.
+            extra_args: if thread.machine.is_none() {
+                self.store.agent_args.get(&thread.agent).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         };
         // A worktree is checked out on first use, and again if its folder went away.
         let checkout = thread.worktree.clone().filter(|w| thread.machine.is_none() && !w.path.exists());
@@ -834,7 +929,8 @@ impl AgentPanel {
         self.dispatch_prompt(id, false, cx);
         self.composer
             .update(cx, |composer, cx| composer.set_value("", window, cx));
-        self.scroll.scroll_to_bottom();
+        self.follow = true;
+        self.chat_list.set_follow_mode(FollowMode::Tail);
         self.store.save();
         cx.notify();
     }
@@ -1032,6 +1128,48 @@ impl AgentPanel {
         cx.notify();
     }
 
+    /// Whether an agent is offered for threads (Settings → Agents).
+    pub fn agent_enabled(&self, agent: &str) -> bool {
+        self.store.enabled_agents.iter().any(|a| a == agent)
+    }
+
+    pub fn set_agent_enabled(&mut self, agent: &str, enabled: bool, cx: &mut Context<Self>) {
+        self.store.enabled_agents.retain(|a| a != agent);
+        if enabled {
+            self.store.enabled_agents.push(agent.to_string());
+        }
+        self.store.save();
+        self.show_agents(cx);
+    }
+
+    /// This machine's agents, once detected (Settings → Agents).
+    pub fn local_agents(&self) -> Option<&[AgentInfo]> {
+        match self.agents_cache.get(&None) {
+            Some(Ok(agents)) => Some(agents),
+            _ => None,
+        }
+    }
+
+    /// Look for this machine's agents again, after their settings changed.
+    pub fn redetect_local_agents(&mut self, cx: &mut Context<Self>) {
+        self.detect_agents(None, cx);
+    }
+
+    /// The arguments appended to an agent's launch arguments here.
+    pub fn agent_args(&self, agent: &str) -> Vec<String> {
+        self.store.agent_args.get(agent).cloned().unwrap_or_default()
+    }
+
+    pub fn set_agent_args(&mut self, agent: &str, args: Vec<String>, cx: &mut Context<Self>) {
+        if args.is_empty() {
+            self.store.agent_args.remove(agent);
+        } else {
+            self.store.agent_args.insert(agent.to_string(), args);
+        }
+        self.store.save();
+        cx.notify();
+    }
+
     fn detect_agents(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
         let detect = agl_bridge::backend(machine.as_deref()).detect();
         cx.spawn(async move |this, cx| {
@@ -1052,19 +1190,29 @@ impl AgentPanel {
         let machine = self.agents_machine.clone();
         let agents = self.agents_cache.get(&machine).cloned();
         if let Some(Ok(agents)) = &agents {
-            let installed = |id: &str| agents.iter().any(|a| a.id == id && a.available);
-            // The next new thread's agent must be one installed there.
-            if machine == self.machine && self.agent.as_deref().is_none_or(|id| !installed(id)) {
-                self.agent = agents.iter().find(|a| a.available).map(|a| a.id.clone());
+            let enabled = &self.store.enabled_agents;
+            let usable = |a: &AgentInfo| a.available && enabled.contains(&a.id);
+            // The next new thread's agent must be one installed and enabled there.
+            if machine == self.machine && self.agent.as_deref().is_none_or(|id| !agents.iter().any(|a| a.id == id && usable(a))) {
+                self.agent = agents.iter().find(|a| usable(a)).map(|a| a.id.clone());
                 self.model = None;
             }
-            let favorites = self.store.favorites.clone();
+            // Starred models of agents turned off stay starred, out of sight.
+            let favorites: Vec<(String, String)> =
+                self.store.favorites.iter().filter(|(a, _)| enabled.contains(a)).cloned().collect();
             let agent = match self.active_thread() {
                 Some(thread) => Some(thread.agent.clone()),
                 None => self.agent.clone(),
             };
+            // The picker offers the enabled agents, and the open thread's
+            // own even if it has been turned off since.
+            let offered: Vec<AgentInfo> = agents
+                .iter()
+                .filter(|a| usable(a) || agent.as_deref() == Some(a.id.as_str()))
+                .cloned()
+                .collect();
             self.picker.update(cx, |picker, cx| {
-                picker.set_agents(agents, cx);
+                picker.set_agents(&offered, cx);
                 picker.set_favorites(favorites, cx);
                 // Load the agent's models for its label and efforts.
                 if let Some(agent) = agent {
@@ -1098,8 +1246,8 @@ impl AgentPanel {
                     }
                     None => self.store.threads.push(thread),
                 }
-                if self.active == Some(id) && self.is_near_bottom() {
-                    self.scroll.scroll_to_bottom();
+                if self.active == Some(id) {
+                    self.follow_to_bottom();
                 }
                 self.store.save();
                 cx.notify();
@@ -1202,15 +1350,10 @@ impl AgentPanel {
         if idle {
             self.dispatch_prompt(id, false, cx);
         }
-        if self.active == Some(id) && self.is_near_bottom() {
-            self.scroll.scroll_to_bottom();
+        if self.active == Some(id) {
+            self.follow_to_bottom();
         }
         cx.notify();
-    }
-
-    fn is_near_bottom(&self) -> bool {
-        let max = self.scroll.max_offset().y;
-        -self.scroll.offset().y >= max - px(120.)
     }
 
     fn on_picker_event(
@@ -1221,13 +1364,17 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ModelPickerEvent::Select { agent, model, effort } => {
+            ModelPickerEvent::Select { agent, model, effort, done } => {
                 self.choose_model(agent.clone(), model.clone(), cx);
                 if let Some(effort) = effort {
                     self.set_effort(effort.clone(), cx);
                 }
-                self.picker_open = false;
-                self.focus_composer(window, cx);
+                // Picking a model leaves the picker open for its effort;
+                // picking the effort (or a model without any) closes it.
+                if *done {
+                    self.picker_open = false;
+                    self.focus_composer(window, cx);
+                }
             }
             ModelPickerEvent::ToggleFavorite { agent, model } => {
                 let key = (agent.clone(), model.clone());
@@ -1294,7 +1441,7 @@ impl AgentPanel {
                     agl_bridge::backend(session.machine.as_deref()).configure(&session.id, None, Some(model.clone().unwrap_or_else(|| "default".into())), None);
                 }
             }
-            self.scroll.scroll_to_bottom();
+            self.follow_to_bottom();
         }
         self.agent = Some(agent.clone());
         self.model = model.clone();
@@ -1578,32 +1725,6 @@ impl AgentPanel {
         }
     }
 
-    pub fn default_agent(&self) -> Option<&str> {
-        self.agent.as_deref()
-    }
-
-    pub fn default_access(&self) -> &str {
-        &self.access
-    }
-
-    /// The agent new threads start with; open threads keep theirs.
-    pub fn set_default_agent(&mut self, agent: String, cx: &mut Context<Self>) {
-        self.agent = Some(agent.clone());
-        self.model = None;
-        self.store.agent = Some(agent.clone());
-        self.store.model = None;
-        self.picker.update(cx, |picker, cx| picker.ensure_models(&agent, cx));
-        self.store.save();
-        cx.notify();
-    }
-
-    pub fn set_default_access(&mut self, access: &str, cx: &mut Context<Self>) {
-        self.access = access.to_string();
-        self.store.access = access.to_string();
-        self.store.save();
-        cx.notify();
-    }
-
     /// The interface language: `None` follows the system.
     pub fn language_preference(&self) -> Option<crate::i18n::Language> {
         crate::i18n::preference_from_setting(self.store.language.clone())
@@ -1631,16 +1752,11 @@ impl AgentPanel {
         crate::style::set_typography(value, cx);
     }
 
-    /// Enter a project: switch to it, show its threads, start a new one there.
-    fn open_project(&mut self, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = &project {
-            if !self.expanded_projects.insert(path.clone()) {
-                self.expanded_projects.remove(path);
-            }
-        }
+    fn new_thread_in_project(&mut self, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         if project != self.project {
             cx.emit(AgentPanelEvent::SwitchProject(project.clone()));
             self.project = project;
+            self.branch = None;
         }
         self.new_thread(window, cx);
     }
@@ -1770,13 +1886,13 @@ impl AgentPanel {
                     }))
                     .separator()
                     .item(
-                        crate::style::menu_item(t(if settled { "Reopen" } else { "Settle" })).on_click(move |_, _, cx| {
+                        crate::style::menu_item(t(if settled { "Unarchive" } else { "Archive" })).on_click(move |_, _, cx| {
                             settle.update(cx, |this, cx| this.set_settled(id, !settled, cx)).ok();
                         }),
                     )
                     .separator()
-                    .item(crate::style::menu_item(t("Delete")).on_click(move |_, _, cx| {
-                        delete.update(cx, |this, cx| this.delete_thread(id, cx)).ok();
+                    .item(crate::style::menu_item(t("Delete…")).on_click(move |_, window, cx| {
+                        delete.update(cx, |this, cx| this.confirm_delete(id, window, cx)).ok();
                     }))
                 }
             })
@@ -1787,6 +1903,7 @@ impl AgentPanel {
         let expanded = match section {
             SidebarSection::Projects => &mut self.projects_expanded,
             SidebarSection::Recent => &mut self.recent_expanded,
+            SidebarSection::Archived => &mut self.archived_expanded,
         };
         *expanded = !*expanded;
         cx.notify();
@@ -1797,6 +1914,7 @@ impl AgentPanel {
         let (title, expanded) = match section {
             SidebarSection::Projects => ("Projects", self.projects_expanded),
             SidebarSection::Recent => ("Chats", self.recent_expanded),
+            SidebarSection::Archived => ("Archived", self.archived_expanded),
         };
         div()
             .mt(layout::SPACE_4)
@@ -1995,6 +2113,7 @@ impl AgentPanel {
                     });
                     let count = entries.len();
                     let path = project.clone();
+                    let new_thread_path = path.clone();
                     list = list.child(
                         div()
                             .id(SharedString::from(format!("project-{}", project.display())))
@@ -2030,20 +2149,48 @@ impl AgentPanel {
                             .when(live, |this| {
                                 this.child(div().flex_none().size(px(6.)).rounded_full().bg(theme.success))
                             })
-                            .when(count > 0 && !expanded, |this| {
-                                this.child(
-                                    div().flex_none().text_size(TEXT).text_color(theme.muted_foreground)
-                                        .child(count.to_string()),
-                                )
-                            })
+                            .child(
+                                div()
+                                    .relative()
+                                    .size(layout::CONTROL)
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(count > 0 && !expanded, |this| {
+                                        this.child(
+                                            div().id("project-thread-count")
+                                                .text_color(theme.muted_foreground)
+                                                .group_hover("project", |this| this.invisible())
+                                                .child(count.to_string()),
+                                        )
+                                    })
+                                    .child(
+                                        div().id("project-new-thread")
+                                            .absolute().inset_0()
+                                            .invisible()
+                                            .group_hover("project", |this| this.visible())
+                                            .child(
+                                                icon_button("new-project-thread", IconName::SquarePen)
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.new_thread_in_project(Some(new_thread_path.clone()), window, cx);
+                                                    }))
+                                                    .app_tooltip(t("New Thread")),
+                                            ),
+                                    ),
+                            )
                             .child(
                                 Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
                                     .size(ICON)
                                     .flex_none()
                                     .text_color(theme.muted_foreground.opacity(0.7)),
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_project(Some(path.clone()), window, cx)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.expanded_projects.insert(path.clone()) {
+                                    this.expanded_projects.remove(&path);
+                                }
+                                cx.notify();
                             })),
                     );
                     if expanded {
@@ -2078,7 +2225,7 @@ impl AgentPanel {
             list = list.child(self.render_section_header(
                 SidebarSection::Recent,
                 icon_button("new-chat", IconName::SquarePen)
-                    .on_click(cx.listener(|this, _, window, cx| this.open_project(None, window, cx)))
+                    .on_click(cx.listener(|this, _, window, cx| this.new_thread_in_project(None, window, cx)))
                     .app_tooltip(t("New Chat"))
                     .into_any_element(),
                 cx,
@@ -2147,6 +2294,21 @@ impl AgentPanel {
             }
         }
 
+        // ---- Archived threads: out of the lists above, kept until deleted.
+        let mut archived: Vec<Entry> = self.store.threads.iter().filter(|t| t.settled).map(Entry::Thread).collect();
+        if !archived.is_empty() {
+            archived.sort_by(|a, b| b.updated().cmp(&a.updated()));
+            let count = div()
+                .text_size(TEXT)
+                .text_color(theme.muted_foreground.opacity(0.7))
+                .child(archived.len().to_string())
+                .into_any_element();
+            list = list.child(self.render_section_header(SidebarSection::Archived, count, cx));
+            if self.archived_expanded {
+                list = push_entries(self, list, Some(PathBuf::from("archived:")), &archived, false, cx);
+            }
+        }
+
         div()
             .size_full()
             .flex()
@@ -2159,96 +2321,26 @@ impl AgentPanel {
 
     pub fn render_chat(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let thread = self.active_thread().cloned();
-
-        let Some(thread) = thread.filter(|t| !t.items.is_empty() || self.pending_prompts.contains_key(&t.id)) else {
+        let Some(id) = self
+            .active_thread()
+            .filter(|t| !t.items.is_empty() || self.pending_prompts.contains_key(&t.id))
+            .map(|t| t.id)
+        else {
             return self.render_empty(cx);
         };
+        self.sync_chat_rows(id);
 
-        let running = self.running.contains(&thread.id);
-        let mut messages = div()
-            .w_full()
-            .min_w_0()
-            .max_w(layout::CONTENT_MAX)
-            .mx_auto()
-            .px(layout::SPACE_6)
-            .pt(layout::SPACE_6)
-            .pb(layout::SPACE_6)
-            .flex()
-            .flex_col();
-        let turns = split_turns(&thread.items);
-        let last_turn = turns.len().saturating_sub(1);
-        let mut first = true;
-        for (n, turn) in turns.iter().enumerate() {
-            if let Some(user) = turn.user {
-                messages = messages.child(
-                    div()
-                        .when(!first, |this| this.mt(px(40.)))
-                        .child(self.render_item(thread.id, user, &thread.items[user], cx)),
-                );
-                first = false;
-            }
-            let live = n == last_turn && running && !turn.finished;
-            let has_work = turn.work.iter().any(|&ix| !is_hidden(&thread.items[ix]));
-            if live || !has_work {
-                // In progress: everything in order, the newest steps open.
-                let mut ixs: Vec<usize> = turn.work.iter().chain(&turn.visible).copied().collect();
-                ixs.sort_unstable();
-                messages = messages.children(self.render_blocks(thread.id, &thread.items, &ixs, first, cx));
-            } else {
-                // Done: the work folds under "Worked for …"; the answer stays.
-                let key = (thread.id, turn.work[0]);
-                let open = self.worked.contains(&key);
-                messages = messages.child(
-                    div()
-                        .id(("worked", turn.work[0]))
-                        .when(!first, |this| this.mt(px(16.)))
-                        .pb(px(6.))
-                        .flex()
-                        .items_center()
-                        .gap(layout::SPACE_2)
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .text_size(TEXT)
-                        .text_color(theme.muted_foreground)
-                        .cursor_pointer()
-                        .hover(|this| this.text_color(theme.foreground))
-                        .child(worked_for(turn.ms))
-                        .child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(ICON))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.worked.remove(&key) {
-                                this.worked.insert(key);
-                            }
-                            cx.notify();
-                        })),
-                );
-                if open {
-                    messages = messages.children(self.render_blocks(thread.id, &thread.items, &turn.work, false, cx));
-                }
-                messages = messages.children(self.render_blocks(thread.id, &thread.items, &turn.visible, false, cx));
-            }
-            if turn.finished && !live {
-                messages = messages.child(self.render_turn_actions(thread.id, &thread.items, turn, cx));
-            }
-            first = false;
-        }
-        if running {
-            messages = messages.child(
-                div()
-                    .mt(px(16.))
-                    .text_size(TEXT)
-                    .text_color(theme.muted_foreground)
-                    .child(
-                        ShimmerText::new(
-                            self.notes
-                                .get(&thread.id)
-                                .cloned()
-                                .unwrap_or_else(|| t("Working…").into()),
-                        )
-                        .id("working"),
-                    ),
-            );
-        }
+        // Only the rows in view (and a margin) are laid out; the rest keep
+        // the height they were last measured at.
+        let rows = list(
+            self.chat_list.clone(),
+            // Each row is laid out on its own, so `mx_auto` inside has no
+            // parent to center against: a full-width row centers it.
+            cx.processor(|this: &mut Self, ix: usize, _window, cx| {
+                div().w_full().flex().justify_center().child(this.render_chat_row(ix, cx)).into_any_element()
+            }),
+        )
+        .size_full();
 
         div()
             .size_full()
@@ -2257,17 +2349,34 @@ impl AgentPanel {
             .flex()
             .flex_col()
             .bg(theme.background)
-            .child(
-                div()
-                    .id("messages")
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .overflow_x_hidden()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .child(messages),
-            )
+            .child(div().id("messages").flex_1().min_h_0().min_w_0().child(rows))
+            .when(!self.follow, |this| {
+                // Back to the newest message, and following it again.
+                this.child(
+                    div().w_full().flex_none().flex().justify_center().h(px(0.)).child(
+                        div()
+                            .id("jump-to-latest")
+                            .mt(px(-44.))
+                            .h(px(30.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .gap(layout::SPACE_1)
+                            .rounded_full()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.popover)
+                            .shadow_sm()
+                            .text_size(TEXT)
+                            .text_color(theme.muted_foreground)
+                            .cursor_pointer()
+                            .hover(|this| this.text_color(theme.foreground))
+                            .child(Icon::new(IconName::ArrowDown).size(ICON))
+                            .child(t("Latest"))
+                            .on_click(cx.listener(|this, _, _, cx| this.pin_to_bottom(cx))),
+                    ),
+                )
+            })
             .child(
                 div()
                     .w_full()
@@ -2276,9 +2385,163 @@ impl AgentPanel {
                     .px(layout::SPACE_6)
                     .pb(layout::SPACE_4)
                     .flex_none()
-                    .child(self.render_composer(Some(&thread), cx)),
+                    .child(self.render_composer(self.active_thread(), cx)),
             )
             .into_any_element()
+    }
+
+    /// Bring the transcript's rows up to date with thread `id`: one per
+    /// turn, then the "Working…" line while it runs, then a bottom margin.
+    /// Rows whose signature changed are measured again; the others keep
+    /// their height, so a growing reply touches one row.
+    fn sync_chat_rows(&mut self, id: u64) {
+        let Some((turns, sigs)) = self.chat_rows(id) else { return };
+        if self.chat_thread != Some(id) {
+            self.chat_thread = Some(id);
+            self.chat_list.reset(sigs.len());
+            if self.follow {
+                self.chat_list.set_follow_mode(FollowMode::Tail);
+            }
+        } else {
+            let old = self.chat_sigs.len();
+            let shared = old.min(sigs.len());
+            for ix in (0..shared).filter(|&ix| self.chat_sigs[ix] != sigs[ix]) {
+                self.chat_list.splice(ix..ix + 1, 1);
+            }
+            if old != sigs.len() {
+                self.chat_list.splice(shared..old, sigs.len() - shared);
+            }
+        }
+        self.chat_turns = turns;
+        self.chat_sigs = sigs;
+    }
+
+    fn chat_rows(&self, id: u64) -> Option<(Vec<Turn>, Vec<u64>)> {
+        use std::hash::{Hash as _, Hasher as _};
+        let thread = self.store.threads.iter().find(|t| t.id == id)?;
+        let running = self.running.contains(&id);
+        let turns = split_turns(&thread.items);
+        let last = turns.len().saturating_sub(1);
+        let mut sigs: Vec<u64> = turns
+            .iter()
+            .enumerate()
+            .map(|(n, turn)| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                let live = n == last && running && !turn.finished;
+                (n, turn.user, live, turn.finished, turn.ms).hash(&mut h);
+                for &ix in turn.user.iter().chain(&turn.work).chain(&turn.visible) {
+                    let item = &thread.items[ix];
+                    (ix, std::mem::discriminant(item), crate::threads::item_weight(item)).hash(&mut h);
+                    let key = (id, ix);
+                    (
+                        self.expanded.contains(&key),
+                        self.groups.get(&key),
+                        self.worked.contains(&key),
+                        self.copied == Some(key),
+                    )
+                        .hash(&mut h);
+                }
+                h.finish()
+            })
+            .collect();
+        if running {
+            sigs.push(u64::MAX - 1);
+        }
+        sigs.push(u64::MAX);
+        Some((turns, sigs))
+    }
+
+    /// One row of the transcript: a turn, the "Working…" line, or the
+    /// bottom margin.
+    fn render_chat_row(&self, n: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let mut row = div()
+            .w_full()
+            .min_w_0()
+            .max_w(layout::CONTENT_MAX)
+            .mx_auto()
+            .px(layout::SPACE_6)
+            .flex()
+            .flex_col();
+        let Some(thread) = self.active_thread() else { return row.into_any_element() };
+        let running = self.running.contains(&thread.id);
+        let Some(turn) = self.chat_turns.get(n) else {
+            if running && n == self.chat_turns.len() {
+                return row
+                    .child(
+                        div()
+                            .mt(px(16.))
+                            .text_size(TEXT)
+                            .text_color(theme.muted_foreground)
+                            .child(
+                                ShimmerText::new(
+                                    self.notes
+                                        .get(&thread.id)
+                                        .cloned()
+                                        .unwrap_or_else(|| t("Working…").into()),
+                                )
+                                .id("working"),
+                            ),
+                    )
+                    .into_any_element();
+            }
+            return row.h(layout::SPACE_6).into_any_element();
+        };
+        if n == 0 {
+            row = row.pt(layout::SPACE_6);
+        }
+        let mut first = n == 0;
+        if let Some(user) = turn.user {
+            row = row.child(
+                div()
+                    .when(!first, |this| this.mt(px(40.)))
+                    .child(self.render_item(thread.id, user, &thread.items[user], cx)),
+            );
+            first = false;
+        }
+        let live = n + 1 == self.chat_turns.len() && running && !turn.finished;
+        let has_work = turn.work.iter().any(|&ix| !is_hidden(&thread.items[ix]));
+        if live || !has_work {
+            // In progress: everything in order, the newest steps open.
+            let mut ixs: Vec<usize> = turn.work.iter().chain(&turn.visible).copied().collect();
+            ixs.sort_unstable();
+            row = row.children(self.render_blocks(thread.id, &thread.items, &ixs, first, cx));
+        } else {
+            // Done: the work folds under "Worked for …"; the answer stays.
+            let key = (thread.id, turn.work[0]);
+            let open = self.worked.contains(&key);
+            row = row.child(
+                div()
+                    .id(("worked", turn.work[0]))
+                    .when(!first, |this| this.mt(px(16.)))
+                    .pb(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(layout::SPACE_2)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_size(TEXT)
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(theme.foreground))
+                    .child(worked_for(turn.ms))
+                    .child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(ICON))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.worked.remove(&key) {
+                            this.worked.insert(key);
+                        }
+                        cx.notify();
+                    })),
+            );
+            if open {
+                row = row.children(self.render_blocks(thread.id, &thread.items, &turn.work, false, cx));
+            }
+            row = row.children(self.render_blocks(thread.id, &thread.items, &turn.visible, false, cx));
+        }
+        if turn.finished && !live {
+            row = row.child(self.render_turn_actions(thread.id, &thread.items, turn, cx));
+        }
+        row.into_any_element()
     }
 
     /// A new thread: one heading and the composer; the project and the rest
@@ -2497,12 +2760,17 @@ impl AgentPanel {
                             })
                             .when(running, |this| this.child(Spinner::new().with_size(crate::style::size::icon_pixels(cx))))
                             .when(*status == ToolStatus::Failed, |this| {
+                                // A command that exits non-zero is usually an
+                                // agent looking around (`git status` outside a
+                                // repo, a glob with no match): worth a note, not
+                                // an alarm. Other tools failing is.
+                                let command = title == "Run";
                                 this.child(
                                     div()
                                         .flex_none()
                                         .text_size(TEXT)
-                                        .text_color(theme.danger)
-                                        .child(t("failed")),
+                                        .text_color(if command { theme.muted_foreground } else { theme.danger })
+                                        .child(if command { t("non-zero exit") } else { t("failed") }),
                                 )
                             }),
                     )
@@ -2530,7 +2798,8 @@ impl AgentPanel {
                                             this.child(div().my_2().h(px(1.)).bg(theme.border))
                                         })
                                 })
-                                .child(output.clone().unwrap_or_default()),
+                                // Output ends with a newline; drawn as is, it leaves a blank line.
+                                .child(output.as_deref().unwrap_or_default().trim_end().to_string()),
                         )
                     })
                     .when((expanded || generated) && !images.is_empty(), |this| {
@@ -2801,7 +3070,7 @@ impl AgentPanel {
         id: &'static str,
         icon: IconName,
         label: impl Into<SharedString>,
-        tooltip: Option<String>,
+        _tooltip: Option<String>,
         cx: &App,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -2816,9 +3085,6 @@ impl AgentPanel {
             .text_color(theme.muted_foreground)
             .child(Icon::new(icon).size(ICON))
             .child(label.into())
-            .when_some(tooltip, |this, tip| {
-                this.tooltip(move |window, cx| Tooltip::new(tip.clone()).text_size(TEXT).build(window, cx))
-            })
             .into_any_element()
     }
 
@@ -3018,7 +3284,6 @@ impl AgentPanel {
                     .text_color(theme.muted_foreground)
                     .child(Icon::new(IconName::Folder).size(ICON))
                     .child(label)
-                    .tooltip(move |window, cx| Tooltip::new(full.clone()).text_size(TEXT).build(window, cx))
                     .into_any_element(),
             );
         }
@@ -3195,17 +3460,11 @@ impl AgentPanel {
                                 .size(ICON)
                                 .text_color(theme.primary_foreground),
                         )
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(t(if will_queue { "Add to queue" } else { "Send message" }))
-                                .text_size(TEXT)
-                                .build(window, cx)
-                        })
                         .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
                 } else if running {
                     this.bg(theme.foreground)
                         .cursor_pointer()
                         .child(div().size(px(10.)).rounded(px(2.)).bg(theme.background))
-                        .tooltip(|window, cx| Tooltip::new(t("Stop current turn")).text_size(TEXT).build(window, cx))
                         .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
                 } else {
                     this.bg(theme.secondary)
@@ -3275,10 +3534,12 @@ impl AgentPanel {
             .child(
                 div()
                     .text_size(TEXT)
-                    // The textarea pads its text on both sides and offers no
-                    // way to turn that off; step out by as much so the first
-                    // character lines up with the attachments and buttons.
+                    // The textarea pads its text on every side and offers no
+                    // way to turn that off; step out by as much, so the text
+                    // sits the box's own padding from its edges, like the
+                    // attachments and buttons do.
                     .mx(-gpui_kit::component::Size::default().input_px())
+                    .mt(-gpui_kit::component::Size::default().input_py())
                     .child({
                         let panel = cx.entity().downgrade();
                         Textarea::new(&self.composer).text_size(TEXT)
@@ -3294,7 +3555,11 @@ impl AgentPanel {
                     .flex()
                     .items_center()
                     .gap(layout::SPACE_1)
-                    .ml(px(-4.))
+                    // Icon buttons have room around their glyphs; pull them
+                    // left by that, so the glyph lines up with the text.
+                    // (Not down: the round send button on the right is drawn
+                    // to its edge and already keeps the box's padding.)
+                    .ml(px(-5.))
                     .when(can_attach, |this| {
                         this.child(
                             crate::style::chrome_button("attach")
@@ -3496,6 +3761,7 @@ fn group_items(items: &[ChatItem], ixs: &[usize]) -> Vec<Block> {
 
 /// One finished turn: the work before the agent's final message, folded
 /// under "Worked for …", and what stays in view.
+#[derive(Clone)]
 struct Turn {
     /// The user's message, if the turn has one.
     user: Option<usize>,
@@ -3655,7 +3921,8 @@ fn summarize_group(items: &[ChatItem], ixs: &[usize]) -> (String, usize, IconNam
     let mut failed = 0;
     for &ix in ixs {
         if let ChatItem::Tool { title, status, .. } = &items[ix] {
-            if *status == ToolStatus::Failed {
+            // Commands exiting non-zero are routine; see `render_item`.
+            if *status == ToolStatus::Failed && title != "Run" {
                 failed += 1;
             }
             match kinds.iter_mut().find(|(kind, _)| *kind == title.as_str()) {
@@ -3749,7 +4016,8 @@ mod group_tests {
 
         let (summary, failed, _) = summarize_group(&items, ixs);
         assert_eq!(summary, "Used the computer, ran 1 command");
-        assert_eq!(failed, 1);
+        // A command exiting non-zero is not counted as a failure.
+        assert_eq!(failed, 0);
     }
 
     #[test]
@@ -3798,17 +4066,6 @@ enum ThreadStatus {
     Idle,
 }
 
-impl ThreadStatus {
-    fn label(self) -> &'static str {
-        t(match self {
-            ThreadStatus::Working => "Working",
-            ThreadStatus::NeedsYou => "Waiting for your approval",
-            ThreadStatus::Failed => "Stopped with an error",
-            ThreadStatus::Done => "Finished, not read yet",
-            ThreadStatus::Idle => "Idle",
-        })
-    }
-}
 
 fn render_status_dot(status: ThreadStatus, id: u64, cx: &App) -> AnyElement {
     let theme = cx.theme();
@@ -3823,8 +4080,7 @@ fn render_status_dot(status: ThreadStatus, id: u64, cx: &App) -> AnyElement {
         .id(("thread-status", id))
         .size(px(7.))
         .rounded_full()
-        .bg(color)
-        .tooltip(move |window, cx| Tooltip::new(status.label()).text_size(TEXT).build(window, cx));
+        .bg(color);
     if status == ThreadStatus::Working {
         dot.with_animation(
             ("thread-status-pulse", id),

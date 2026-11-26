@@ -112,3 +112,18 @@ the CodeAny Sparkle private key for future releases.
 | `src/search_palette.rs` | ⌘P palette |
 | `src/settings.rs` | settings dialog |
 | `src/themes.rs` + `src/style.rs` | theme palettes and how they map onto the component theme |
+
+## Dependencies
+
+[agl](https://github.com/thinkany-ai/agl) (agent sessions) and
+[nex](https://github.com/thinkany-ai/nex) (device relay) come from GitHub at the commits
+pinned in `Cargo.toml`. To work on them side by side, check them out next to this repo and
+copy `.cargo/config.local.example.toml` to `.cargo/config.toml`. That rewrites `Cargo.lock`
+to the local paths: remove the file and run `cargo check` before committing, after bumping the
+`rev`s to your pushed changes (`scripts/bundle.sh` builds with `--locked`).
+
+## License
+
+[AGPL-3.0](LICENSE) © 2026 ThinkAny, LLC. Network use is distribution: if you run a modified
+version as a service, you must offer users its source. For commercial licensing
+outside the AGPL, contact support@thinkany.ai.

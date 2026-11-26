@@ -32,6 +32,9 @@ struct Row {
     depth: usize,
 }
 
+/// Directory listings read off the UI thread; `None` for one that is gone.
+pub struct Listing(Vec<(PathBuf, Option<Vec<DirEntry>>)>);
+
 pub enum FileTreeEvent {
     OpenFile(PathBuf),
 }
@@ -121,25 +124,48 @@ impl FileTree {
     /// Re-read every loaded directory, picking up files created or removed
     /// outside the editor.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let listing = Self::read_dirs(self.loaded_dirs());
+        self.apply_listing(listing, cx);
+    }
+
+    /// The directories loaded, to read again with [`Self::read_dirs`].
+    pub fn loaded_dirs(&self) -> Vec<PathBuf> {
+        self.children.keys().cloned().collect()
+    }
+
+    /// Read `dirs` from the disk; slow on big folders, so polling does it
+    /// off the UI thread and hands the result to [`Self::apply_listing`].
+    pub fn read_dirs(dirs: Vec<PathBuf>) -> Listing {
+        Listing(
+            dirs.into_iter()
+                .map(|dir| {
+                    let entries = dir.is_dir().then(|| read_dir(&dir));
+                    (dir, entries)
+                })
+                .collect(),
+        )
+    }
+
+    /// Take fresh listings; redraws only when something changed.
+    pub fn apply_listing(&mut self, listing: Listing, cx: &mut Context<Self>) {
         let mut changed = false;
-        let dirs: Vec<PathBuf> = self.children.keys().cloned().collect();
-        for dir in dirs {
-            if !dir.is_dir() {
-                self.children.remove(&dir);
-                self.expanded.remove(&dir);
-                changed = true;
-                continue;
-            }
-            let fresh = read_dir(&dir);
-            let old = &self.children[&dir];
-            let same = old.len() == fresh.len()
-                && old
-                    .iter()
-                    .zip(&fresh)
-                    .all(|(a, b)| a.path == b.path && a.is_dir == b.is_dir);
-            if !same {
-                self.children.insert(dir, fresh);
-                changed = true;
+        for (dir, fresh) in listing.0 {
+            // Collapsed or replaced while it was read.
+            let Some(old) = self.children.get(&dir) else { continue };
+            match fresh {
+                None => {
+                    self.children.remove(&dir);
+                    self.expanded.remove(&dir);
+                    changed = true;
+                }
+                Some(fresh) => {
+                    let same = old.len() == fresh.len()
+                        && old.iter().zip(&fresh).all(|(a, b)| a.path == b.path && a.is_dir == b.is_dir);
+                    if !same {
+                        self.children.insert(dir, fresh);
+                        changed = true;
+                    }
+                }
             }
         }
         if changed {

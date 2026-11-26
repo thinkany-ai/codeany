@@ -47,6 +47,7 @@ pub fn agent_name(id: &str) -> String {
         "claude" => "Claude Code".into(),
         "codex" => "Codex".into(),
         "gemini" => "Gemini CLI".into(),
+        "antigravity" => "Antigravity".into(),
         "opencode" => "OpenCode".into(),
         "cursor" => "Cursor Agent".into(),
         "kimi" => "Kimi Code".into(),
@@ -683,6 +684,14 @@ pub struct Store {
     /// The nex device new threads run on; `None` is this machine.
     #[serde(default)]
     pub machine: Option<String>,
+    /// The agents offered when starting or switching a thread; the others
+    /// stay installed but out of the way. Codex and Claude Code at first.
+    #[serde(default = "default_enabled_agents")]
+    pub enabled_agents: Vec<String>,
+    /// Arguments appended to each agent's launch arguments on this machine,
+    /// by agent id (Settings → Agents).
+    #[serde(default)]
+    pub agent_args: HashMap<String, Vec<String>>,
     /// The interface language's tag, or `None` to follow the system.
     #[serde(default)]
     pub language: Option<String>,
@@ -694,6 +703,10 @@ pub struct Store {
     pub remote_dirs: std::collections::HashMap<String, PathBuf>,
     #[serde(skip)]
     db: Option<Db>,
+}
+
+fn default_enabled_agents() -> Vec<String> {
+    vec!["codex".into(), "claude".into()]
 }
 
 fn default_access() -> String {
@@ -717,6 +730,8 @@ impl Default for Store {
             machine: None,
             tabs: Vec::new(),
             language: None,
+            agent_args: HashMap::new(),
+            enabled_agents: default_enabled_agents(),
             remote_dirs: Default::default(),
             db: None,
         }
@@ -812,7 +827,8 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
 impl Store {
     /// Open `~/.codeany/codeany.db`.
     pub fn load() -> Self {
-        match Db::open(&crate::paths::database()) {
+        let path = crate::paths::database();
+        let store = match Db::open(&path) {
             Ok(db) => Store {
                 agent: db.setting("agent").flatten(),
                 access: db.setting("access").unwrap_or_else(default_access),
@@ -828,6 +844,8 @@ impl Store {
                 machine: db.setting("machine").flatten(),
                 tabs: db.setting("tabs").unwrap_or_default(),
                 language: db.setting("language").flatten(),
+                agent_args: db.setting("agent_args").unwrap_or_default(),
+                enabled_agents: db.setting("enabled_agents").unwrap_or_else(default_enabled_agents),
                 remote_dirs: db.setting("remote_dirs").unwrap_or_default(),
                 db: Some(db),
             },
@@ -835,7 +853,12 @@ impl Store {
                 eprintln!("codeany: cannot open the database: {err}");
                 Store::default()
             }
+        };
+        // Threads are written off the UI thread from now on.
+        if let Some(db) = &store.db {
+            crate::db::start_writer(db, &path);
         }
+        store
     }
 
     /// Write what changed.
@@ -854,12 +877,37 @@ impl Store {
         db.set_setting("machine", &self.machine);
         db.set_setting("tabs", &self.tabs);
         db.set_setting("language", &self.language);
+        db.set_setting("agent_args", &self.agent_args);
+        db.set_setting("enabled_agents", &self.enabled_agents);
         db.set_setting("remote_dirs", &self.remote_dirs);
-        if let Err(err) = db.save_threads(&self.threads) {
-            eprintln!("codeany: saving threads failed: {err}");
+        // A copy is cheap next to serializing every item to see what changed;
+        // that happens on the writer's thread.
+        if !crate::db::save_in_background(self.threads.clone()) {
+            if let Err(err) = db.save_threads(&self.threads) {
+                eprintln!("codeany: saving threads failed: {err}");
+            }
         }
         // Serve the threads that run here; write others back to their device.
         crate::sync::saved(&self.threads);
+    }
+}
+
+/// A cheap measure of how much an item shows, which changes whenever it
+/// grows or changes state: to notice changes without comparing contents.
+pub fn item_weight(item: &ChatItem) -> usize {
+    let text = |t: &Option<String>| t.as_ref().map_or(0, String::len);
+    match item {
+        ChatItem::User(message) => message.text.len() + message.images.len(),
+        ChatItem::Assistant(t) | ChatItem::Thinking(t) | ChatItem::Error(t) => t.len(),
+        ChatItem::Tool { title, detail, output, status, code, images, .. } => {
+            title.len() + text(detail) + text(output) + text(code) + images.len() + (*status as usize) * 1_000_003
+        }
+        ChatItem::Approval { title, detail, options, decision, .. } => {
+            title.len() + text(detail) + options.len() + text(decision) * 7 + usize::from(decision.is_some())
+        }
+        ChatItem::Plan(entries) => entries.len() + format!("{entries:?}").len(),
+        ChatItem::TurnEnd { ms, at } => ms.unwrap_or(0) as usize ^ at.unwrap_or(0) as usize,
+        ChatItem::Handoff { from_label, to_label, .. } => from_label.len() + to_label.len(),
     }
 }
 

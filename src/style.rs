@@ -5,7 +5,7 @@ use std::sync::RwLock;
 
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Selectable, Theme, ThemeMode, button::{Button, ButtonVariants as _}, menu::PopupMenuItem,
-    text::{TextView, TextViewStyle}, tooltip::Tooltip,
+    text::{TextView, TextViewStyle},
 };
 use anyhow::Result;
 use gpui_kit::*;
@@ -15,12 +15,14 @@ use crate::themes::{self, Palette, parse_color};
 /// Text and action icons follow the window's typography setting.
 pub mod size {
     use gpui_kit::component::ActiveTheme as _;
-    use gpui_kit::{App, Pixels, Rems, rems};
+    use gpui_kit::{App, Pixels, Rems, px, rems};
 
     pub const TEXT: Rems = rems(1.);
 
     /// 16 px icons with the default 14 px text.
     pub const ICON: Rems = rems(8. / 7.);
+
+    pub const TAB_ACTION_ICON: Pixels = px(14.);
 
     pub fn icon_pixels(cx: &App) -> Pixels {
         ICON.to_pixels(cx.theme().font_size)
@@ -38,7 +40,9 @@ pub mod layout {
     pub const SPACE_4: Pixels = px(16.);
     pub const SPACE_6: Pixels = px(24.);
     pub const CONTROL: Pixels = px(28.);
-    pub const HEADER: Pixels = px(40.);
+    // A 32 px control row below the top inset keeps its centre at 20 px.
+    pub const HEADER: Pixels = px(36.);
+    pub const HEADER_TOP_INSET: Pixels = SPACE_1;
     pub const RADIUS: Pixels = px(8.);
     pub const BUBBLE_RADIUS: Pixels = px(12.);
     pub const SIDEBAR_INSET: Pixels = SPACE_2;
@@ -156,13 +160,14 @@ impl RenderOnce for AppTooltipButton {
     }
 }
 
+/// Once a button with a hover label; hover labels are off app-wide, so this
+/// only keeps the wrapper (and its id) the callers lay out around.
 pub fn with_tooltip(content: impl IntoElement, label: impl Into<SharedString>) -> impl IntoElement {
     let label = label.into();
     div()
         .id(SharedString::from(format!("button-tooltip:{label}")))
         .flex_none()
         .child(content)
-        .tooltip(move |window, cx| Tooltip::new(label.clone()).text_size(size::TEXT).build(window, cx))
 }
 
 pub fn menu_item(label: impl Into<SharedString>) -> PopupMenuItem {
@@ -174,6 +179,25 @@ pub fn menu_item(label: impl Into<SharedString>) -> PopupMenuItem {
             .aria_label(label.clone())
             .flex_1()
             .text_size(size::TEXT)
+            .child(label.clone())
+    })
+}
+
+/// A menu item with an icon at the app's icon size (the menu's own
+/// `.icon()` draws it smaller than icons elsewhere).
+pub fn menu_item_with_icon(label: impl Into<SharedString>, icon: impl Into<Icon> + Clone + 'static) -> PopupMenuItem {
+    let label = label.into();
+    PopupMenuItem::element(move |_, _| {
+        div()
+            .id("menu-item-label")
+            .role(accesskit::Role::Label)
+            .aria_label(label.clone())
+            .flex_1()
+            .flex()
+            .items_center()
+            .gap(layout::SPACE_2)
+            .text_size(size::TEXT)
+            .child(icon.clone().into().size(size::ICON).flex_none())
             .child(label.clone())
     })
 }

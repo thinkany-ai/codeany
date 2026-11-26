@@ -2,6 +2,8 @@
 
 use crate::style::AppButtonStyle as _;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use gpui_kit::assets::IconName;
@@ -9,9 +11,10 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     Disableable as _,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::DropdownMenu as _,
     switch::Switch,
+    window_paddings,
 };
 use nex::proto::PairingCode;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -19,10 +22,10 @@ use gpui_kit::*;
 
 use crate::{
     agent_icons::agent_icon,
+    keymap,
     agent_panel::AgentPanel,
-    paths, peer, remote, style,
+    peer, remote, style,
     themes::{self, Palette, THEMES},
-    threads::{ACCESS_LEVELS, access_name, agent_name},
 };
 use crate::style::size::{TEXT, ICON};
 use crate::i18n::{t, tf};
@@ -32,7 +35,16 @@ pub const WIDTH: f32 = 1040.;
 pub const HEIGHT: f32 = 720.;
 const FRAME_BORDER: Pixels = px(1.);
 const NAV_WIDTH: f32 = 220.;
-const CARD_WIDTH: f32 = 188.;
+const CONTENT_PADDING: Pixels = px(28.);
+const CARD_PADDING: Rems = rems(1.);
+const REPO: &str = "https://github.com/thinkany-ai/codeany";
+/// About-section destinations, like Termany's.
+const ABOUT_LINKS: &[(&str, &str)] = &[
+    ("Website", "https://codeany.ai?utm_source=codeany_app&utm_medium=settings_about"),
+    ("Source code", REPO),
+    ("Feedback", "https://github.com/thinkany-ai/codeany/issues"),
+];
+const THEME_CARD_MIN_WIDTH: Pixels = px(188.);
 const CARD_BORDER: Pixels = px(2.);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,25 +90,42 @@ impl Section {
     }
 }
 
-const SHORTCUTS: &[(&str, &str)] = &[
-    ("⌘T / ⌘N", "New tab"),
-    ("⌘W", "Close tab"),
-    ("⌘⇧T", "Reopen closed tab"),
-    ("⌃Tab / ⌘⇧]", "Next tab"),
-    ("⌃⇧Tab / ⌘⇧[", "Previous tab"),
-    ("⌘1 … ⌘8 / ⌘9", "Go to tab / last tab"),
-    ("⌥⌘T", "Surfaces"),
-    ("⌘E", "Switch Agent / Editor"),
-    ("⌘O", "Open folder"),
-    ("⌘,", "Settings"),
-    ("⌘B", "Toggle sidebar"),
-    ("⌘J / ⌃`", "Toggle terminal"),
-    ("⌘⇧G", "Toggle git changes"),
-    ("⌘S", "Save file"),
-    ("Enter", "Send message"),
-    ("⇧Enter", "New line in message"),
-    ("⌘1 … ⌘9 (in the model menu)", "Pick a model"),
-    ("⌘C / ⌘V / ⌘K", "Terminal copy / paste / clear"),
+/// The agent settings being edited.
+struct AgentEditor {
+    id: String,
+    path: Entity<InputState>,
+    args: Entity<TextareaState>,
+    /// The executable when the editor opened, to tell whether it changed.
+    original_command: String,
+    icon: IconChoice,
+    error: Option<String>,
+    saving: bool,
+}
+
+enum IconChoice {
+    Keep,
+    Picked(PathBuf),
+    /// Back to the agent's own logo.
+    Reset,
+}
+
+#[derive(Clone)]
+enum AgentTest {
+    Running,
+    Passed(std::time::Duration),
+    Failed(String),
+}
+
+/// Whether devices can join through a termany.sh account. Off until the
+/// cloud side ships: devices connect with an authorization code only. A
+/// machine already signed in still shows the account and can sign out.
+const ACCOUNTS: bool = false;
+
+/// Shortcuts that belong to one control and cannot be changed.
+const FIXED_SHORTCUTS: &[(&str, &str)] = &[
+    ("↩", "Send message"),
+    ("⇧↩", "New line in message"),
+    ("⌘1 … ⌘9", "Pick a model"),
 ];
 
 fn logo() -> Arc<Image> {
@@ -127,6 +156,8 @@ pub struct Settings {
     auth_input: Option<Entity<InputState>>,
     /// The connection code typed to verify one.
     verify_input: Option<Entity<InputState>>,
+    /// Enter in each input does what its button does.
+    _input_subscriptions: Vec<Subscription>,
     /// The device being renamed.
     renaming: Option<String>,
     /// An action waiting for a second click.
@@ -135,10 +166,19 @@ pub struct Settings {
     link: Option<Link>,
     /// The authorization code was just copied.
     copied: bool,
+    /// The agent whose settings are open, with its inputs.
+    agent_editor: Option<AgentEditor>,
+    /// Connection tests, by agent: running, or how the last one went.
+    agent_tests: HashMap<String, AgentTest>,
     /// Measuring every way to every device.
     measuring: bool,
     _devices_poll: Option<Task<()>>,
     _link_poll: Option<Task<()>>,
+    /// Re-render About when an update turns up.
+    _update_watch: Option<Subscription>,
+    /// The shortcut waiting for its new keystroke.
+    recording: Option<&'static str>,
+    _recorder: Option<Subscription>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -176,6 +216,9 @@ impl Settings {
             name_input: None,
             auth_input: None,
             verify_input: None,
+            _input_subscriptions: Vec::new(),
+            agent_editor: None,
+            agent_tests: HashMap::new(),
             renaming: None,
             confirm: None,
             link: None,
@@ -183,6 +226,9 @@ impl Settings {
             measuring: false,
             _devices_poll: None,
             _link_poll: None,
+            _update_watch: None,
+            recording: None,
+            _recorder: None,
         }
     }
 
@@ -235,6 +281,7 @@ impl Settings {
                     .child(t(section.label()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.section = section;
+                        this.stop_recording(cx);
                         if section == Section::Devices {
                             this.watch_devices(cx);
                         }
@@ -288,57 +335,9 @@ impl Settings {
         let Some(panel) = self.agent_panel.upgrade() else {
             return div().into_any_element();
         };
-        let (agents, current_agent, access) = {
-            let panel = panel.read(cx);
-            (
-                panel.agents().map(|a| a.to_vec()).unwrap_or_default(),
-                panel.default_agent().map(String::from),
-                panel.default_access().to_string(),
-            )
-        };
-        let weak = panel.downgrade();
-        let agent_menu = Button::new("default-agent")
-            .outline()
-            .small()
-            .app_label(current_agent.as_deref().map(agent_name).unwrap_or_else(|| t("None").into()))
-            .dropdown_caret(true)
-            .dropdown_menu({
-                let weak = weak.clone();
-                move |mut menu, _, _| {
-                    for agent in agents.iter().filter(|a| a.available) {
-                        let (weak, id) = (weak.clone(), agent.id.clone());
-                        menu = menu.item(
-                            crate::style::menu_item(agent.name.clone())
-                                .checked(current_agent.as_deref() == Some(agent.id.as_str()))
-                                .on_click(move |_, _, cx| {
-                                    let id = id.clone();
-                                    weak.update(cx, |panel, cx| panel.set_default_agent(id, cx)).ok();
-                                }),
-                        );
-                    }
-                    menu
-                }
-            });
-        let access_menu = Button::new("default-access")
-            .outline()
-            .small()
-            .app_label(access_name(&access))
-            .dropdown_caret(true)
-            .dropdown_menu(move |mut menu, _, _| {
-                for (id, name) in ACCESS_LEVELS {
-                    let weak = weak.clone();
-                    menu = menu.item(crate::style::menu_item(crate::i18n::t(name)).checked(access == id).on_click(
-                        move |_, _, cx| {
-                            weak.update(cx, |panel, cx| panel.set_default_access(id, cx)).ok();
-                        },
-                    ));
-                }
-                menu
-            });
         let language = panel.read(cx).language_preference();
         let language_menu = Button::new("language")
             .outline()
-            .small()
             .app_label(match language {
                 Some(language) => language.label().to_string(),
                 None => format!("{} ({})", crate::i18n::t("System"), crate::i18n::system_language().label()),
@@ -374,38 +373,15 @@ impl Settings {
                     menu
                 }
             });
-        let data_dir = paths::home();
+        let language = Self::row(
+            "Language",
+            Some(t("Follows the system unless you pick one.").into()),
+            language_menu.into_any_element(),
+            cx,
+        );
         div()
             .child(Self::heading("General", cx))
-            .child(Self::row(
-                "Language",
-                Some(t("Follows the system unless you pick one.").into()),
-                language_menu.into_any_element(),
-                cx,
-            ))
-            .child(Self::row(
-                "Default agent",
-                Some(t("New threads start with this agent; open threads keep theirs.").into()),
-                agent_menu.into_any_element(),
-                cx,
-            ))
-            .child(Self::row(
-                "Default access",
-                Some(t("What agents may do without asking.").into()),
-                access_menu.into_any_element(),
-                cx,
-            ))
-            .child(Self::row(
-                "Data",
-                Some(data_dir.display().to_string()),
-                Button::new("reveal-data")
-                    .outline()
-                    .small()
-                    .app_label(t("Show in Finder"))
-                    .on_click(move |_, _, cx| cx.reveal_path(&paths::database()))
-                    .into_any_element(),
-                cx,
-            ))
+            .child(Self::card(language, cx))
             .into_any_element()
     }
 
@@ -449,8 +425,19 @@ impl Settings {
             )
     }
 
-    fn render_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_appearance(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        // Match the dialog's width clamp when choosing how many previews fit.
+        let inset = window_paddings(window);
+        let dialog_width = px(WIDTH).min(
+            window.viewport_size().width - inset.left - inset.right - theme.spacing_tokens().lg * 2.,
+        );
+        let grid_width = dialog_width
+            - px(NAV_WIDTH)
+            - (CONTENT_PADDING + CARD_PADDING.to_pixels(window.rem_size()) + FRAME_BORDER * 2.) * 2.;
+        let column_gap = px(20.);
+        let columns =
+            (((grid_width + column_gap) / (THEME_CARD_MIN_WIDTH + column_gap)) as u16).clamp(1, 3);
         let card_radius = theme.radius_lg;
         let preview_radius = (card_radius - CARD_BORDER).max(px(0.));
         let current = style::choice(cx);
@@ -459,7 +446,6 @@ impl Settings {
             let weak = weak.clone();
             div()
                 .id(id)
-                .w(px(CARD_WIDTH))
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -512,20 +498,26 @@ impl Settings {
             )
             .into_any_element();
 
+        let grid = div()
+            .py_4()
+            .grid()
+            .grid_cols(columns)
+            .gap_x(column_gap)
+            .gap_y(px(22.))
+            .child(card("system", t("System"), system_preview, current == "system"))
+            .children(THEMES.iter().map(|p| {
+                card(
+                    p.id,
+                    p.name,
+                    Self::theme_preview(p, preview_radius).into_any_element(),
+                    current == p.id,
+                )
+            }));
         div()
+            .child(Self::heading("Appearance", cx))
             .child(self.render_typography(cx))
-            .child(Self::heading("Theme", cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_x(px(20.))
-                    .gap_y(px(22.))
-                    .child(card("system", t("System"), system_preview, current == "system"))
-                    .children(THEMES.iter().map(|p| {
-                        card(p.id, p.name, Self::theme_preview(p, preview_radius).into_any_element(), current == p.id)
-                    })),
-            )
+            .child(Self::subheading("Theme", cx))
+            .child(Self::card(grid, cx))
             .into_any_element()
     }
 
@@ -534,7 +526,6 @@ impl Settings {
         let fonts_panel = self.agent_panel.clone();
         let sizes_panel = self.agent_panel.clone();
         let font_picker = Button::new("appearance-font")
-            .small()
             .w(px(200.))
             .app_label(typography.family.as_deref().unwrap_or(t("System")))
             .dropdown_caret(true)
@@ -557,7 +548,6 @@ impl Settings {
                 menu
             });
         let size_picker = Button::new("appearance-text-size")
-            .small()
             .w(px(96.))
             .app_label(format!("{} px", typography.size))
             .dropdown_caret(true)
@@ -575,150 +565,670 @@ impl Settings {
                 menu
             });
 
-        div()
-            .mb_6()
-            .child(Self::heading("Typography", cx))
+        let rows = div()
             .child(Self::row("Font", None, font_picker.into_any_element(), cx))
-            .child(Self::row("Text size", None, size_picker.into_any_element(), cx))
+            .child(Self::row("Text size", None, size_picker.into_any_element(), cx));
+        div().child(Self::subheading("Typography", cx).mt_0()).child(Self::card(rows, cx))
     }
 
-    fn render_agents(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn open_agent_editor(&mut self, agent: &str, detected: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        // The executable in use: the one chosen here, else the one found.
+        let command = crate::agl_bridge::agent_command(agent).or_else(|| detected.clone()).unwrap_or_default();
+        let args = self
+            .agent_panel
+            .upgrade()
+            .map(|panel| panel.read(cx).agent_args(agent).join("\n"))
+            .unwrap_or_default();
+        let placeholder = "/path/to/agent".to_string();
+        let path = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder(placeholder);
+            input.set_value(command.clone(), window, cx);
+            input
+        });
+        let args_input = cx.new(|cx| {
+            let mut input = TextareaState::new(window, cx).auto_grow(3, 8).placeholder("--flag\nvalue");
+            input.set_value(args.clone(), window, cx);
+            input
+        });
+        self.agent_editor = Some(AgentEditor {
+            id: agent.to_string(),
+            path,
+            args: args_input,
+            original_command: command,
+            icon: IconChoice::Keep,
+            error: None,
+            saving: false,
+        });
+        cx.notify();
+    }
+
+    fn pick_agent_icon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(t("Choose picture").into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            let Some(path) = paths.into_iter().find(|p| crate::threads::is_image_path(p)) else { return };
+            this.update(cx, |this, cx| {
+                if let Some(editor) = &mut this.agent_editor {
+                    editor.icon = IconChoice::Picked(path);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Save the open agent's icon, arguments and executable; agents are
+    /// then detected again, so the list shows the executable in use.
+    fn save_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.agent_editor else { return };
+        let id = editor.id.clone();
+        let command = editor.path.read(cx).value().trim().to_string();
+        let args: Vec<String> = editor
+            .args
+            .read(cx)
+            .value()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let icon = std::mem::replace(&mut editor.icon, IconChoice::Keep);
+        let icon_result = match &icon {
+            IconChoice::Keep => Ok(()),
+            IconChoice::Picked(path) => crate::agent_icons::set_custom_icon(&id, Some(path)),
+            IconChoice::Reset => crate::agent_icons::set_custom_icon(&id, None),
+        };
+        if let Err(err) = icon_result {
+            editor.error = Some(tf("Cannot use this picture: {err}", &[("err", err.to_string())]));
+            cx.notify();
+            return;
+        }
+        if let Some(panel) = self.agent_panel.upgrade() {
+            panel.update(cx, |panel, cx| panel.set_agent_args(&id, args, cx));
+        }
+        let command_changed = command != editor.original_command;
+        if !command_changed {
+            self.agent_editor = None;
+            self.agent_tests.remove(&id);
+            cx.refresh_windows();
+            cx.notify();
+            return;
+        }
+        editor.saving = true;
+        editor.error = None;
+        let save = crate::agl_bridge::set_agent_command(id.clone(), Some(command));
+        cx.spawn(async move |this, cx| {
+            let result = save.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.agent_editor = None;
+                        this.agent_tests.remove(&id);
+                        if let Some(panel) = this.agent_panel.upgrade() {
+                            panel.update(cx, |panel, cx| panel.redetect_local_agents(cx));
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(editor) = &mut this.agent_editor {
+                            editor.saving = false;
+                            editor.error = Some(format!("{err:#}"));
+                        }
+                    }
+                }
+                cx.refresh_windows();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Send the agent one short prompt, the way a thread would, and time it.
+    fn test_agent(&mut self, agent: String, cx: &mut Context<Self>) {
+        // The arguments being edited, saved or not; the executable must be
+        // saved first (agl reads it from its own configuration).
+        let args = match &self.agent_editor {
+            Some(editor) if editor.id == agent => editor
+                .args
+                .read(cx)
+                .value()
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            _ => self.agent_panel.upgrade().map(|p| p.read(cx).agent_args(&agent)).unwrap_or_default(),
+        };
+        self.agent_tests.insert(agent.clone(), AgentTest::Running);
+        let test = crate::agl_bridge::test_agent(agent.clone(), args);
+        cx.spawn(async move |this, cx| {
+            let result = test.await;
+            this.update(cx, |this, cx| {
+                this.agent_tests.insert(
+                    agent,
+                    match result {
+                        Ok(took) => AgentTest::Passed(took),
+                        Err(err) => AgentTest::Failed(format!("{err:#}")),
+                    },
+                );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn render_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let _ = window;
         let theme = cx.theme().clone();
         let agents = self
             .agent_panel
             .upgrade()
-            .and_then(|panel| panel.read(cx).agents().map(|a| a.to_vec()));
-        let mut list = div().flex().flex_col();
-        match agents {
-            None => {
-                list = list.child(
+            .and_then(|panel| panel.read(cx).local_agents().map(|a| a.to_vec()));
+        let intro = div()
+            .mb_2()
+            .text_size(TEXT)
+            .text_color(theme.muted_foreground)
+            .child(t("Each agent you turn on is offered when you start or switch a thread. Its executable, arguments and icon are under Edit, with a connection test."));
+        let Some(mut agents) = agents else {
+            return div()
+                .child(Self::heading("Agents", cx))
+                .child(intro)
+                .child(div().text_size(TEXT).text_color(theme.muted_foreground).child(t("Detecting agents…")))
+                .into_any_element();
+        };
+        agents.sort_by_key(|a| !a.available);
+        let mut rows = div();
+        for (ix, agent) in agents.into_iter().enumerate() {
+            let id = agent.id.clone();
+            let editing = self.agent_editor.as_ref().is_some_and(|e| e.id == id);
+            let enabled = self.agent_panel.upgrade().is_some_and(|p| p.read(cx).agent_enabled(&id));
+            // The version says it runs; the executable is under Edit.
+            let detail = match &agent.version {
+                _ if !agent.available => t("Not installed").to_string(),
+                Some(version) => version.clone(),
+                None => t("Version unknown").to_string(),
+            };
+            let detected = agent.path.clone();
+            let mut row = div()
+                .py_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .border_b_1()
+                .border_color(theme.border.opacity(0.6))
+                .child(
                     div()
-                        .text_size(TEXT)
-                        .text_color(theme.muted_foreground)
-                        .child(t("Detecting agents…")),
-                )
-            }
-            Some(mut agents) => {
-                agents.sort_by_key(|a| !a.available);
-                for agent in agents {
-                    let detail = match (&agent.version, &agent.path) {
-                        _ if !agent.available => t("Not installed").to_string(),
-                        (Some(version), Some(path)) => format!("{version} · {path}"),
-                        (_, Some(path)) => path.clone(),
-                        _ => String::new(),
-                    };
-                    list = list.child(
-                        div()
-                            .py_3()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .border_b_1()
-                            .border_color(theme.border.opacity(0.6))
-                            .when(!agent.available, |this| this.opacity(0.55))
-                            .child(agent_icon(&agent.id, px(28.), cx))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.))
-                                    .child(div().text_size(TEXT).child(agent.name.clone()))
-                                    .child(
-                                        div()
-                                            .text_size(TEXT)
-                                            .text_color(theme.muted_foreground)
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .child(detail),
-                                    ),
-                            )
-                            .when(agent.available, |this| {
-                                this.child(
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(div().when(!agent.available, |this| this.opacity(0.55)).child(agent_icon(&id, px(32.), cx)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(div().text_size(TEXT).font_weight(FontWeight::MEDIUM).child(agent.name.clone()))
+                                .child(
                                     div()
-                                        .flex()
-                                        .gap_1()
-                                        .children(agent.features.iter().take(4).map(|f| {
-                                            div()
-                                                .px(px(6.))
-                                                .py(px(1.))
-                                                .rounded_md()
-                                                .bg(theme.secondary)
-                                                .text_size(TEXT)
-                                                .text_color(theme.muted_foreground)
-                                                .child(f.clone())
-                                        })),
-                                )
-                            }),
-                    );
-                }
+                                        .text_size(TEXT)
+                                        .text_color(theme.muted_foreground)
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(detail),
+                                ),
+                        )
+                        .child(
+                            // Only enabled agents are offered when starting or
+                            // switching a thread.
+                            Switch::new(("enable-agent", ix))
+                                .checked(enabled)
+                                .disabled(!agent.available)
+                                .on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |this, on: &bool, _, cx| {
+                                        if let Some(panel) = this.agent_panel.upgrade() {
+                                            panel.update(cx, |panel, cx| panel.set_agent_enabled(&id, *on, cx));
+                                        }
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new(("edit-agent", ix))
+                                .outline()
+                                .app_label(t("Edit"))
+                                .disabled(editing)
+                                .on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |this, _, window, cx| this.open_agent_editor(&id, detected.clone(), window, cx)
+                                })),
+                        ),
+                );
+            if editing {
+                row = row.child(self.render_agent_editor(&id, cx));
             }
+            rows = rows.child(row);
         }
         div()
             .child(Self::heading("Agents", cx))
-            .child(list)
+            .child(intro)
+            .child(Self::card(rows, cx))
             .into_any_element()
     }
 
-    fn render_shortcuts(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_agent_editor(&self, agent: &str, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let Some(editor) = &self.agent_editor else { return div().into_any_element() };
+        let editable = crate::agl_bridge::agent_command_editable(agent);
+        let installed = self
+            .agent_panel
+            .upgrade()
+            .and_then(|p| p.read(cx).local_agents().map(|a| a.iter().any(|a| a.id == agent && a.available)))
+            .unwrap_or(false);
+        let test = self.agent_tests.get(agent).cloned();
+        let testing = matches!(test, Some(AgentTest::Running));
+        let path_changed = editor.path.read(cx).value().trim() != editor.original_command.trim();
+        let test_line: AnyElement = match test {
+            _ if path_changed => div()
+                .text_size(TEXT)
+                .text_color(theme.muted_foreground)
+                .child(t("Save to test the new executable."))
+                .into_any_element(),
+            Some(AgentTest::Passed(took)) => div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(TEXT)
+                .text_color(theme.success)
+                .child(Icon::new(IconName::CircleCheck).size(ICON).flex_none())
+                .child(tf("Connected · {s}s", &[("s", format!("{:.1}", took.as_secs_f32()))]))
+                .into_any_element(),
+            Some(AgentTest::Failed(err)) => div()
+                .flex()
+                .items_start()
+                .gap_1()
+                .text_size(TEXT)
+                .text_color(theme.danger)
+                .child(Icon::new(IconName::CircleAlert).size(ICON).mt(px(2.)).flex_none())
+                .child(div().min_w_0().child(err))
+                .into_any_element(),
+            _ => div().into_any_element(),
+        };
+        let label = |text: &'static str| div().w(px(120.)).flex_none().pt(px(6.)).text_size(TEXT).child(t(text));
+        let preview: AnyElement = match &editor.icon {
+            IconChoice::Picked(path) => div()
+                .size(px(40.))
+                .rounded(px(9.))
+                .overflow_hidden()
+                .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
+                .into_any_element(),
+            IconChoice::Reset => div().child(crate::agent_icons::builtin_icon(agent, px(40.), cx)).into_any_element(),
+            IconChoice::Keep => agent_icon(agent, px(40.), cx),
+        };
+        let has_custom = match &editor.icon {
+            IconChoice::Picked(_) => true,
+            IconChoice::Reset => false,
+            IconChoice::Keep => crate::agent_icons::custom_icon(agent).is_some(),
+        };
         div()
-            .child(Self::heading("Shortcuts", cx))
-            .children(SHORTCUTS.iter().map(|(keys, action)| {
-                div()
-                    .py(px(10.))
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme.border.opacity(0.6))
-                    .child(div().flex_1().text_size(TEXT).child(t(*action)))
-                    .child(
-                        div()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .rounded_md()
-                            .bg(theme.secondary)
-                            .text_size(TEXT)
-                            .text_color(theme.muted_foreground)
-                            .child(t(*keys)),
-                    )
-            }))
-            .into_any_element()
-    }
-
-    fn render_about(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        div()
-            .pt_10()
+            .ml(px(44.))
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
             .flex()
             .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .child(label("Icon"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(preview)
+                            .child(
+                                Button::new("agent-icon-pick")
+                                    .outline()
+                                    .app_label(t("Choose picture"))
+                                    .on_click(cx.listener(|this, _, window, cx| this.pick_agent_icon(window, cx))),
+                            )
+                            .when(has_custom, |this| {
+                                this.child(
+                                    Button::new("agent-icon-reset")
+                                        .ghost()
+                                        .app_label(t("Use its own"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(editor) = &mut this.agent_editor {
+                                                editor.icon = IconChoice::Reset;
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .child(label("Executable"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(Input::new(&editor.path).text_size(TEXT).disabled(!editable))
+                            .child(div().text_size(TEXT).text_color(theme.muted_foreground).child(if editable {
+                                t("Leave empty to find it on the PATH.")
+                            } else {
+                                t("This agent's executable cannot be changed here.")
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .child(label("Arguments"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.input)
+                                    .child(Textarea::new(&editor.args).text_size(TEXT).appearance(false).bordered(false)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(TEXT)
+                                    .text_color(theme.muted_foreground)
+                                    .child(t("One per line, added after the agent's own arguments. New threads use them.")),
+                            ),
+                    ),
+            )
+            .when_some(editor.error.clone(), |this, err| this.child(Self::error_banner(err, cx)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        // Tests what is saved: the executable and arguments a
+                        // new thread would run with.
+                        Button::new("agent-test")
+                            .outline()
+                            .app_label(if testing { t("Testing…") } else { t("Test connection") })
+                            .disabled(testing || !installed || path_changed)
+                            .on_click(cx.listener({
+                                let id = agent.to_string();
+                                move |this, _, _, cx| this.test_agent(id.clone(), cx)
+                            })),
+                    )
+                    .child(div().flex_1().min_w_0().child(test_line))
+                    .child(
+                        Button::new("agent-cancel")
+                            .ghost()
+                            .app_label(t("Cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.agent_editor = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("agent-save")
+                            .primary()
+                            .app_label(if editor.saving { t("Saving…") } else { t("Save") })
+                            .disabled(editor.saving)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_agent(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Take the next keystroke, anywhere in the app, as the shortcut's
+    /// new keys; Esc cancels. Nothing else sees keystrokes meanwhile.
+    fn start_recording(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        if self.recording == Some(id) {
+            self.stop_recording(cx);
+            return;
+        }
+        self.recording = Some(id);
+        let weak = cx.entity().downgrade();
+        self._recorder = Some(cx.intercept_keystrokes(move |event, _, cx| {
+            let Some(this) = weak.upgrade() else { return };
+            let Some(id) = this.read(cx).recording else { return };
+            cx.stop_propagation();
+            let keystroke = &event.keystroke;
+            let cancel = keystroke.key == "escape" && !keystroke.modifiers.modified();
+            let keys = keymap::from_keystroke(keystroke);
+            if !cancel && keys.is_none() {
+                return; // Modifiers only, or a plain key: keep waiting.
+            }
+            // Not dropped here: this is that subscription's own callback.
+            this.update(cx, |this, cx| {
+                this.recording = None;
+                cx.notify();
+            });
+            let weak = weak.clone();
+            cx.defer(move |cx| {
+                weak.update(cx, |this, _| this._recorder = None).ok();
+            });
+            if let Some(keys) = keys {
+                keymap::set(id, Some(keys), cx);
+            }
+        }));
+        cx.notify();
+    }
+
+    fn stop_recording(&mut self, cx: &mut Context<Self>) {
+        if self.recording.take().is_some() {
+            self._recorder = None;
+            cx.notify();
+        }
+    }
+
+    /// A shortcut's keys as a chip, like a key cap.
+    fn key_chip(text: String, cx: &App) -> Div {
+        let theme = cx.theme();
+        div()
+            .h(px(26.))
+            .px_2()
+            .flex()
             .items_center()
-            .gap_2()
-            .child(img(logo()).size(px(96.)))
-            .child(div().mt_2().text_size(TEXT).font_weight(FontWeight::SEMIBOLD).child("CodeAny"))
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border.opacity(0.0))
+            .bg(theme.secondary)
+            .text_size(TEXT)
+            .text_color(theme.muted_foreground)
+            .whitespace_nowrap()
+            .child(text)
+    }
+
+    fn render_shortcuts(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let conflicts = keymap::conflicts(cx);
+        let mut page = div().child(
+            div()
+                .flex()
+                .items_start()
+                .justify_between()
+                .child(Self::heading("Shortcuts", cx))
+                .when(keymap::any_custom(cx), |this| {
+                    this.child(
+                        Button::new("reset-shortcuts")
+                            .ghost()
+                            .small()
+                            .app_label(t("Reset all"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stop_recording(cx);
+                                keymap::reset_all(cx);
+                                cx.notify();
+                            })),
+                    )
+                }),
+        );
+        page = page.child(
+            div()
+                .text_size(TEXT)
+                .text_color(theme.muted_foreground)
+                .child(t("Click a shortcut, then press the new keys. Esc cancels.")),
+        );
+        for group in keymap::Group::ALL {
+            let mut rows = div();
+            for shortcut in keymap::SHORTCUTS.iter().filter(|s| s.group == group) {
+                let id = shortcut.id;
+                let recording = self.recording == Some(id);
+                let conflict = conflicts.get(id).copied();
+                let keys = keymap::keys(id, cx).iter().map(|k| keymap::display(k)).collect::<Vec<_>>().join(" / ");
+                let chip = Self::key_chip(if recording { t("Press keys…").to_string() } else { keys }, cx)
+                    .id(id)
+                    .cursor_pointer()
+                    .hover(|this| this.bg(theme.list_hover))
+                    .when(recording, |this| this.border_color(theme.primary).text_color(theme.primary))
+                    .when(conflict.is_some() && !recording, |this| this.text_color(theme.danger))
+                    .on_click(cx.listener(move |this, _, _, cx| this.start_recording(id, cx)));
+                let control = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(keymap::is_custom(id, cx) && !recording, |this| {
+                        this.child(
+                            Button::new(("reset-shortcut", keymap::SHORTCUTS.iter().position(|s| s.id == id).unwrap_or(0)))
+                                .ghost()
+                                .small()
+                                .app_label(t("Reset"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.stop_recording(cx);
+                                    keymap::set(id, None, cx);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(chip)
+                    .into_any_element();
+                let hint = conflict.map(|other| tf("Also used by “{name}”", &[("name", t(other).to_string())]));
+                rows = rows.child(Self::row(shortcut.label, hint, control, cx));
+            }
+            page = page.child(Self::subheading(group.label(), cx)).child(Self::card(rows, cx));
+        }
+        let mut fixed = div();
+        for (keys, label) in FIXED_SHORTCUTS {
+            fixed = fixed.child(Self::row(label, None, Self::key_chip(t(keys).to_string(), cx).into_any_element(), cx));
+        }
+        page.child(Self::subheading("Composer and model menu", cx))
+            .child(Self::card(fixed, cx))
+            .into_any_element()
+    }
+
+    fn render_about(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        // The updater runs in the released app only (Sparkle in the bundle).
+        let update = cx
+            .try_global::<crate::updater::AvailableUpdate>()
+            .map(|update| update.0.clone());
+        if update.is_some() && self._update_watch.is_none() {
+            self._update_watch = Some(cx.observe_global::<crate::updater::AvailableUpdate>(|_, cx| cx.notify()));
+        }
+        let update_row: AnyElement = match update {
+            Some(Some(version)) => Button::new("install-update")
+                .primary()
+                .small()
+                .app_label(tf("Update to v{version}", &[("version", version)]))
+                .on_click(|_, _, _| crate::updater::check())
+                .into_any_element(),
+            Some(None) => Button::new("check-updates")
+                .outline()
+                .small()
+                .app_label(t("Check for Updates"))
+                .on_click(|_, _, _| crate::updater::check())
+                .into_any_element(),
+            None => div()
+                .text_size(TEXT)
+                .text_color(theme.muted_foreground)
+                .child(t("Automatic updates are available in the released app."))
+                .into_any_element(),
+        };
+        let links = ABOUT_LINKS.iter().enumerate().map(|(ix, (label, url))| {
+            let url = *url;
+            div()
+                .id(("about-link", ix))
+                .px(px(14.))
+                .py(px(11.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .text_size(TEXT)
+                .cursor_pointer()
+                .when(ix + 1 < ABOUT_LINKS.len(), |this| this.border_b_1().border_color(theme.border))
+                .hover(|this| this.bg(theme.list_hover))
+                .child(t(label))
+                .child(Icon::new(IconName::ExternalLink).size(ICON).text_color(theme.muted_foreground))
+                .on_click(move |_, _, cx| cx.open_url(url))
+        });
+        div()
+            .child(Self::heading("About", cx))
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .child(img(logo()).size(px(52.)).rounded(px(12.)).flex_none())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).child("CodeAny"))
+                            .child(
+                                div()
+                                    .text_size(TEXT)
+                                    .text_color(theme.muted_foreground)
+                                    .child(tf("Version {version}", &[("version", env!("CARGO_PKG_VERSION").to_string())])),
+                            ),
+                    ),
+            )
+            .child(div().mt(px(10.)).mb(px(14.)).child(update_row))
+            .child(
+                div()
+                    .mb(px(18.))
                     .text_size(TEXT)
                     .text_color(theme.muted_foreground)
-                    .child(tf("Version {version}", &[("version", env!("CARGO_PKG_VERSION").to_string())])),
+                    .child(t("A local-first coding agent.")),
             )
             .child(
+                // The same card as the other pages.
                 div()
-                    .mt_4()
-                    .max_w(px(420.))
-                    .text_size(TEXT)
-                    .text_color(theme.muted_foreground)
-                    .text_center()
-                    .child(t("A lightweight coding-agent app with an editor.")),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .text_size(TEXT)
-                    .text_color(theme.muted_foreground)
-                    .child(tf("Data: {path}", &[("path", paths::home().display().to_string())])),
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded_xl()
+                    .bg(theme.secondary.opacity(0.35))
+                    .children(links),
             )
             .into_any_element()
     }
@@ -729,22 +1239,46 @@ impl Render for Settings {
         let theme = cx.theme().clone();
         // Shrink with small windows rather than running off the bottom.
         let max_height = window.viewport_size().height - px(48.);
+        // Each input submits on Enter, like clicking its button. (The dialog
+        // would otherwise take Enter as "OK" and close the whole settings.)
+        let on_enter = |input: &Entity<InputState>,
+                        window: &mut Window,
+                        cx: &mut Context<Self>,
+                        submit: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    submit(this, window, cx);
+                }
+            })
+        };
         if self.code_input.is_none() {
-            self.code_input = Some(cx.new(|cx| InputState::new(window, cx).placeholder("XXXX-XXXX")));
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("XXXX-XXXX"));
+            let sub = on_enter(&input, window, cx, |this, window, cx| this.join_with_code(window, cx));
+            self._input_subscriptions.push(sub);
+            self.code_input = Some(input);
         }
         if self.name_input.is_none() {
-            self.name_input = Some(cx.new(|cx| InputState::new(window, cx).placeholder(t("Device name"))));
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder(t("Device name")));
+            let sub = on_enter(&input, window, cx, |this, _, cx| this.save_rename(cx));
+            self._input_subscriptions.push(sub);
+            self.name_input = Some(input);
         }
         if self.auth_input.is_none() {
-            self.auth_input = Some(cx.new(|cx| InputState::new(window, cx).placeholder("codeany1.…")));
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("codeany1.…"));
+            let sub = on_enter(&input, window, cx, |this, _, cx| this.submit_connect(cx));
+            self._input_subscriptions.push(sub);
+            self.auth_input = Some(input);
         }
         if self.verify_input.is_none() {
-            self.verify_input = Some(cx.new(|cx| InputState::new(window, cx).placeholder("XXXX-XXXX")));
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("XXXX-XXXX"));
+            let sub = on_enter(&input, window, cx, |this, window, cx| this.submit_verify(window, cx));
+            self._input_subscriptions.push(sub);
+            self.verify_input = Some(input);
         }
         let content = match self.section {
             Section::General => self.render_general(cx),
-            Section::Appearance => self.render_appearance(cx),
-            Section::Agents => self.render_agents(cx),
+            Section::Appearance => self.render_appearance(window, cx),
+            Section::Agents => self.render_agents(window, cx),
             Section::Devices => self.render_devices(window, cx),
             Section::Shortcuts => self.render_shortcuts(cx),
             Section::About => self.render_about(cx),
@@ -773,7 +1307,7 @@ impl Render for Settings {
                             .id("settings-content")
                             .size_full()
                             .overflow_y_scroll()
-                            .px(px(28.))
+                            .px(CONTENT_PADDING)
                             .py_6()
                             .child(content),
                     )
@@ -976,9 +1510,21 @@ impl Settings {
         .detach();
     }
 
+    /// Copy a fresh authorization code, good for ten minutes; the row counts
+    /// down meanwhile.
     fn copy_invite(&mut self, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(peer::invite()));
+        cx.write_to_clipboard(ClipboardItem::new_string(peer::new_invite()));
         self.copied = true;
+        cx.spawn(async move |this, cx| {
+            while peer::invite_expires_in().is_some() {
+                cx.background_executor().timer(std::time::Duration::from_secs(15)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
             this.update(cx, |this, cx| {
@@ -1132,6 +1678,16 @@ impl Settings {
     // ---- Rendering
 
     fn render_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let intro = if ACCOUNTS {
+            t("Use your other machines from this one: run agents there, and see their \
+               threads here. Sign in to the same account on each, or connect them with an \
+               authorization code; CodeAny picks the fastest way, directly over the same \
+               Wi-Fi or Tailscale network when it can.")
+        } else {
+            t("Use your other machines from this one: run agents there, and see their \
+               threads here. Connect them with an authorization code; CodeAny connects \
+               directly over the same Wi-Fi or Tailscale network.")
+        };
         if self._devices_poll.is_none() {
             self.watch_devices(cx);
         }
@@ -1141,12 +1697,7 @@ impl Settings {
                 .mb_4()
                 .text_size(TEXT)
                 .text_color(theme.muted_foreground)
-                .child(t(
-                    "Use your other machines from this one: run agents there, and see their \
-                     threads here. Sign in to the same account on each, or connect them with an \
-                     authorization code; CodeAny picks the fastest way, directly over the same \
-                     Wi-Fi or Tailscale network when it can.",
-                )),
+                .child(intro),
         );
         let error = self.device_error.clone().or_else(|| match remote::login_status() {
             remote::Login::Failed(err) => Some(err),
@@ -1189,6 +1740,21 @@ impl Settings {
             )
     }
 
+    /// Related rows grouped in a rounded card. Rows draw a rule under
+    /// themselves; the card hides the last one against its own border.
+    fn card(content: impl IntoElement, cx: &App) -> Div {
+        let theme = cx.theme();
+        div()
+            .mt_2()
+            .rounded_xl()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary.opacity(0.35))
+            .px(CARD_PADDING)
+            .overflow_hidden()
+            .child(div().mb(px(-1.)).child(content))
+    }
+
     fn status_dot(color: Hsla) -> impl IntoElement {
         div().size(px(8.)).flex_none().rounded_full().bg(color)
     }
@@ -1207,7 +1773,11 @@ impl Settings {
         let self_id = me.as_ref().map(|d| d.id.clone()).unwrap_or_else(|| remote::SELF_ID.to_string());
         let online = status.as_ref().is_some_and(|s| s.host == remote::HostStatus::On);
 
-        let mut card = div().child(Self::subheading("This device", cx));
+        // This machine: its name and whether it is shared. Access: the ways
+        // another machine connects, from either end.
+        let mut card = div();
+        let mut access = div();
+        let mut notes = div();
 
         // Name and account, with the one action on the account.
         let name_cell: AnyElement = if self.renaming.as_deref() == Some(self_id.as_str()) {
@@ -1228,13 +1798,14 @@ impl Settings {
                 }))
                 .into_any_element()
         };
-        let account_text = match &status {
-            Some(status) => tf(
+        let account_text: Option<String> = match &status {
+            Some(status) => Some(tf(
                 "Signed in · {account}",
                 &[("account", status.account.clone().unwrap_or_else(|| status.server.clone()))],
-            ),
-            None if pending_login => t("Waiting for you to approve in the browser…").into(),
-            None => t("Not signed in").into(),
+            )),
+            None if !ACCOUNTS => None,
+            None if pending_login => Some(t("Waiting for you to approve in the browser…").into()),
+            None => Some(t("Not signed in").into()),
         };
         let actions: AnyElement = match (&status, &self.confirm) {
             (Some(_), Some(Confirm::SignOut)) => div()
@@ -1250,7 +1821,6 @@ impl Settings {
                 .child(
                     Button::new("cancel-sign-out")
                         .ghost()
-                        .small()
                         .app_label(t("Cancel"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.confirm = None;
@@ -1260,7 +1830,6 @@ impl Settings {
                 .child(
                     Button::new("confirm-sign-out")
                         .primary()
-                        .small()
                         .app_label(t("Sign out"))
                         .disabled(busy)
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1271,7 +1840,6 @@ impl Settings {
                 .into_any_element(),
             (Some(_), _) => Button::new("sign-out")
                 .outline()
-                .small()
                 .app_label(t("Sign out"))
                 .disabled(busy)
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1279,6 +1847,8 @@ impl Settings {
                     cx.notify();
                 }))
                 .into_any_element(),
+            // Without accounts there is nothing to sign in to.
+            (None, _) if !ACCOUNTS => div().into_any_element(),
             (None, _) => div()
                 .flex()
                 .items_center()
@@ -1287,7 +1857,6 @@ impl Settings {
                     this.child(
                         Button::new("cancel-sign-in")
                             .ghost()
-                            .small()
                             .app_label(t("Cancel"))
                             .on_click(cx.listener(|_, _, _, cx| {
                                 remote::cancel_login();
@@ -1298,7 +1867,6 @@ impl Settings {
                 .child(
                     Button::new("sign-in")
                         .primary()
-                        .small()
                         .app_label(if pending_login { t("Open the browser again") } else { t("Sign in with termany.sh") })
                         .disabled(busy)
                         .on_click(cx.listener(|this, _, _, cx| this.sign_in_browser(cx))),
@@ -1322,16 +1890,18 @@ impl Settings {
                         .flex_col()
                         .gap(px(2.))
                         .child(name_cell)
-                        .child(div().text_size(TEXT).text_color(theme.muted_foreground).child(account_text)),
+                        .when_some(account_text, |this, text| {
+                            this.child(div().text_size(TEXT).text_color(theme.muted_foreground).child(text))
+                        }),
                 )
                 .child(actions),
         );
         if let Some(remote::Status { host: remote::HostStatus::Failed(err), .. }) = &status {
-            card = card.child(Self::error_banner(tf("Not reachable through the account: {err}", &[("err", err.to_string())]), cx));
+            notes = notes.child(Self::error_banner(tf("Not reachable through the account: {err}", &[("err", err.to_string())]), cx));
         }
 
         // Signed out: other ways into an account.
-        if status.is_none() {
+        if ACCOUNTS && status.is_none() {
             if let Some((server, account)) = remote::termany_account() {
                 let hint = match account {
                     Some(account) => tf("Termany on this machine is signed in as {account}.", &[("account", account.to_string())]),
@@ -1342,7 +1912,6 @@ impl Settings {
                     Some(hint),
                     Button::new("join-termany")
                         .outline()
-                        .small()
                         .app_label(t("Use it"))
                         .disabled(busy || pending_login)
                         .on_click(cx.listener(|this, _, _, cx| this.device_action(remote::join_termany(true), cx)))
@@ -1359,12 +1928,11 @@ impl Settings {
                     .items_center()
                     .gap_2()
                     .when_some(code_input, |this, input| {
-                        this.child(div().w(px(140.)).child(Input::new(&input).text_size(TEXT).small()))
+                        this.child(div().w(px(140.)).child(Input::new(&input).text_size(TEXT)))
                     })
                     .child(
                         Button::new("join-code")
                             .outline()
-                            .small()
                             .app_label(t("Join"))
                             .disabled(busy || pending_login)
                             .on_click(cx.listener(|this, _, window, cx| this.join_with_code(window, cx))),
@@ -1375,17 +1943,19 @@ impl Settings {
         }
 
         // The authorization code another device pastes to connect.
-        let invite = peer::invite();
-        let short = if invite.len() > 36 { format!("{}…{}", &invite[..24], &invite[invite.len() - 8..]) } else { invite };
-        card = card.child(Self::row(
+        // A fresh code on every copy, good for ten minutes.
+        let hint = match peer::invite_expires_in() {
+            Some(left) => tf(
+                "Copied. Paste it into “Connect a device” on your other machine within {minutes} min.",
+                &[("minutes", left.as_secs().div_ceil(60).max(1).to_string())],
+            ),
+            None => t("Copy a code and paste it into “Connect a device” on your other machine; it works for 10 minutes.").to_string(),
+        };
+        access = access.child(Self::row(
             "Authorization code",
-            Some(tf(
-                "Paste it into “Connect a device” on your other machine. {code} · {fingerprint}",
-                &[("code", short), ("fingerprint", peer::fingerprint(&peer::public_key()).to_string())],
-            )),
+            Some(hint),
             Button::new("copy-invite")
                 .outline()
-                .small()
                 .app_icon(if self.copied { IconName::Check } else { IconName::Copy })
                 .app_label(if self.copied { t("Copied") } else { t("Copy") })
                 .on_click(cx.listener(|this, _, _, cx| this.copy_invite(cx)))
@@ -1420,7 +1990,7 @@ impl Settings {
         ));
 
         let verified = peer::peers().iter().filter(|p| !p.pending).count();
-        if status.is_some() && verified > 0 {
+        if ACCOUNTS && status.is_some() && verified > 0 {
             card = card.child(Self::row(
                 "Only end-to-end encrypted devices",
                 Some(t("Devices in the account that are not connected by code can no longer reach this one. Encrypted ones keep working, directly or through the cloud.").into()),
@@ -1435,7 +2005,7 @@ impl Settings {
             ));
         }
 
-        if status.is_some() {
+        if ACCOUNTS && status.is_some() {
             let pairing: AnyElement = match &self.pairing {
                 Some(code) => div()
                     .flex()
@@ -1446,14 +2016,12 @@ impl Settings {
                         let text = code.code.clone();
                         Button::new("copy-code")
                             .ghost()
-                            .small()
                             .app_icon(IconName::Copy)
                             .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
                     })
                     .into_any_element(),
                 None => Button::new("pairing-code")
                     .outline()
-                    .small()
                     .app_label(t("Get a code"))
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| this.create_pairing_code(cx)))
@@ -1466,8 +2034,35 @@ impl Settings {
                 cx,
             ));
         }
-        let _ = window;
-        card.into_any_element()
+        access = access
+            .child(Self::row(
+                "Connect a device",
+                Some(t("Paste the authorization code from another machine to use it from here.").into()),
+                Button::new("connect-device")
+                    .outline()
+                    .app_label(t("Connect"))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_connect(window, cx)))
+                    .into_any_element(),
+                cx,
+            ))
+            .child(Self::row(
+                "Verify access",
+                Some(t("When another machine connects to this one, type the connection code it shows.").into()),
+                Button::new("verify-access")
+                    .outline()
+                    .app_label(t("Verify"))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_verify(window, cx)))
+                    .into_any_element(),
+                cx,
+            ));
+        div()
+            .child(Self::subheading("This device", cx))
+            .child(Self::card(card, cx))
+            .child(notes)
+            .child(Self::subheading("Access", cx))
+            .child(Self::card(access, cx))
+            .when(self.link.is_some(), |this| this.child(div().mt_2().child(self.render_link(window, cx))))
+            .into_any_element()
     }
 
     fn rename_editor(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1476,18 +2071,16 @@ impl Settings {
             .flex()
             .items_center()
             .gap_2()
-            .when_some(input, |this, input| this.child(div().w(px(200.)).child(Input::new(&input).text_size(TEXT).small())))
+            .when_some(input, |this, input| this.child(div().w(px(200.)).child(Input::new(&input).text_size(TEXT))))
             .child(
                 Button::new("save-name")
                     .primary()
-                    .small()
                     .app_label(t("Save"))
                     .on_click(cx.listener(|this, _, _, cx| this.save_rename(cx))),
             )
             .child(
                 Button::new("cancel-name")
                     .ghost()
-                    .small()
                     .app_label(t("Cancel"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.renaming = None;
@@ -1505,31 +2098,13 @@ impl Settings {
                 .child(
                     Button::new("refresh-devices")
                         .ghost()
-                        .small()
                         .app_icon(IconName::RefreshCw)
                         .app_label(if measuring { t("Measuring…") } else { t("Refresh") })
                         .disabled(measuring)
                         .on_click(cx.listener(|this, _, _, cx| this.refresh_now(cx))),
                 )
-                .child(
-                    Button::new("verify-access")
-                        .outline()
-                        .small()
-                        .app_label(t("Verify access"))
-                        .on_click(cx.listener(|this, _, window, cx| this.open_verify(window, cx))),
-                )
-                .child(
-                    Button::new("connect-device")
-                        .primary()
-                        .small()
-                        .app_label(t("Connect a device"))
-                        .on_click(cx.listener(|this, _, window, cx| this.open_connect(window, cx))),
-                ),
         );
-
-        if self.link.is_some() {
-            card = card.child(self.render_link(window, cx));
-        }
+        let _ = window;
 
         // Devices asking to connect.
         for (ix, request) in peer::requests().into_iter().enumerate() {
@@ -1552,7 +2127,6 @@ impl Settings {
                     .child(
                         Button::new(("decline-request", ix))
                             .ghost()
-                            .small()
                             .app_label(t("Decline"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 peer::decline(&key);
@@ -1563,7 +2137,6 @@ impl Settings {
                     .child(
                         Button::new(("verify-request", ix))
                             .primary()
-                            .small()
                             .app_label(t("Verify"))
                             .on_click(cx.listener(|this, _, window, cx| this.open_verify(window, cx))),
                     ),
@@ -1583,10 +2156,12 @@ impl Settings {
                         .py_3()
                         .text_size(TEXT)
                         .text_color(theme.muted_foreground)
-                        .child(t(
-                            "No other devices yet. Sign in to the same account on another machine, or \
-                             click Connect a device and paste its authorization code.",
-                        ))
+                        .child(if ACCOUNTS {
+                            t("No other devices yet. Sign in to the same account on another machine, or \
+                               click Connect a device and paste its authorization code.")
+                        } else {
+                            t("No other devices yet. Copy the authorization code on another machine, then use Connect a device here.")
+                        })
                         .into_any_element()
                 } else {
                     div()
@@ -1597,7 +2172,7 @@ impl Settings {
                 }
             }
         };
-        card.child(list).into_any_element()
+        card.child(Self::card(list, cx)).into_any_element()
     }
 
     fn render_link(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1608,7 +2183,6 @@ impl Settings {
         };
         let close = Button::new("close-link")
             .ghost()
-            .small()
             .app_label(close_label)
             .on_click(cx.listener(|this, _, _, cx| this.close_link(cx)));
         let mut panel = div()
@@ -1668,12 +2242,11 @@ impl Settings {
                                     .items_center()
                                     .gap_2()
                                     .when_some(input, |this, input| {
-                                        this.child(div().flex_1().child(Input::new(&input).text_size(TEXT).small()))
+                                        this.child(div().flex_1().child(Input::new(&input).text_size(TEXT)))
                                     })
                                     .child(
                                         Button::new("submit-connect")
                                             .primary()
-                                            .small()
                                             .app_label(t("Next"))
                                             .on_click(cx.listener(|this, _, _, cx| this.submit_connect(cx))),
                                     ),
@@ -1708,12 +2281,11 @@ impl Settings {
                                     .items_center()
                                     .gap_2()
                                     .when_some(input, |this, input| {
-                                        this.child(div().w(px(180.)).child(Input::new(&input).text_size(TEXT).small()))
+                                        this.child(div().w(px(180.)).child(Input::new(&input).text_size(TEXT)))
                                     })
                                     .child(
                                         Button::new("submit-verify")
                                             .primary()
-                                            .small()
                                             .app_label(t("Verify"))
                                             .on_click(cx.listener(|this, _, window, cx| this.submit_verify(window, cx))),
                                     ),
@@ -1820,7 +2392,6 @@ impl Settings {
             Some(
                 Button::new(("e2e-on", ix))
                     .ghost()
-                    .small()
                     .app_icon(IconName::Lock)
                     .app_label(t("End-to-end encrypted"))
                     .disabled(!device.via_account)
@@ -1835,7 +2406,6 @@ impl Settings {
             Some(
                 Button::new(("e2e-off", ix))
                     .outline()
-                    .small()
                     .app_icon(IconName::LockOpen)
                     .app_label(t("Turn on end-to-end encryption"))
                     .on_click(cx.listener(move |this, _, _, cx| this.connect_device(id.clone(), cx)))
@@ -1876,7 +2446,6 @@ impl Settings {
                     row = row.child(
                         Button::new(("remove-peer", ix))
                             .ghost()
-                            .small()
                             .app_label(if pending { t("Cancel") } else { t("Remove") })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if pending {
@@ -1894,10 +2463,8 @@ impl Settings {
                     row = row.child(
                         Button::new(("revoke-device", ix))
                             .ghost()
-                            .small()
                             .app_icon(IconName::Trash)
                             .disabled(busy)
-                            .tooltip(t("Remove from the account"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.confirm = Some(Confirm::Revoke(id.clone()));
                                 cx.notify();
@@ -1984,7 +2551,6 @@ impl Settings {
             .child(
                 Button::new(("confirm-cancel", ix))
                     .ghost()
-                    .small()
                     .app_label(t("Cancel"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.confirm = None;
@@ -1994,7 +2560,6 @@ impl Settings {
             .child(
                 Button::new(("confirm-ok", ix))
                     .primary()
-                    .small()
                     .app_label(t("Confirm"))
                     .on_click(on_confirm),
             )

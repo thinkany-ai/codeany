@@ -8,11 +8,13 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, kbd::Kbd, Selectable as _,
+    ActiveTheme as _, Disableable as _, Icon, kbd::Kbd,
     button::{Button, ButtonVariants as _},
-    input::{Editor, EditorState, InputEvent},
+    input::{Editor, EditorState, Input, InputEvent, InputState},
+    menu::ContextMenuExt as _,
     notification::{Notification, NotificationType},
-    resizable::{h_resizable, resizable_panel},
+    resizable::{HandleEdge, resize_handle},
+    window_paddings,
     WindowExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -31,11 +33,23 @@ use crate::{
 };
 use crate::style::chrome_button;
 use crate::style::layout;
-use crate::style::size::{TEXT, ICON};
+use crate::style::size::{TEXT, ICON, TAB_ACTION_ICON};
 use crate::i18n::{t, tf};
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+const SIDEBAR_DEFAULT: Pixels = px(260.);
+const SIDEBAR_MIN: Pixels = px(220.);
+const SIDEBAR_MAX: Pixels = px(600.);
+const CONVERSATION_MIN: Pixels = px(420.);
+const CONVERSATION_MAX: Pixels = px(1440.);
+const SURFACES_DEFAULT: Pixels = px(360.);
+const SURFACES_MIN: Pixels = px(300.);
+const SURFACES_MAX: Pixels = px(720.);
+
+pub fn minimum_window_size() -> Size<Pixels> {
+    size(SIDEBAR_MIN + CONVERSATION_MIN + SURFACES_MIN, px(0.))
+}
 
 enum TabContent {
     Editor(Entity<EditorState>),
@@ -56,11 +70,26 @@ enum Mode {
     Editor,
 }
 
+#[derive(Clone, Copy)]
+enum PanelDivider {
+    Sidebar,
+    Surfaces,
+}
+
+impl Render for PanelDivider {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 /// Room for the macOS traffic lights in the transparent title bar.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 86.;
 
 pub struct Workspace {
     root: Option<PathBuf>,
+    /// The chat tab whose title is being typed: its thread and the input.
+    renaming_tab: Option<(u64, Entity<InputState>)>,
+    _rename_subscription: Option<Subscription>,
     /// The active thread's worktree, shown in the file tree, surfaces and git
     /// status in place of `root`.
     work_dir: Option<PathBuf>,
@@ -71,6 +100,9 @@ pub struct Workspace {
     /// From an editor window: the main window that opened it.
     main_window: Option<(AnyWindowHandle, WeakEntity<Workspace>)>,
     agent_panel: Entity<AgentPanel>,
+    /// The panel's conversation and thread list, embedded cached.
+    chat_view: Entity<crate::panel_views::ChatView>,
+    sidebar_view: Entity<crate::panel_views::SidebarView>,
     settings: Entity<crate::settings::Settings>,
     file_tree: Entity<FileTree>,
     surfaces: Entity<SurfaceHost>,
@@ -78,6 +110,8 @@ pub struct Workspace {
     active_tab: Option<usize>,
     git: RepoSnapshot,
     show_sidebar: bool,
+    sidebar_width: Pixels,
+    surfaces_width: Pixels,
     focus_handle: FocusHandle,
     /// The open search palette's subscription.
     _palette: Option<Subscription>,
@@ -205,10 +239,14 @@ impl Workspace {
         let mut this = Self {
             root: None,
             work_dir: None,
+            renaming_tab: None,
+            _rename_subscription: None,
             mode,
             editor_window: None,
             main_window,
             settings: cx.new(|_| crate::settings::Settings::new(&agent_panel)),
+            chat_view: cx.new(|cx| crate::panel_views::ChatView::new(agent_panel.clone(), cx)),
+            sidebar_view: cx.new(|cx| crate::panel_views::SidebarView::new(agent_panel.clone(), cx)),
             agent_panel,
             file_tree,
             surfaces,
@@ -216,6 +254,8 @@ impl Workspace {
             active_tab: None,
             git: RepoSnapshot::default(),
             show_sidebar: true,
+            sidebar_width: SIDEBAR_DEFAULT,
+            surfaces_width: SURFACES_DEFAULT,
             focus_handle: cx.focus_handle(),
             _palette: None,
             _poll_task: None,
@@ -275,12 +315,20 @@ impl Workspace {
                         break;
                     };
                     let Some(root) = root else { break };
-                    let snapshot = cx
+                    // Only the editor shows the file tree; its folders are
+                    // read here, off the UI thread, with the git status.
+                    let dirs = this
+                        .read_with(cx, |this, cx| {
+                            (this.mode == Mode::Editor).then(|| this.file_tree.read(cx).loaded_dirs())
+                        })
+                        .ok()
+                        .flatten();
+                    let (snapshot, listing) = cx
                         .background_executor()
-                        .spawn(async move { git::snapshot(&root) })
+                        .spawn(async move { (git::snapshot(&root), dirs.map(FileTree::read_dirs)) })
                         .await;
                     let alive = this.update_in(cx, |this, window, cx| {
-                        this.apply_snapshot(snapshot.unwrap_or_default(), window, cx);
+                        this.apply_snapshot(snapshot.unwrap_or_default(), listing, window, cx);
                     });
                     if alive.is_err() {
                         break;
@@ -293,7 +341,13 @@ impl Workspace {
     }
 
     /// Bring the tree, git panel and clean tabs up to date with the disk.
-    fn apply_snapshot(&mut self, snapshot: RepoSnapshot, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_snapshot(
+        &mut self,
+        snapshot: RepoSnapshot,
+        listing: Option<crate::file_tree::Listing>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let changed = snapshot != self.git;
         self.git = snapshot.clone();
         if self.mode == Mode::Agent {
@@ -302,13 +356,18 @@ impl Workspace {
         }
         self.file_tree.update(cx, |tree, cx| {
             tree.set_git(snapshot, cx);
-            tree.refresh(cx);
+            if let Some(listing) = listing {
+                tree.apply_listing(listing, cx);
+            }
         });
         if changed {
             self.surfaces.update(cx, |surfaces, cx| surfaces.refresh(window, cx));
         }
         self.reload_changed_tabs(window, cx);
-        cx.notify();
+        // Nothing new on disk: nothing to redraw.
+        if changed {
+            cx.notify();
+        }
     }
 
     fn reload_changed_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -817,6 +876,7 @@ impl Workspace {
         let agent_panel = self.agent_panel.clone();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
+            window_min_size: Some(minimum_window_size()),
             titlebar: Some(TitlebarOptions {
                 title: Some(t("CodeAny Editor").into()),
                 appears_transparent: true,
@@ -870,6 +930,9 @@ impl Workspace {
                 // corners; the dialog's would peek out around them.
                 .bg(gpui_kit::transparent_black())
                 .border_0()
+                // Enter belongs to the input it is typed in; it must not
+                // take the dialog's "OK" and close the settings.
+                .on_ok(|_, _, _| false)
                 .close_button(false)
                 .child(settings.clone())
         });
@@ -1043,7 +1106,7 @@ impl Workspace {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let content = match self.mode {
-            Mode::Agent => self.agent_panel.update(cx, |panel, cx| panel.render_sidebar(cx)),
+            Mode::Agent => crate::panel_views::cached(self.sidebar_view.clone()).into_any_element(),
             Mode::Editor => self.file_tree.clone().into_any_element(),
         };
         let can_back = self.mode == Mode::Agent && self.agent_panel.read(cx).can_navigate(false);
@@ -1053,6 +1116,7 @@ impl Workspace {
             .child(
                 div()
                     .h(layout::HEADER).flex_none().flex().items_center()
+                    .pt(layout::HEADER_TOP_INSET)
                     .pl(px(TRAFFIC_LIGHTS_WIDTH)).pr(layout::SIDEBAR_INSET)
                     .child(
                         chrome_button("hide-sidebar")
@@ -1103,11 +1167,6 @@ impl Workspace {
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let mode = self.mode;
-        let icon_button = |id: &'static str, icon: IconName| {
-            chrome_button(id)
-                .child(Icon::new(icon).size(ICON))
-                .text_color(theme.muted_foreground)
-        };
         #[cfg(target_os = "macos")]
         let update = cx
             .try_global::<crate::updater::AvailableUpdate>()
@@ -1123,12 +1182,19 @@ impl Workspace {
             .items_center()
             .gap(layout::SPACE_1)
             .child(
-                icon_button("open-settings", IconName::Settings)
+                Button::new("open-settings")
+                    .ghost()
+                    .h(layout::CONTROL)
+                    .px_2()
+                    .gap_2()
+                    .text_color(theme.muted_foreground)
+                    .app_icon(IconName::Settings)
+                    .app_label(t("Settings"))
                     .on_click(cx.listener(|this, _, window, cx| this.open_settings(&OpenSettings, window, cx)))
                     .app_tooltip(t("Settings (⌘,)")),
             )
             .child(div().flex_1())
-            .when_some(update, |this, version| {
+            .when_some(update, |this, _version| {
                 this.child(
                     div()
                         .id("install-update")
@@ -1144,11 +1210,6 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(|this| this.bg(theme.list_hover))
                         .child(Icon::new(IconName::ArrowUp).size(ICON))
-                        .tooltip(move |window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(tf("Update to {version}", &[("version", version.to_string())]))
-                                .text_size(TEXT)
-                                .build(window, cx)
-                        })
                         .on_click(|_, _, _| {
                             #[cfg(target_os = "macos")]
                             crate::updater::check();
@@ -1160,29 +1221,68 @@ impl Workspace {
     /// The agent window's tabs, one per open thread, drawn like a browser's:
     /// the active tab takes the page's color and flows into it, with curved
     /// feet; the others sit on the darker strip, split by thin rules.
+    /// Type a new title for a tab's thread, in the tab itself.
+    fn start_tab_rename(&mut self, id: u64, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(title, window, cx);
+            input
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        // Enter or leaving the field keeps the title.
+        self._rename_subscription = Some(cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                this.finish_tab_rename(true, cx);
+            }
+        }));
+        self.renaming_tab = Some((id, input));
+        cx.notify();
+    }
+
+    fn finish_tab_rename(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some((id, input)) = self.renaming_tab.take() else { return };
+        self._rename_subscription = None;
+        if keep {
+            let title = input.read(cx).value().to_string();
+            self.agent_panel.update(cx, |panel, cx| panel.rename_thread(id, &title, cx));
+        }
+        cx.notify();
+    }
+
     fn render_chat_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         const RADIUS: Pixels = px(8.);
-        // × and + share a size and colour.
-        const TAB_ICON: Pixels = px(14.);
+        const RULE_HEIGHT: Pixels = px(14.);
         let theme = cx.theme().clone();
         let (tabs, active) = self.agent_panel.read(cx).tab_items();
         let count = tabs.len();
         let closable = count > 1 || self.agent_panel.read(cx).has_open_thread();
         let icon_size = crate::style::size::icon_pixels(cx);
-        // A concave corner joining the active tab to the page.
+        // Paint only the curve so the strip or adjacent hover shows through.
         let foot = |left: bool| {
+            let background = theme.background;
             div()
                 .absolute()
-                // Down to the strip's bottom row: the curve ends the rule,
-                // instead of the rule showing under the curve.
                 .bottom_0()
-                .when(left, |this| this.left(-RADIUS))
-                .when(!left, |this| this.right(-RADIUS))
                 .size(RADIUS)
-                .bg(theme.background)
-                .child(div().size_full().bg(theme.tab_bar).map(|this| {
-                    if left { this.rounded_br(RADIUS) } else { this.rounded_bl(RADIUS) }
-                }))
+                .child(
+                    canvas(|_, _, _| (), move |bounds, (), window, _| {
+                        let bottom_right = bounds.bottom_right();
+                        let (outer_x, inner_x) = if left {
+                            (bounds.origin.x, bottom_right.x)
+                        } else {
+                            (bottom_right.x, bounds.origin.x)
+                        };
+                        let mut path = PathBuilder::fill();
+                        path.move_to(point(outer_x, bottom_right.y));
+                        path.arc_to(point(RADIUS, RADIUS), px(0.), false, !left, point(inner_x, bounds.origin.y));
+                        path.line_to(point(inner_x, bottom_right.y));
+                        path.close();
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, background);
+                        }
+                    })
+                    .size_full(),
+                )
         };
         div()
             .id("chat-tabs")
@@ -1191,16 +1291,12 @@ impl Workspace {
             .h_full()
             .flex()
             .items_end()
-            .pl(RADIUS)
+            // Leave a gap between the sidebar divider and the active tab's foot.
+            .pl(RADIUS + layout::SPACE_2)
             .children(tabs.into_iter().enumerate().map(|(ix, tab)| {
                 let selected = ix == active;
                 // Rules split two inactive tabs; none touches the active one.
                 let rule = ix + 1 < count && !selected && ix + 1 != active;
-                let shortcut = match ix {
-                    0..=7 => format!(" (⌘{})", ix + 1),
-                    _ => String::new(),
-                };
-                let tip = format!("{}{shortcut}", tab.title);
                 let icon = if tab.running {
                     Icon::new(IconName::LoaderCircle)
                         .size(ICON)
@@ -1225,7 +1321,7 @@ impl Workspace {
                     .w(px(220.))
                     .flex_shrink(1.)
                     .min_w(px(56.))
-                    .h(px(32.))
+                    .h_full()
                     .pl_3()
                     .pr_1p5()
                     .flex()
@@ -1236,25 +1332,43 @@ impl Workspace {
                     .cursor_pointer()
                     .map(|this| {
                         if selected {
-                            // Reaches the strip's bottom row, over its rule.
                             this.bg(theme.background)
                                 .text_color(theme.foreground)
-                                .child(foot(true))
-                                .child(foot(false))
+                                .when(ix == 0, |this| this.child(foot(true).left(-RADIUS)))
+                                .when(ix + 1 == count, |this| this.child(foot(false).right(-RADIUS)))
                         } else {
+                            // Draw shared corners over the inactive tab's hover fill.
                             this.text_color(theme.muted_foreground)
                                 .hover(|this| this.bg(theme.list_hover).text_color(theme.foreground))
+                                .when(ix + 1 == active, |this| this.child(foot(true).right_0()))
+                                .when(ix == active + 1, |this| this.child(foot(false).left_0()))
                         }
                     })
                     .child(div().flex_none().flex().items_center().child(icon))
-                    .child(
-                        div()
+                    .child(match (&self.renaming_tab, tab.id) {
+                        (Some((renaming, input)), Some(id)) if *renaming == id => div()
+                            .flex_1()
+                            .min_w_0()
+                            // Clicks in the field stay there: the tab would
+                            // otherwise take them and move focus away.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            // Esc puts the old title back.
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                if event.keystroke.key == "escape" {
+                                    cx.stop_propagation();
+                                    this.finish_tab_rename(false, cx);
+                                }
+                            }))
+                            .child(gpui_kit::component::Sizable::small(Input::new(input).text_size(TEXT)))
+                            .into_any_element(),
+                        _ => div()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(tab.title),
-                    )
+                            .child(tab.title.clone())
+                            .into_any_element(),
+                    })
                     .when(closable, |this| {
                         this.child(
                             div()
@@ -1267,7 +1381,7 @@ impl Workspace {
                                 .rounded_full()
                                 .text_color(theme.muted_foreground)
                                 .hover(|this| this.bg(theme.foreground.opacity(0.1)).text_color(theme.foreground))
-                                .child(Icon::new(IconName::X).size(TAB_ICON))
+                                .child(Icon::new(IconName::X).size(TAB_ACTION_ICON))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.agent_panel.update(cx, |panel, cx| panel.close_tab(Some(ix), window, cx));
@@ -1279,8 +1393,8 @@ impl Workspace {
                             div()
                                 .absolute()
                                 .right_0()
-                                .top(px(9.))
-                                .h(px(14.))
+                                .top((layout::HEADER - layout::HEADER_TOP_INSET - RULE_HEIGHT) / 2.)
+                                .h(RULE_HEIGHT)
                                 .w(px(1.))
                                 .bg(theme.border)
                                 .group_hover("chat-tab", |this| this.invisible()),
@@ -1289,18 +1403,65 @@ impl Workspace {
                     .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, window, cx| {
                         this.agent_panel.update(cx, |panel, cx| panel.close_tab(Some(ix), window, cx));
                     }))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.agent_panel.update(cx, |panel, cx| panel.select_tab(ix, window, cx));
+                    .on_click(cx.listener({
+                        let (id, title) = (tab.id, tab.title.clone());
+                        move |this, event: &ClickEvent, window, cx| {
+                            this.agent_panel.update(cx, |panel, cx| panel.select_tab(ix, window, cx));
+                            // A double click renames a thread's tab.
+                            if event.click_count() == 2 && let Some(id) = id {
+                                this.start_tab_rename(id, title.clone(), window, cx);
+                            }
+                        }
                     }))
-                    .tooltip(move |window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new(tip.clone()).text_size(TEXT).build(window, cx)
+                    .context_menu({
+                        let workspace = cx.entity().downgrade();
+                        let (id, title) = (tab.id, tab.title.clone());
+                        move |menu, _, _| {
+                            let (rename, close, others, right, reopen) =
+                                (workspace.clone(), workspace.clone(), workspace.clone(), workspace.clone(), workspace.clone());
+                            let title = title.clone();
+                            menu.when_some(id, |menu, id| {
+                                menu.item(crate::style::menu_item(t("Rename")).on_click(move |_, window, cx| {
+                                    let title = title.clone();
+                                    rename.update(cx, |this, cx| this.start_tab_rename(id, title, window, cx)).ok();
+                                }))
+                                .separator()
+                            })
+                            .item(crate::style::menu_item(t("Close Tab")).on_click(move |_, window, cx| {
+                                close
+                                    .update(cx, |this, cx| {
+                                        this.agent_panel.update(cx, |panel, cx| panel.close_tab(Some(ix), window, cx))
+                                    })
+                                    .ok();
+                            }))
+                            .item(crate::style::menu_item(t("Close Other Tabs")).disabled(count < 2).on_click(move |_, window, cx| {
+                                others
+                                    .update(cx, |this, cx| {
+                                        this.agent_panel.update(cx, |panel, cx| panel.close_other_tabs(ix, window, cx))
+                                    })
+                                    .ok();
+                            }))
+                            .item(crate::style::menu_item(t("Close Tabs to the Right")).disabled(ix + 1 >= count).on_click(move |_, window, cx| {
+                                right
+                                    .update(cx, |this, cx| {
+                                        this.agent_panel.update(cx, |panel, cx| panel.close_tabs_to_right(ix, window, cx))
+                                    })
+                                    .ok();
+                            }))
+                            .separator()
+                            .item(crate::style::menu_item(t("Reopen Closed Tab")).on_click(move |_, window, cx| {
+                                reopen
+                                    .update(cx, |this, cx| this.agent_panel.update(cx, |panel, cx| panel.reopen_tab(window, cx)))
+                                    .ok();
+                            }))
+                        }
                     })
             }))
             .child(
                 div().h_full().flex_none().flex().items_center().pl_1().child(
                     chrome_button("new-chat-tab")
                         .text_color(theme.muted_foreground)
-                        .child(Icon::new(IconName::Plus).size(TAB_ICON))
+                        .child(Icon::new(IconName::Plus).size(TAB_ACTION_ICON))
                         .on_click(cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)))
                         .app_tooltip(t("New Tab (⌘T)")),
                 ),
@@ -1329,21 +1490,13 @@ impl Workspace {
 
         div()
             .h(layout::HEADER)
+            .pt(layout::HEADER_TOP_INSET)
             .flex_none()
             .flex()
             .items_center()
             .gap_2()
             .pr_2()
-            // Tabs sit on a darker strip, as in a browser.
-            // A rule under the strip keeps scrolled content apart from it;
-            // the active tab covers it, joining the page.
-            .when(self.mode == Mode::Agent, |this| {
-                // Room above the tabs, so buttons centre on the tab row, not the strip.
-                this.relative().pt(px(8.)).bg(theme.tab_bar).child(
-                    // Drawn before the tabs, so the active one paints over it.
-                    div().absolute().left_0().right_0().bottom_0().h(px(1.)).bg(theme.border),
-                )
-            })
+            .when(self.mode == Mode::Agent, |this| this.bg(theme.tab_bar))
             .map(|this| {
                 if self.show_sidebar {
                     this.when(self.mode == Mode::Editor, |this| this.pl_4())
@@ -1391,28 +1544,84 @@ impl Workspace {
             .when(!self.show_sidebar && self.mode == Mode::Agent, |this| {
                 this.child(self.render_editor_button("header-editor", cx))
             })
-            .child({
-                let visible = self.surfaces.read(cx).is_visible();
-                chrome_button("toggle-surfaces")
-                    .child(Icon::new(IconName::PanelRight).size(ICON))
-                    .selected(visible)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        // Shown with nothing open, the panel lists the surfaces.
-                        this.surfaces.update(cx, |surfaces, cx| surfaces.set_visible(!visible, window, cx))
-                    }))
-                    .app_tooltip(t("Surfaces (⌥⌘T)"))
+            .when(!self.surfaces.read(cx).is_visible(), |this| {
+                this.child(
+                    chrome_button("toggle-surfaces")
+                        .app_icon(IconName::PanelRight)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.surfaces.update(cx, |surfaces, cx| surfaces.set_visible(true, window, cx))
+                        }))
+                        .app_tooltip(t("Surfaces (⌥⌘T)")),
+                )
+            })
+    }
+
+    /// Reserve the conversation's minimum width before applying the sidebar
+    /// preferences. Temporarily narrower panels regain their width as room returns.
+    fn side_widths(&self, width: Pixels, surfaces_visible: bool) -> (Pixels, Pixels) {
+        let surfaces_min = if surfaces_visible { SURFACES_MIN } else { px(0.) };
+        let sidebar = if self.show_sidebar {
+            self.sidebar_width.min((width - CONVERSATION_MIN - surfaces_min).max(px(0.)))
+        } else {
+            px(0.)
+        };
+        let surfaces = if surfaces_visible {
+            self.surfaces_width.min((width - sidebar - CONVERSATION_MIN).max(px(0.)))
+        } else {
+            px(0.)
+        };
+        (sidebar, surfaces)
+    }
+
+    fn resize_panel_at(
+        &mut self,
+        divider: PanelDivider,
+        width: Pixels,
+        pointer: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let (sidebar, surfaces) = self.side_widths(width, self.surfaces.read(cx).is_visible());
+        let (preferred, next) = match divider {
+            PanelDivider::Sidebar => {
+                let max = (width - surfaces - CONVERSATION_MIN).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                (&mut self.sidebar_width, pointer.clamp(SIDEBAR_MIN, max))
+            }
+            PanelDivider::Surfaces => {
+                let max = (width - sidebar - CONVERSATION_MIN).clamp(SURFACES_MIN, SURFACES_MAX);
+                (&mut self.surfaces_width, (width - pointer).clamp(SURFACES_MIN, max))
+            }
+        };
+        if *preferred != next {
+            *preferred = next;
+            cx.notify();
+        }
+    }
+
+    fn panel_divider(divider: PanelDivider, cx: &Context<Self>) -> impl IntoElement {
+        let (id, edge) = match divider {
+            PanelDivider::Sidebar => ("sidebar-divider", HandleEdge::Trailing),
+            PanelDivider::Surfaces => ("surfaces-divider", HandleEdge::Leading),
+        };
+        let workspace = cx.entity().downgrade();
+        resize_handle(id, Axis::Horizontal)
+            .inside(edge)
+            .on_drag(divider, move |divider, _, window, cx| {
+                // GPUI starts the drag after the pointer has already moved.
+                let inset = window_paddings(window);
+                let width = window.viewport_size().width - inset.left - inset.right;
+                let pointer = window.mouse_position().x - inset.left;
+                let _ = workspace.update(cx, |this, cx| this.resize_panel_at(*divider, width, pointer, cx));
+                cx.new(|_| *divider)
             })
     }
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
 
         let content = match self.mode {
-            Mode::Agent => self
-                .agent_panel
-                .update(cx, |panel, cx| panel.render_chat(cx)),
+            Mode::Agent => crate::panel_views::cached(self.chat_view.clone()).into_any_element(),
             Mode::Editor => self.render_editor_area(cx),
         };
 
@@ -1425,24 +1634,40 @@ impl Render for Workspace {
             .child(self.render_header(cx))
             .child(div().flex_1().min_h_0().min_w_0().child(content));
 
-        let main = h_resizable("workspace-h")
+        let surfaces_visible = self.surfaces.read(cx).is_visible();
+        let inset = window_paddings(window);
+        let width = window.viewport_size().width - inset.left - inset.right;
+        let (sidebar_width, surfaces_width) = self.side_widths(width, surfaces_visible);
+        let main = div()
+            .id("workspace-panels")
+            .size_full()
+            .flex()
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<PanelDivider>, _, cx| {
+                this.resize_panel_at(
+                    *event.drag(cx),
+                    event.bounds.size.width,
+                    event.event.position.x - event.bounds.left(),
+                    cx,
+                );
+            }))
+            .when(self.show_sidebar, |main| {
+                main.child(
+                    div().relative().flex_none().w(sidebar_width).h_full()
+                        .child(self.render_sidebar(cx))
+                        .child(Self::panel_divider(PanelDivider::Sidebar, cx)),
+                )
+            })
             .child(
-                resizable_panel()
-                    .size(px(260.))
-                    .size_range(px(220.)..px(600.))
-                    .fixed()
-                    .visible(self.show_sidebar)
-                    .child(self.render_sidebar(cx)),
+                div().flex_1().min_w_0().flex().justify_center()
+                    .child(center.max_w(CONVERSATION_MAX)),
             )
-            .child(resizable_panel().child(center))
-            .child(
-                resizable_panel()
-                    .size(px(520.))
-                    .size_range(px(280.)..px(1400.))
-                    .fixed()
-                    .visible(self.surfaces.read(cx).is_visible())
-                    .child(self.surfaces.clone()),
-            );
+            .when(surfaces_visible, |main| {
+                main.child(
+                    div().relative().flex_none().w(surfaces_width).h_full()
+                        .child(self.surfaces.clone())
+                        .child(Self::panel_divider(PanelDivider::Surfaces, cx)),
+                )
+            });
 
         div()
             .key_context("Workspace")

@@ -47,6 +47,9 @@ pub struct Fingerprint {
     pub title: String,
     pub settled: bool,
     pub agent: String,
+    /// How big the last item is: it grows in place while a turn streams.
+    #[serde(default)]
+    pub last: usize,
 }
 
 impl Fingerprint {
@@ -57,6 +60,7 @@ impl Fingerprint {
             title: thread.title.clone(),
             settled: thread.settled,
             agent: thread.agent.clone(),
+            last: thread.items.last().map(crate::threads::item_weight).unwrap_or(0),
         }
     }
 }
@@ -144,7 +148,15 @@ pub fn start(threads: &[Thread]) -> mpsc::UnboundedReceiver<Incoming> {
 /// other devices' threads for writing back.
 pub fn saved(threads: &[Thread]) {
     let mut state = STATE.lock().unwrap();
-    state.local = threads.iter().filter(|t| t.machine.is_none()).map(|t| (t.id, t.clone())).collect();
+    // Copy only the local threads that changed since the last save.
+    let ids: HashSet<u64> = threads.iter().filter(|t| t.machine.is_none()).map(|t| t.id).collect();
+    state.local.retain(|id, _| ids.contains(id));
+    for thread in threads.iter().filter(|t| t.machine.is_none()) {
+        let fp = Fingerprint::of(thread);
+        if state.local.get(&thread.id).map(Fingerprint::of) != Some(fp) {
+            state.local.insert(thread.id, thread.clone());
+        }
+    }
     // A thread nobody wrote in yet is not worth showing elsewhere.
     for thread in threads.iter().filter(|t| !t.items.is_empty()) {
         let Some(machine) = &thread.machine else { continue };

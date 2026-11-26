@@ -32,10 +32,8 @@ fn line_height(font_size: Pixels) -> Pixels {
 actions!(terminal, [Copy, Paste, SendTab, SendShiftTab, Clear]);
 
 pub fn init(cx: &mut App) {
+    // Copy, paste and clear are bound in `keymap`, so they can be changed.
     cx.bind_keys([
-        KeyBinding::new("cmd-c", Copy, Some("Terminal")),
-        KeyBinding::new("cmd-v", Paste, Some("Terminal")),
-        KeyBinding::new("cmd-k", Clear, Some("Terminal")),
         // The window root binds tab for focus navigation; keep it for the shell.
         KeyBinding::new("tab", SendTab, Some("Terminal")),
         KeyBinding::new("shift-tab", SendShiftTab, Some("Terminal")),

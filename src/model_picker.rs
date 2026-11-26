@@ -10,7 +10,6 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     input::{Input, InputEvent, InputState},
     spinner::Spinner,
-    tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -44,7 +43,9 @@ pub fn init(cx: &mut App) {
 
 pub enum ModelPickerEvent {
     /// `effort` is `None` when only the model was picked: keep the effort.
-    Select { agent: String, model: Option<String>, effort: Option<Option<String>> },
+    /// `done` closes the picker: an effort was picked, or the model has none
+    /// to pick, so there is nothing left to choose.
+    Select { agent: String, model: Option<String>, effort: Option<Option<String>>, done: bool },
     ToggleFavorite { agent: String, model: String },
 }
 
@@ -78,6 +79,9 @@ pub struct ModelPicker {
     effort: Option<String>,
     query: Entity<InputState>,
     highlighted: usize,
+    /// A model was just picked: its efforts stay on the right while the
+    /// pointer crosses other rows on the way there.
+    locked: bool,
     show_more: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -101,6 +105,7 @@ impl ModelPicker {
         let subscriptions = vec![cx.subscribe(&query, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Change => {
                 this.highlighted = 0;
+                this.locked = false;
                 // Searching covers every agent, so load them all.
                 let ids: Vec<String> = this.agents.iter().map(|a| a.id.clone()).collect();
                 for id in ids {
@@ -121,6 +126,7 @@ impl ModelPicker {
             effort: None,
             query,
             highlighted: 0,
+            locked: false,
             show_more: false,
             _subscriptions: subscriptions,
         }
@@ -160,6 +166,7 @@ impl ModelPicker {
         self.current = (agent.clone(), model);
         self.effort = effort;
         self.show_more = false;
+        self.locked = false;
         self.highlighted = self.current_index(cx).unwrap_or(0);
         self.query.update(cx, |query, cx| {
             query.set_value("", window, cx);
@@ -299,7 +306,12 @@ impl ModelPicker {
             agent: row.agent.clone(),
             model: Some(row.model.id.clone()),
             effort: None,
+            done: row.model.efforts.is_empty(),
         });
+        // Its efforts show next, for the second half of the choice.
+        self.highlighted = ix;
+        self.locked = true;
+        cx.notify();
     }
 
     fn select_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
@@ -315,6 +327,7 @@ impl ModelPicker {
         }
         self.tab = tab;
         self.highlighted = 0;
+        self.locked = false;
         self.show_more = false;
         cx.notify();
     }
@@ -326,6 +339,8 @@ impl ModelPicker {
                 .id(id)
                 .relative()
                 .size(px(40.))
+                // Kept full size; the rail scrolls when agents don't fit.
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -358,7 +373,7 @@ impl ModelPicker {
             .flex()
             .flex_col()
             .items_center()
-            .gap_1()
+            .gap(px(8.))
             .border_r_1()
             .border_color(theme.border)
             .child(
@@ -372,7 +387,7 @@ impl ModelPicker {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.select_tab(Tab::Favorites, cx))),
             )
-            .child(div().my_1().w(px(32.)).h(px(1.)).bg(theme.border));
+            .child(div().flex_none().w(px(32.)).h(px(1.)).bg(theme.border));
         for agent in &self.agents {
             let id = agent.id.clone();
             rail = rail.child(
@@ -381,10 +396,6 @@ impl ModelPicker {
                     self.tab == Tab::Agent(id.clone()),
                     agent_icon(&id, px(24.), cx),
                 )
-                .tooltip({
-                    let name = agent.name.clone();
-                    move |window, cx| Tooltip::new(name.clone()).text_size(TEXT).build(window, cx)
-                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select_tab(Tab::Agent(id.clone()), cx)
                 })),
@@ -398,6 +409,7 @@ impl ModelPicker {
         let favorite = self.is_favorite(&row.agent, &row.model.id);
         let current = self.is_current(row);
         let (agent, model) = (row.agent.clone(), row.model.id.clone());
+        let done = row.model.efforts.is_empty();
         div()
             .id(("model-row", ix))
             .group("model-row")
@@ -410,15 +422,11 @@ impl ModelPicker {
             .cursor_pointer()
             .when(ix == self.highlighted, |this| this.bg(theme.list_active))
             .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                if this.highlighted != ix {
+                if this.highlighted != ix && !this.locked {
                     this.highlighted = ix;
                     cx.notify();
                 }
             }))
-            .tooltip({
-                let label = self.agent_label(&row.agent);
-                move |window, cx| Tooltip::new(label.clone()).text_size(TEXT).build(window, cx)
-            })
             .child(agent_icon(&row.agent, px(16.), cx))
             .child(
                 div()
@@ -473,12 +481,16 @@ impl ModelPicker {
                         .child(format!("⌘{}", ix + 1)),
                 )
             })
-            .on_click(cx.listener(move |_, _, _, cx| {
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.highlighted = ix;
+                this.locked = true;
                 cx.emit(ModelPickerEvent::Select {
                     agent: agent.clone(),
                     model: Some(model.clone()),
                     effort: None,
-                })
+                    done,
+                });
+                cx.notify();
             }))
             .into_any_element()
     }
@@ -491,7 +503,8 @@ impl ModelPicker {
             .mx_3()
             .mt_2()
             .mb_2()
-            .h(px(32.))
+            .h(HEADER_H)
+            .flex_none()
             .flex()
             .items_center()
             .gap_2()
@@ -550,6 +563,7 @@ impl ModelPicker {
                                     agent: agent.clone(),
                                     model: Some(model.clone()),
                                     effort: Some(option.clone()),
+                                    done: true,
                                 })
                             })),
                     );
@@ -569,6 +583,9 @@ impl ModelPicker {
             .into_any_element()
     }
 }
+
+/// The height of the search box and the reasoning header, side by side.
+const HEADER_H: Pixels = px(36.);
 
 /// "Claude Opus 5.5" as "Opus 5.5", for the narrow reasoning header.
 fn short_model_name(name: &str) -> String {
@@ -701,12 +718,18 @@ impl Render for ModelPicker {
                     .flex()
                     .flex_col()
                     .child(
+                        // The same height and rule as the reasoning header, so
+                        // the two read as one line across the picker.
                         div()
                             .mx_3()
                             .mt_2()
                             .mb_2()
+                            .h(HEADER_H)
+                            .flex_none()
+                            .flex()
+                            .items_center()
                             .border_b_1()
-                            .border_color(theme.primary.opacity(0.6))
+                            .border_color(theme.border)
                             .text_size(TEXT)
                             .child(
                                 Input::new(&self.query).text_size(TEXT)

@@ -171,9 +171,10 @@ struct PeersFile {
     /// Only paired devices may use this machine, even through the account.
     #[serde(default)]
     strict: bool,
-    /// Travels inside the authorization code: whoever has it may ask to
-    /// connect, nothing more.
-    #[serde(default)]
+    /// Before codes expired, one secret served every authorization code.
+    /// Kept so old files still read; no longer honoured.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pair_secret: Option<String>,
     /// Names given here to account devices (relay id → name).
     #[serde(default)]
@@ -215,6 +216,9 @@ struct State {
     port: Option<u16>,
     tailscale_name: Option<String>,
     direct: HashMap<String, DirectStatus>,
+    /// The secret of the last authorization code copied, and when it stops
+    /// working. Kept in memory only: a restart voids it too.
+    offer: Option<(Vec<u8>, Instant)>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
@@ -224,6 +228,7 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         port: None,
         tailscale_name: None,
         direct: HashMap::new(),
+        offer: None,
     })
 });
 
@@ -329,6 +334,8 @@ fn code_chars(digest: &[u8], n: usize) -> String {
 }
 
 /// A short, human-comparable fingerprint of a public key: `ABCD-EFGH-…`.
+// Not shown in Settings any more; kept for checking a key by eye.
+#[allow(dead_code)]
 pub fn fingerprint(public_key: &str) -> String {
     let raw = parse_public_key(public_key).unwrap_or_default();
     let digest = Sha256::digest(&raw);
@@ -379,14 +386,27 @@ fn pairing_psk(secret: &[u8]) -> [u8; 32] {
     out
 }
 
-fn pair_secret() -> Vec<u8> {
-    let existing = STATE.lock().unwrap().file.pair_secret.clone();
-    if let Some(secret) = existing.and_then(|s| B64.decode(s).ok()).filter(|s| s.len() >= 16) {
-        return secret;
+/// How long a copied authorization code lets devices ask to connect.
+pub const INVITE_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// The secret of the authorization code still in force, if any.
+fn pair_secret() -> Option<Vec<u8>> {
+    let mut state = STATE.lock().unwrap();
+    match &state.offer {
+        Some((secret, until)) if Instant::now() < *until => Some(secret.clone()),
+        Some(_) => {
+            state.offer = None;
+            None
+        }
+        None => None,
     }
-    let secret: Vec<u8> = uuid::Uuid::new_v4().as_bytes().to_vec();
-    with_file(|file| file.pair_secret = Some(B64.encode(&secret)));
-    secret
+}
+
+/// How long the last copied authorization code still works.
+pub fn invite_expires_in() -> Option<Duration> {
+    pair_secret()?;
+    let until = STATE.lock().unwrap().offer.as_ref().map(|(_, until)| *until)?;
+    Some(until.saturating_duration_since(Instant::now()))
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +437,21 @@ struct InviteBody {
 }
 
 /// The text another CodeAny pastes to connect to this one.
+/// A fresh authorization code, good for `INVITE_TTL`. It replaces the last
+/// one: only the newest code lets a device ask to connect.
+pub fn new_invite() -> String {
+    let secret: Vec<u8> = uuid::Uuid::new_v4().as_bytes().to_vec();
+    STATE.lock().unwrap().offer = Some((secret.clone(), Instant::now() + INVITE_TTL));
+    invite_with(Some(secret))
+}
+
+/// This device as other devices should know it (name, key, addresses),
+/// without a secret: it cannot be used to ask to connect.
 pub fn invite() -> String {
+    invite_with(None)
+}
+
+fn invite_with(secret: Option<Vec<u8>>) -> String {
     let body = InviteBody {
         v: 1,
         name: crate::remote::this_name(),
@@ -427,7 +461,7 @@ pub fn invite() -> String {
             .map(|e| (e.host, e.port, kind_text(e.kind).into()))
             .collect(),
         dev: crate::remote::account().map(|(_, id)| id),
-        ps: Some(B64.encode(pair_secret())),
+        ps: secret.map(|s| B64.encode(s)),
     };
     format!("{INVITE_PREFIX}{}", B64.encode(serde_json::to_vec(&body).unwrap_or_default()))
 }
@@ -875,7 +909,11 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
         let mode = socket.read_u8().await?;
         let (pattern, psk) = match mode {
             MODE_PAIRED => (PATTERN_PAIRED, None),
-            MODE_REQUEST => (PATTERN_REQUEST, Some(pairing_psk(&pair_secret()))),
+            // Asking to connect needs the secret of a code still in force.
+            MODE_REQUEST => match pair_secret() {
+                Some(secret) => (PATTERN_REQUEST, Some(pairing_psk(&secret))),
+                None => bail!("no authorization code is in force"),
+            },
             // The authorization code only goes to the relay's streams: those
             // reach this port from loopback; LAN neighbours do not.
             MODE_INVITE if from.ip().is_loopback() => (PATTERN_INVITE, None),
@@ -909,7 +947,7 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
         .ok_or_else(|| anyhow!("closed before the request"))?;
     let request: Value = serde_json::from_str(&line)?;
     match mode {
-        MODE_INVITE => reply(&mut stream, json!({ "ok": true, "invite": invite() })).await,
+        MODE_INVITE => reply(&mut stream, json!({ "ok": true, "invite": new_invite() })).await,
         MODE_REQUEST => {
             let remote = remote.ok_or_else(|| anyhow!("no key"))?;
             let answer = match accept_request(&remote, &request["pair"]) {
@@ -1254,7 +1292,12 @@ async fn pair(invite: Invite) -> Result<Offer> {
     if let Ok((socket, _)) = dial(&invite.endpoints).await {
         match send_request(socket, &remote, psk, &request).await {
             Ok(()) => sent = true,
-            Err(err) => errors.push(format!("{err:#}")),
+            // Reached it, and it turned the request down: the code is no
+            // longer in force (expired, or a newer one was copied).
+            Err(err) => errors.push(tf(
+                "{name} did not accept this authorization code: it lasts 10 minutes and only the newest one works. Copy a new one there. ({err})",
+                &[("name", invite.name.clone()), ("err", format!("{err:#}"))],
+            )),
         }
     }
     if !sent {
@@ -1499,7 +1542,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             assert_eq!(self::port(), Some(port));
-            let host = parse_invite(&invite()).unwrap();
+            // No code copied yet: nobody may ask to connect.
+            assert!(parse_invite(&invite()).unwrap().pair_secret.is_none());
+            let host = parse_invite(&new_invite()).unwrap();
             let host_key = parse_public_key(&host.public_key).unwrap();
 
             // A device of our own making asks to connect.

@@ -18,7 +18,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agl::protocol::{AgentEvent, AgentInfo, EventEnvelope, WireMsg};
@@ -59,6 +59,129 @@ pub struct SessionOptions {
     pub effort: Option<String>,
     pub access: String,
     pub resume: Option<String>,
+    /// Appended to the agent's launch arguments (Settings → Agents); only
+    /// for this machine's agl, which alone accepts them.
+    pub extra_args: Vec<String>,
+}
+
+/// The executable chosen for an agent on this machine, if any. It is kept
+/// as agl's `custom_agents` entry of the same id: the built-in definition
+/// (arguments, environment, protocol) with only its command replaced.
+pub fn agent_command(agent: &str) -> Option<String> {
+    let cfg = agl::config::Config::load().ok()?;
+    cfg.custom_agents.iter().find(|c| c.id == agent).map(|c| c.command.clone())
+}
+
+/// Whether an agent's executable can be chosen here: agl's custom agents
+/// speak ACP, Claude's or Codex's protocol, not the one-shot ones.
+pub fn agent_command_editable(agent: &str) -> bool {
+    use agl::agents::Protocol;
+    builtin_agent(agent).is_none_or(|d| matches!(d.protocol, Protocol::Claude | Protocol::Codex | Protocol::Acp))
+}
+
+fn builtin_agent(agent: &str) -> Option<agl::agents::AgentDef> {
+    agl::agents::registry(&agl::config::Config::default()).into_iter().find(|d| d.id == agent)
+}
+
+/// Choose an agent's executable on this machine (`None` or blank: look it
+/// up on the PATH again); agl then re-reads its configuration.
+pub fn set_agent_command(agent: String, command: Option<String>) -> impl Future<Output = Result<()>> + Send + 'static {
+    spawn(async move {
+        use agl::agents::Protocol;
+        let command = command
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .map(|c| match c.strip_prefix("~/") {
+                Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest).to_string_lossy().into_owned(),
+                None => c,
+            });
+        let mut cfg = agl::config::Config::load()?;
+        cfg.custom_agents.retain(|c| c.id != agent);
+        if let Some(command) = command {
+            let def = builtin_agent(&agent).ok_or_else(|| anyhow!("unknown agent {agent}"))?;
+            let protocol = match def.protocol {
+                Protocol::Claude => "claude",
+                Protocol::Codex => "codex",
+                Protocol::Acp => "acp",
+                Protocol::Cursor | Protocol::Pi => bail!("this agent's executable cannot be changed"),
+            };
+            cfg.custom_agents.push(agl::config::CustomAgent {
+                id: def.id,
+                name: Some(def.name),
+                command,
+                args: def.args,
+                protocol: protocol.into(),
+                env: def.env.into_iter().collect(),
+                // agl keeps a built-in agent's own icon when none is named.
+                icon: None,
+            });
+        }
+        cfg.save()?;
+        backend(None).call("env.reload", json!({})).await?;
+        Ok(())
+    })
+}
+
+/// What the connection test asks for, and the answer it wants back.
+const TEST_PROMPT: &str = "Connection test. Reply with exactly CODEANY_OK and nothing else. Do not use any tools.";
+const TEST_ANSWER: &str = "CODEANY_OK";
+
+/// Run one short turn with an agent on this machine, the way a thread
+/// would (its executable and `extra_args` included), and time it. This
+/// uses the agent's own account, so it may use a little of its quota.
+pub fn test_agent(agent: String, extra_args: Vec<String>) -> impl Future<Output = Result<Duration>> + Send + 'static {
+    spawn(async move {
+        let started = Instant::now();
+        let dir = std::env::temp_dir().join("codeany-agent-test");
+        std::fs::create_dir_all(&dir)?;
+        let local = backend(None);
+        let meta = local
+            .open_session(
+                format!("codeany:test:{agent}:{}", uuid::Uuid::new_v4()),
+                SessionOptions {
+                    agent,
+                    cwd: Some(dir),
+                    model: None,
+                    effort: None,
+                    access: "read_only".into(),
+                    resume: None,
+                    extra_args,
+                },
+            )
+            .await?;
+        let mut events = local.subscribe(meta.id.clone());
+        let turn = uuid::Uuid::new_v4().to_string();
+        let sent = local.prompt(&meta.id, &turn, TEST_PROMPT.into(), "queue").await;
+        let answer = match sent {
+            Err(err) => Err(err),
+            Ok(()) => tokio::time::timeout(Duration::from_secs(60), async {
+                let mut text = String::new();
+                while let Some(event) = events.next().await {
+                    match event {
+                        AgentEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
+                        AgentEvent::TurnEnded { outcome, error, .. } => {
+                            return match outcome.as_str() {
+                                "completed" => Ok(text),
+                                _ => Err(anyhow!("{}", error.unwrap_or(outcome))),
+                            };
+                        }
+                        AgentEvent::Error { message } => return Err(anyhow!("{message}")),
+                        _ => {}
+                    }
+                }
+                Err(anyhow!("the agent stopped before answering"))
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("no answer within 60 seconds"))),
+        };
+        local.close(meta.id.clone());
+        let text = answer?;
+        if !text.contains(TEST_ANSWER) {
+            let shown: String = text.trim().chars().take(200).collect();
+            bail!("unexpected answer: {shown}");
+        }
+        Ok(started.elapsed())
+    })
 }
 
 /// Run agl as part of CodeAny: under CodeAny's name in messages, with its
@@ -376,6 +499,7 @@ impl Backend {
                             "access": opts.access,
                             "name": name,
                             "resume": opts.resume,
+                            "extra_args": opts.extra_args,
                         }),
                     )
                     .await?,
@@ -673,6 +797,7 @@ mod live_tests {
                 effort: None,
                 access: "ask".into(),
                 resume: None,
+                extra_args: Vec::new(),
             },
         ))
         .unwrap();

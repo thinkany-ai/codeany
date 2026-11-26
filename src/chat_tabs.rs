@@ -78,6 +78,28 @@ impl TabSet {
         closed
     }
 
+    /// Close every tab but `ix`; the threads the others showed.
+    pub fn close_others(&mut self, ix: usize) -> Vec<u64> {
+        if ix >= self.tabs.len() {
+            return Vec::new();
+        }
+        let kept = self.tabs[ix];
+        let closed = self.tabs.iter().enumerate().filter(|(i, _)| *i != ix).filter_map(|(_, t)| *t).collect();
+        self.tabs = vec![kept];
+        self.active = 0;
+        closed
+    }
+
+    /// Close the tabs after `ix`; the threads they showed.
+    pub fn close_right(&mut self, ix: usize) -> Vec<u64> {
+        if ix + 1 >= self.tabs.len() {
+            return Vec::new();
+        }
+        let closed = self.tabs.split_off(ix + 1).into_iter().flatten().collect();
+        self.active = self.active.min(ix);
+        closed
+    }
+
     pub fn select(&mut self, ix: usize) {
         if ix < self.tabs.len() {
             self.active = ix;
@@ -149,6 +171,16 @@ mod tests {
         assert_eq!((set.tabs.clone(), set.active), (vec![Some(2)], 0));
         set.close(0);
         assert_eq!((set.tabs.clone(), set.active), (vec![None], 0));
+    }
+
+    #[test]
+    fn closes_others_and_to_the_right() {
+        let mut set = TabSet { project: None, tabs: vec![Some(1), Some(2), None, Some(3)], active: 3 };
+        assert_eq!(set.close_right(1), vec![3]);
+        assert_eq!((set.tabs.clone(), set.active), (vec![Some(1), Some(2)], 1));
+        assert_eq!(set.close_others(1), vec![1]);
+        assert_eq!((set.tabs.clone(), set.active), (vec![Some(2)], 0));
+        assert!(set.close_right(0).is_empty());
     }
 
     #[test]

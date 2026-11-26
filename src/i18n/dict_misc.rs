@@ -5,6 +5,7 @@
 //! device pairing / relay messages.
 
 pub const ZH_CN: &[(&str, &str)] = &[
+    ("{name} did not accept this authorization code: it lasts 10 minutes and only the newest one works. Copy a new one there. ({err})", "{name} 没有接受这个授权码：授权码 10 分钟内有效，且只有最新复制的那个可用。请在那台设备上重新复制。（{err}）"),
     // Surface names and the surface host.
     ("Browser", "浏览器"),
     ("Terminal", "终端"),
@@ -112,6 +113,7 @@ pub const ZH_CN: &[(&str, &str)] = &[
 ];
 
 pub const ZH_TW: &[(&str, &str)] = &[
+    ("{name} did not accept this authorization code: it lasts 10 minutes and only the newest one works. Copy a new one there. ({err})", "{name} 沒有接受這個授權碼：授權碼 10 分鐘內有效，且只有最新複製的那個可用。請在那台裝置上重新複製。（{err}）"),
     // Surface names and the surface host.
     ("Browser", "瀏覽器"),
     ("Terminal", "終端機"),
@@ -219,6 +221,7 @@ pub const ZH_TW: &[(&str, &str)] = &[
 ];
 
 pub const JA: &[(&str, &str)] = &[
+    ("{name} did not accept this authorization code: it lasts 10 minutes and only the newest one works. Copy a new one there. ({err})", "{name} はこの認証コードを受け付けませんでした。コードの有効期間は 10 分で、最後にコピーしたものだけが使えます。そちらで新しくコピーしてください。（{err}）"),
     // Surface names and the surface host.
     ("Browser", "ブラウザ"),
     ("Terminal", "ターミナル"),
@@ -326,6 +329,7 @@ pub const JA: &[(&str, &str)] = &[
 ];
 
 pub const KO: &[(&str, &str)] = &[
+    ("{name} did not accept this authorization code: it lasts 10 minutes and only the newest one works. Copy a new one there. ({err})", "{name}에서 이 인증 코드를 받지 않았습니다. 코드는 10분 동안 유효하며 마지막으로 복사한 코드만 사용할 수 있습니다. 그 기기에서 다시 복사하세요. ({err})"),
     // Surface names and the surface host.
     ("Browser", "브라우저"),
     ("Terminal", "터미널"),

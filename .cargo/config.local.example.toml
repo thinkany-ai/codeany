@@ -1,0 +1,7 @@
+# Build against local checkouts of agl and nex next to this repo instead of
+# the commits pinned in Cargo.toml. Copy to .cargo/config.toml (gitignored).
+[patch."https://github.com/thinkany-ai/agl"]
+agl = { path = "../agl" }
+
+[patch."https://github.com/thinkany-ai/nex"]
+nex = { path = "../nex/crates/nex" }

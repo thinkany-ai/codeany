@@ -8,8 +8,10 @@ mod git;
 mod git_panel;
 mod i18n;
 mod icons;
+mod keymap;
 mod model_picker;
 mod settings;
+mod panel_views;
 mod paths;
 mod peer;
 mod project_avatar;
@@ -143,43 +145,15 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
 
-            cx.bind_keys([
-                KeyBinding::new("cmd-q", Quit, None),
-                KeyBinding::new("cmd-o", OpenFolder, Some("Workspace")),
-                KeyBinding::new("cmd-s", Save, Some("Workspace")),
-                KeyBinding::new("cmd-w", CloseTab, Some("Workspace")),
-                KeyBinding::new("cmd-b", ToggleSidebar, Some("Workspace")),
-                KeyBinding::new("cmd-shift-g", ToggleGitPanel, Some("Workspace")),
-                KeyBinding::new("ctrl-`", ToggleTerminal, Some("Workspace")),
-                KeyBinding::new("cmd-j", ToggleTerminal, Some("Workspace")),
-                KeyBinding::new("cmd-e", OpenEditor, Some("Workspace")),
-                KeyBinding::new("cmd-n", NewThread, Some("Workspace")),
-                KeyBinding::new("cmd-,", OpenSettings, Some("Workspace")),
-                KeyBinding::new("cmd-t", NewTab, Some("Workspace")),
-                KeyBinding::new("cmd-shift-t", ReopenTab, Some("Workspace")),
-                KeyBinding::new("ctrl-tab", NextTab, Some("Workspace")),
-                KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Workspace")),
-                KeyBinding::new("cmd-shift-]", NextTab, Some("Workspace")),
-                KeyBinding::new("cmd-shift-[", PrevTab, Some("Workspace")),
-                KeyBinding::new("cmd-alt-right", NextTab, Some("Workspace")),
-                KeyBinding::new("cmd-alt-left", PrevTab, Some("Workspace")),
-                KeyBinding::new("cmd-1", SelectTab1, Some("Workspace")),
-                KeyBinding::new("cmd-2", SelectTab2, Some("Workspace")),
-                KeyBinding::new("cmd-3", SelectTab3, Some("Workspace")),
-                KeyBinding::new("cmd-4", SelectTab4, Some("Workspace")),
-                KeyBinding::new("cmd-5", SelectTab5, Some("Workspace")),
-                KeyBinding::new("cmd-6", SelectTab6, Some("Workspace")),
-                KeyBinding::new("cmd-7", SelectTab7, Some("Workspace")),
-                KeyBinding::new("cmd-8", SelectTab8, Some("Workspace")),
-                KeyBinding::new("cmd-9", SelectLastTab, Some("Workspace")),
-                KeyBinding::new("cmd-alt-t", OpenSurface, Some("Workspace")),
-                KeyBinding::new("cmd-p", Search, Some("Workspace")),
-            ]);
             terminal::init(cx);
             model_picker::init(cx);
+            // Last: it keeps the bindings above and adds the rebindable ones.
+            keymap::init(cx);
 
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_app_quit(|_| async {
+                // The last save may still be on its way to the disk.
+                db::flush();
                 agl_bridge::shutdown();
             })
             .detach();
@@ -192,6 +166,7 @@ fn main() {
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
+                window_min_size: Some(workspace::minimum_window_size()),
                 titlebar: Some(TitlebarOptions {
                     title: Some("CodeAny".into()),
                     appears_transparent: true,

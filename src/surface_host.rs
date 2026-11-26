@@ -1,12 +1,12 @@
-//! The right-hand panel that hosts surface extensions. With nothing open,
-//! or after "+", it lists the surfaces to open in place.
+//! The right-hand panel that hosts surface extensions. With nothing open it
+//! shows a launcher; opened tabs can add surfaces from their dropdown.
 
 use crate::style::AppButtonStyle as _;
 
 use std::{path::PathBuf, rc::Rc};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Icon};
+use gpui_kit::component::{ActiveTheme as _, Icon, menu::DropdownMenu as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -16,8 +16,8 @@ use crate::{
     surfaces::{self, Extension, Host, Request, Surface, SurfaceContext},
 };
 use crate::style::{
-    chrome_button,
-    size::{ICON, TEXT},
+    chrome_button, layout,
+    size::{ICON, TAB_ACTION_ICON, TEXT},
 };
 
 pub enum SurfaceHostEvent {
@@ -132,7 +132,7 @@ impl SurfaceHost {
         cx.notify();
     }
 
-    /// ⌥⌘T and "+": list the surfaces in the panel; again hides the panel.
+    /// ⌥⌘T: list the surfaces in the panel; again hides the panel.
     pub fn show_launcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.visible && self.showing_launcher() {
             self.set_visible(false, window, cx);
@@ -185,6 +185,43 @@ impl SurfaceHost {
                 }
             }
         }
+    }
+
+    fn add_surface_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let host = cx.entity().downgrade();
+        chrome_button("add-surface")
+            .child(Icon::new(IconName::Plus).size(TAB_ACTION_ICON))
+            .accessibility_label(t("Open a surface"))
+            .dropdown_menu({
+                let host = host.clone();
+                move |menu, _, cx| {
+                    let Some(entity) = host.upgrade() else { return menu };
+                    let this = entity.read(cx);
+                    this.extensions.iter().fold(menu, |menu, extension| {
+                        let manifest = extension.manifest();
+                        let id = manifest.id;
+                        let disabled = this.index_of(id).is_none() && extension.unavailable(&this.ctx).is_some();
+                        let host = host.clone();
+                        menu.item(
+                            crate::style::menu_item_with_icon(t(manifest.name), manifest.icon.clone())
+                                .disabled(disabled)
+                                .on_click(move |_, window, cx| {
+                                    let _ = host.update(cx, |this, cx| this.open(id, window, cx));
+                                }),
+                        )
+                    })
+                }
+            })
+            .on_open_change(move |open, window, cx| {
+                let _ = host.update(cx, |this, cx| {
+                    // Native browser content otherwise covers the dropdown.
+                    if let Some(tab) = this.active.and_then(|ix| this.open.get(ix))
+                        && tab.extension.manifest().id == "browser"
+                    {
+                        tab.surface.set_active(this.visible && !this.showing_launcher() && !*open, window, cx);
+                    }
+                });
+            })
     }
 
     /// The surfaces to open, each with its key; unavailable ones dimmed.
@@ -287,7 +324,8 @@ impl Render for SurfaceHost {
             div()
                 .id(("surface-tab", ix))
                 .group("surface-tab")
-                .h(px(28.))
+                .flex_none()
+                .h(layout::CONTROL)
                 .pl_2()
                 .pr_1()
                 .flex()
@@ -295,6 +333,7 @@ impl Render for SurfaceHost {
                 .gap(px(6.))
                 .rounded_md()
                 .text_size(TEXT)
+                .whitespace_nowrap()
                 .cursor_pointer()
                 .when(active, |this| this.bg(theme.list_active).text_color(theme.foreground))
                 .when(!active, |this| {
@@ -315,7 +354,7 @@ impl Render for SurfaceHost {
                         .when(active, |this| this.visible())
                         .group_hover("surface-tab", |this| this.visible())
                         .hover(|this| this.bg(theme.list_hover))
-                        .child(Icon::new(IconName::X).size(ICON))
+                        .child(Icon::new(IconName::X).size(TAB_ACTION_ICON))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.close(ix, window, cx);
@@ -332,37 +371,35 @@ impl Render for SurfaceHost {
             .border_color(theme.border)
             .child(
                 div()
-                    .h(px(40.))
+                    .h(layout::HEADER)
+                    .pt(layout::HEADER_TOP_INSET)
                     .flex_none()
                     .px_2()
                     .flex()
                     .items_center()
                     .gap_1()
-                    .border_b_1()
-                    .border_color(theme.border)
                     .child(
                         div()
-                            .id("surface-tabs")
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .overflow_x_scroll()
-                            .children(tabs),
-                    )
-                    .child(
-                        chrome_button("add-surface")
-                            .app_icon(IconName::Plus)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.launcher = true;
-                                this.set_visible(true, window, cx);
-                            }))
-                            .app_tooltip(t("Open a surface (⌥⌘T)")),
+                            .child(
+                                div()
+                                    .id("surface-tabs")
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .overflow_x_scroll()
+                                    .children(tabs),
+                            )
+                            .when(!self.open.is_empty(), |this| this.child(self.add_surface_menu(cx))),
                     )
                     .child(
                         chrome_button("hide-surfaces")
-                            .app_icon(IconName::PanelRightClose)
+                            .app_icon(IconName::PanelRight)
                             .on_click(cx.listener(|this, _, window, cx| this.set_visible(false, window, cx)))
                             .app_tooltip(t("Hide panel")),
                     ),
