@@ -1062,29 +1062,53 @@ fn refresh_peer(invite: &Invite) {
 // Dialing (client side)
 // ---------------------------------------------------------------------------
 
-/// The first of `endpoints` to accept a TCP connection.
-async fn dial(endpoints: &[Endpoint]) -> Result<(TcpStream, Endpoint)> {
+/// Try every address at once and keep the first that gets all the way
+/// through `talk` (the handshake and whatever follows), not merely the
+/// first to accept a TCP connection: a proxy in TUN mode (Clash, Surge, …)
+/// accepts connections to any private address at once, then never answers,
+/// and would otherwise win the race against the address that works.
+async fn dial_with<T, F, Fut>(endpoints: &[Endpoint], talk: F) -> Result<(T, Endpoint)>
+where
+    F: Fn(TcpStream) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
     if endpoints.is_empty() {
         bail!(t("no address to reach the device at"));
     }
-    let attempts = endpoints.iter().cloned().map(|e| {
-        Box::pin(async move {
-            let socket = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect((e.host.as_str(), e.port)))
-                .await
-                .map_err(|_| anyhow!("timed out"))?
-                .map_err(|err| match err.kind() {
-                    std::io::ErrorKind::ConnectionRefused => anyhow!("refused"),
-                    std::io::ErrorKind::PermissionDenied => anyhow!("blocked"),
-                    _ => anyhow!("{err}"),
-                })?;
-            let _ = socket.set_nodelay(true);
-            anyhow::Ok((socket, e))
+    let mut attempts: futures::stream::FuturesUnordered<_> = endpoints
+        .iter()
+        .cloned()
+        .map(|e| {
+            let talk = &talk;
+            async move {
+                let socket = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect((e.host.as_str(), e.port)))
+                    .await
+                    .map_err(|_| anyhow!("timed out"))?
+                    .map_err(|err| match err.kind() {
+                        std::io::ErrorKind::ConnectionRefused => anyhow!("refused"),
+                        std::io::ErrorKind::PermissionDenied => anyhow!("blocked"),
+                        _ => anyhow!("{err}"),
+                    })?;
+                let _ = socket.set_nodelay(true);
+                let found = talk(socket).await?;
+                anyhow::Ok((found, e))
+            }
         })
-    });
-    futures::future::select_ok(attempts)
-        .await
-        .map(|(found, _)| found)
-        .map_err(|err| anyhow!("{err}"))
+        .collect();
+    let mut errors = Vec::new();
+    while let Some(attempt) = attempts.next().await {
+        match attempt {
+            Ok(found) => return Ok(found),
+            Err(err) => errors.push(err),
+        }
+    }
+    // The device's own answer says more than a silent address does.
+    let timeout = |e: &anyhow::Error| {
+        let text = format!("{e:#}");
+        text.contains("timed out") || text.contains(t("the device did not answer"))
+    };
+    let pos = errors.iter().position(|e| !timeout(e)).unwrap_or(0);
+    Err(errors.swap_remove(pos))
 }
 
 /// A relay stream as plain bytes (the `codeany.e2e` service is tcp).
@@ -1148,13 +1172,16 @@ async fn open_paired(peer: &Peer, allow_relay: bool) -> Result<(DuplexStream, Vi
         .is_some_and(|s| s.rtt_ms.is_none() && s.at.elapsed() < DIRECT_RETRY);
     let mut direct_error = None;
     if !(recently_failed && allow_relay && peer.nex_device_id.is_some()) {
-        match dial(&peer.endpoints).await {
-            Ok((socket, endpoint)) => {
-                let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, initiate(socket, MODE_PAIRED, Some(&remote), None))
+        let handshake = |socket: TcpStream| {
+            let remote = remote.clone();
+            async move {
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, initiate(socket, MODE_PAIRED, Some(&remote), None))
                     .await
-                    .map_err(|_| anyhow!("handshake timed out"))??;
-                return Ok((stream, Via::Direct(endpoint)));
+                    .map_err(|_| anyhow!("handshake timed out"))?
             }
+        };
+        match dial_with(&peer.endpoints, handshake).await {
+            Ok((stream, endpoint)) => return Ok((stream, Via::Direct(endpoint))),
             Err(err) => direct_error = Some(err),
         }
     }
@@ -1289,16 +1316,22 @@ async fn pair(invite: Invite) -> Result<Offer> {
     let request = json!({ "pair": { "name": crate::remote::this_name(), "invite": self::invite() } });
     let mut errors = Vec::new();
     let mut sent = false;
-    if let Ok((socket, _)) = dial(&invite.endpoints).await {
-        match send_request(socket, &remote, psk, &request).await {
-            Ok(()) => sent = true,
-            // Reached it, and it turned the request down: the code is no
-            // longer in force (expired, or a newer one was copied).
-            Err(err) => errors.push(tf(
+    let ask = |socket: TcpStream| send_request(socket, &remote, psk, &request);
+    match dial_with(&invite.endpoints, ask).await {
+        Ok(_) => sent = true,
+        // Reached it, and it turned the request down: the code is no
+        // longer in force (expired, or a newer one was copied).
+        Err(err) if format!("{err:#}").contains(t("the device refused the authorization code; copy it again")) => {
+            errors.push(tf(
                 "{name} did not accept this authorization code: it lasts 10 minutes and only the newest one works. Copy a new one there. ({err})",
                 &[("name", invite.name.clone()), ("err", format!("{err:#}"))],
-            )),
+            ))
         }
+        // Nothing answered directly: no address works from here.
+        Err(err) => errors.push(tf(
+            "cannot reach {name} directly ({reason}); both machines need the same Wi-Fi or Tailscale network, or the same account",
+            &[("name", invite.name.clone()), ("reason", format!("{err:#}"))],
+        )),
     }
     if !sent {
         if let (Some(nex_id), Some(_)) = (&invite.nex_device_id, crate::remote::account()) {
@@ -1638,5 +1671,44 @@ mod tests {
             assert!(find(&peer_id(&my_key)).is_none());
         });
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A TUN-mode proxy accepts a connection to any address and then says
+    /// nothing; the address that really answers must still win.
+    #[test]
+    fn a_silent_address_does_not_win_the_race() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let real = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = |l: &TcpListener| Endpoint {
+                host: "127.0.0.1".into(),
+                port: l.local_addr().unwrap().port(),
+                kind: NetKind::Lan,
+            };
+            let endpoints = vec![endpoint(&silent), endpoint(&real)];
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = silent.accept().await {
+                    held.push(socket);
+                }
+            });
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = real.accept().await {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = socket.write_all(b"!").await;
+                }
+            });
+            let talk = |mut socket: TcpStream| async move {
+                let mut byte = [0u8; 1];
+                tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut byte))
+                    .await
+                    .map_err(|_| anyhow!("timed out"))??;
+                anyhow::Ok(byte[0])
+            };
+            let (answer, used) = dial_with(&endpoints, talk).await.unwrap();
+            assert_eq!(answer, b'!');
+            assert_eq!(used, endpoints[1]);
+        });
     }
 }
