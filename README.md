@@ -96,6 +96,15 @@ are served at `https://cdn.codeany.ai/releases/<version>/`, including the DMG
 for fresh installs and the ZIP for Sparkle updates. Keep a secure backup of
 the CodeAny Sparkle private key for future releases.
 
+## Linux and Windows
+
+The `Linux & Windows` GitHub Actions workflow (`.github/workflows/linux-windows.yml`)
+builds, tests and packages CodeAny on each push to `main`, each `v*` tag and on
+demand. Its artifacts are a `.deb` and a `.tar.gz` for x86_64 Linux, and an
+Inno Setup installer (`*_setup.exe`) and a `.zip` for x64 Windows. These builds
+are not signed and do not update themselves yet. Linux needs WebKitGTK 4.1 and
+Vulkan; packaging files live in `packaging/`.
+
 ## Layout
 
 | File | What it does |

@@ -95,8 +95,13 @@ struct AgentEditor {
     id: String,
     path: Entity<InputState>,
     args: Entity<TextareaState>,
+    /// `NAME=value` per line, set on the agent's processes.
+    env: Entity<TextareaState>,
     /// The executable when the editor opened, to tell whether it changed.
     original_command: String,
+    /// Whether that executable was chosen here, not found on the PATH.
+    custom_command: bool,
+    original_env: Vec<(String, String)>,
     icon: IconChoice,
     error: Option<String>,
     saving: bool,
@@ -166,6 +171,8 @@ pub struct Settings {
     link: Option<Link>,
     /// The authorization code was just copied.
     copied: bool,
+    /// The connection code was just copied.
+    code_copied: bool,
     /// The agent whose settings are open, with its inputs.
     agent_editor: Option<AgentEditor>,
     /// Connection tests, by agent: running, or how the last one went.
@@ -223,6 +230,7 @@ impl Settings {
             confirm: None,
             link: None,
             copied: false,
+            code_copied: false,
             measuring: false,
             _devices_poll: None,
             _link_poll: None,
@@ -573,7 +581,11 @@ impl Settings {
 
     fn open_agent_editor(&mut self, agent: &str, detected: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         // The executable in use: the one chosen here, else the one found.
-        let command = crate::agl_bridge::agent_command(agent).or_else(|| detected.clone()).unwrap_or_default();
+        let custom = crate::agl_bridge::agent_command(agent);
+        let custom_command = custom.is_some();
+        let command = custom.or_else(|| detected.clone()).unwrap_or_default();
+        let env = crate::agl_bridge::agent_env(agent);
+        let env_text = env_text(&env);
         let args = self
             .agent_panel
             .upgrade()
@@ -590,11 +602,19 @@ impl Settings {
             input.set_value(args.clone(), window, cx);
             input
         });
+        let env_input = cx.new(|cx| {
+            let mut input = TextareaState::new(window, cx).auto_grow(3, 8).placeholder("ANTHROPIC_BASE_URL=https://…\nMY_API_KEY");
+            input.set_value(env_text, window, cx);
+            input
+        });
         self.agent_editor = Some(AgentEditor {
             id: agent.to_string(),
             path,
             args: args_input,
+            env: env_input,
             original_command: command,
+            custom_command,
+            original_env: env,
             icon: IconChoice::Keep,
             error: None,
             saving: false,
@@ -637,6 +657,14 @@ impl Settings {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect();
+        let env = match parse_env(&editor.env.read(cx).value()) {
+            Ok(env) => env,
+            Err(err) => {
+                editor.error = Some(err);
+                cx.notify();
+                return;
+            }
+        };
         let icon = std::mem::replace(&mut editor.icon, IconChoice::Keep);
         let icon_result = match &icon {
             IconChoice::Keep => Ok(()),
@@ -652,7 +680,8 @@ impl Settings {
             panel.update(cx, |panel, cx| panel.set_agent_args(&id, args, cx));
         }
         let command_changed = command != editor.original_command;
-        if !command_changed {
+        let env_changed = env != editor.original_env;
+        if !command_changed && !env_changed {
             self.agent_editor = None;
             self.agent_tests.remove(&id);
             cx.refresh_windows();
@@ -661,7 +690,9 @@ impl Settings {
         }
         editor.saving = true;
         editor.error = None;
-        let save = crate::agl_bridge::set_agent_command(id.clone(), Some(command));
+        // An executable found on the PATH and left alone stays looked up.
+        let command = (command_changed || editor.custom_command).then_some(command);
+        let save = crate::agl_bridge::set_agent_launch(id.clone(), command, env);
         cx.spawn(async move |this, cx| {
             let result = save.await;
             this.update(cx, |this, cx| {
@@ -837,12 +868,14 @@ impl Settings {
             .unwrap_or(false);
         let test = self.agent_tests.get(agent).cloned();
         let testing = matches!(test, Some(AgentTest::Running));
-        let path_changed = editor.path.read(cx).value().trim() != editor.original_command.trim();
+        let env_changed = parse_env(&editor.env.read(cx).value()).ok().as_ref() != Some(&editor.original_env);
+        // The test runs what agl has saved.
+        let path_changed = editor.path.read(cx).value().trim() != editor.original_command.trim() || env_changed;
         let test_line: AnyElement = match test {
             _ if path_changed => div()
                 .text_size(TEXT)
                 .text_color(theme.muted_foreground)
-                .child(t("Save to test the new executable."))
+                .child(t(if env_changed { "Save to test with the new environment." } else { "Save to test the new executable." }))
                 .into_any_element(),
             Some(AgentTest::Passed(took)) => div()
                 .flex()
@@ -967,6 +1000,39 @@ impl Settings {
                                     .text_color(theme.muted_foreground)
                                     .child(t("One per line, added after the agent's own arguments. New threads use them.")),
                             ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .child(label("Environment"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.input)
+                                    .when(!editable, |this| this.opacity(0.5))
+                                    .child(
+                                        Textarea::new(&editor.env)
+                                            .text_size(TEXT)
+                                            .appearance(false)
+                                            .bordered(false)
+                                            .disabled(!editable),
+                                    ),
+                            )
+                            .child(div().text_size(TEXT).text_color(theme.muted_foreground).child(if editable {
+                                t("One per line: NAME=value sets a value, stored in plain text on this machine; NAME alone passes that variable from your shell, read each time the agent starts. New threads use them.")
+                            } else {
+                                t("This agent's environment cannot be changed here.")
+                            })),
                     ),
             )
             .when_some(editor.error.clone(), |this, err| this.child(Self::error_banner(err, cx)))
@@ -1212,7 +1278,8 @@ impl Settings {
                             ),
                     ),
             )
-            .child(div().mt(px(10.)).mb(px(14.)).child(update_row))
+            // A row, so the button keeps its own width.
+            .child(div().mt(px(10.)).mb(px(14.)).flex().child(update_row))
             .child(
                 div()
                     .mb(px(18.))
@@ -2220,10 +2287,39 @@ impl Settings {
                             .child(
                                 div()
                                     .py_2()
-                                    .text_size(px(28.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .font_family("Menlo")
-                                    .child(offer.code.clone()),
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_size(px(28.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .font_family("Menlo")
+                                            .child(offer.code.clone()),
+                                    )
+                                    .child({
+                                        let code = offer.code.clone();
+                                        let copied = self.code_copied;
+                                        Button::new("copy-connection-code")
+                                            .outline()
+                                            .small()
+                                            .app_icon(if copied { IconName::Check } else { IconName::Copy })
+                                            .app_label(if copied { t("Copied") } else { t("Copy") })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                                                this.code_copied = true;
+                                                cx.notify();
+                                                cx.spawn(async move |this, cx| {
+                                                    cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
+                                                    this.update(cx, |this, cx| {
+                                                        this.code_copied = false;
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                                })
+                                                .detach();
+                                            }))
+                                    }),
                             )
                             .child(muted(tf("Waiting for {name} to verify…", &[("name", offer.name.clone())])));
                     }
@@ -2326,16 +2422,15 @@ impl Settings {
                 .into_any_element()
         };
 
-        // What it is and how it is doing.
-        let mut detail = Vec::new();
-        if let Some(app) = device.app.as_deref() {
-            detail.push(match app {
-                "codeany" => "CodeAny".to_string(),
-                "termany" => "Termany".to_string(),
-                other => other.to_string(),
-            });
+        // How it is doing. The app is named only when it is not CodeAny (a
+        // Termany in the same account); how it is reached shows in the
+        // encryption badge and the round trips.
+        let mut detail: Vec<String> = Vec::new();
+        match device.app.as_deref() {
+            None | Some("codeany") => {}
+            Some("termany") => detail.push("Termany".into()),
+            Some(other) => detail.push(other.into()),
         }
-        detail.push(if device.via_account { t("In your account").into() } else { t("Connected by code").into() });
         if pending {
             detail.push(t("waiting for it to verify the connection code").into());
         } else if device.requires_pairing {
@@ -2587,5 +2682,78 @@ fn direct_hint(note: &str) -> String {
         t("It has no LAN or Tailscale address to reach it at.").into()
     } else {
         tf("Not reachable directly: {note}", &[("note", note.to_string())])
+    }
+}
+
+/// What a bare `NAME` line is stored as.
+fn shell_ref(name: &str) -> String {
+    format!("${{{name}}}")
+}
+
+/// The editor's text for saved variables: a bare name for one taken from
+/// the shell.
+fn env_text(env: &[(String, String)]) -> String {
+    env.iter()
+        .map(|(k, v)| if *v == shell_ref(k) { k.clone() } else { format!("{k}={v}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `NAME=value` or `NAME` lines (blank lines and `#` comments skipped),
+/// sorted by name.
+fn parse_env(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut env = std::collections::BTreeMap::new();
+    for (ix, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let valid = |name: &str| {
+            name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        match line.split_once('=') {
+            Some((name, value)) if valid(name.trim()) => {
+                let value = value.trim();
+                // Quotes as a shell would write them.
+                let value = value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                    .unwrap_or(value);
+                env.insert(name.trim().to_string(), value.to_string());
+            }
+            // A bare name: its value from the user's shell, at each launch
+            // (agl expands `${NAME}`).
+            None if valid(line) => {
+                env.insert(line.to_string(), shell_ref(line));
+            }
+            _ => return Err(tf("Environment line {n}: expected NAME=value.", &[("n", (ix + 1).to_string())])),
+        }
+    }
+    Ok(env.into_iter().collect())
+}
+
+#[cfg(test)]
+mod env_tests {
+    #[test]
+    fn parses_env_lines() {
+        let env = super::parse_env("# key\nB=2\nexport A=\"x y\"\n\nC='z'\nD=a=b").unwrap();
+        assert_eq!(
+            env,
+            vec![
+                ("A".into(), "x y".into()),
+                ("B".into(), "2".into()),
+                ("C".into(), "z".into()),
+                ("D".into(), "a=b".into())
+            ]
+        );
+        assert!(super::parse_env("1BAD=x").is_err());
+        assert_eq!(super::parse_env("MY_KEY").unwrap(), vec![("MY_KEY".into(), "${MY_KEY}".into())]);
+        let saved = super::parse_env("MY_KEY\nB=2").unwrap();
+        assert_eq!(super::env_text(&saved), "B=2\nMY_KEY");
+        assert!(super::parse_env("1BAD").is_err());
+        assert_eq!(super::parse_env("EMPTY=").unwrap(), vec![("EMPTY".into(), String::new())]);
     }
 }

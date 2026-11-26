@@ -31,6 +31,8 @@ use crate::{
     i18n::{t, tf},
     model_picker::{ModelPicker, ModelPickerEvent, model_display_name},
     project_avatar::{ProjectAvatar, avatar_size},
+    project_filter::{ProjectFilter, ProjectFilterEvent},
+    workspace_switcher::{MenuDevice, WorkspaceMenu, WorkspaceMenuEvent},
     remote,
     remote_folders::{RemoteFolders, RemoteFoldersEvent},
     threads::{
@@ -89,6 +91,7 @@ pub enum AgentPanelEvent {
     SwitchProject(Option<PathBuf>),
     OpenFolder,
     TurnFinished,
+    OpenSettings,
 }
 
 /// A thread's live agl session, for its current agent.
@@ -134,10 +137,16 @@ pub struct AgentPanel {
     machine: Option<String>,
     /// The account's other machines that share their agents.
     hosts: Vec<remote::Device>,
-    /// Other devices whose thread list is folded in the sidebar.
-    folded_devices: HashSet<String>,
     folders: Entity<RemoteFolders>,
     folders_open: bool,
+    /// The workspace menu at the top of the sidebar, and whether it is open.
+    workspace_menu: Entity<WorkspaceMenu>,
+    workspace_menu_open: bool,
+    /// The Projects section's filter menu, and whether it is open.
+    project_filter: Entity<ProjectFilter>,
+    project_filter_open: bool,
+    /// The one project the sidebar shows, picked in that menu; `None` shows all.
+    shown_project: Option<PathBuf>,
     /// The agent, model, effort and access level for the next new thread.
     agent: Option<String>,
     model: Option<String>,
@@ -208,7 +217,23 @@ impl AgentPanel {
         });
         let picker = cx.new(|cx| ModelPicker::new(window, cx));
         let folders = cx.new(|_| RemoteFolders::new());
+        let project_filter = cx.new(|cx| ProjectFilter::new(window, cx));
+        let workspace_menu = cx.new(|cx| WorkspaceMenu::new(window, cx));
         let subscriptions = vec![
+            cx.subscribe_in(&workspace_menu, window, Self::on_workspace_menu),
+            cx.subscribe(&project_filter, |this, _, event: &ProjectFilterEvent, cx| {
+                match event {
+                    ProjectFilterEvent::Pick(project) => {
+                        this.shown_project = project.clone();
+                        if let Some(project) = project {
+                            this.expanded_projects.insert(project.clone());
+                        }
+                        this.project_filter_open = false;
+                    }
+                    ProjectFilterEvent::SortByName(by_name) => this.sort_repositories_by_name = *by_name,
+                }
+                cx.notify();
+            }),
             cx.subscribe_in(
                 &composer,
                 window,
@@ -263,6 +288,9 @@ impl AgentPanel {
         .detach();
 
         let mut store = Store::load();
+        // Everything from before workspaces lands in one.
+        store.ensure_workspaces(&remote::this_name());
+        store.machine = store.active_workspace().and_then(|w| w.device.clone());
         // Threads written here by other devices, and theirs to mirror.
         let mut inbox = crate::sync::start(&store.threads);
         cx.spawn(async move |this, cx| {
@@ -305,9 +333,13 @@ impl AgentPanel {
             agents_machine: store.machine.clone(),
             agents_cache: HashMap::new(),
             hosts: Vec::new(),
-            folded_devices: HashSet::new(),
             folders,
             folders_open: false,
+            workspace_menu,
+            workspace_menu_open: false,
+            project_filter,
+            project_filter_open: false,
+            shown_project: None,
             agent: store.agent.clone(),
             model: store.model.clone(),
             effort: store.effort.clone(),
@@ -358,6 +390,13 @@ impl AgentPanel {
             }
             self.store.projects.retain(|p| p != project);
             self.store.projects.insert(0, project.clone());
+            // A folder opened here joins the workspace shown, when it is this device's.
+            let active = self.store.active_workspace.clone();
+            if let Some(ws) = self.store.workspaces.iter_mut().find(|w| Some(&w.id) == active.as_ref() && w.device.is_none()) {
+                if !ws.projects.contains(project) {
+                    ws.projects.insert(0, project.clone());
+                }
+            }
         }
         if self.store.last_project != project || project.is_some() {
             self.store.last_project = project.clone();
@@ -389,30 +428,40 @@ impl AgentPanel {
 
     // ---- Tabs ---------------------------------------------------------------
 
-    /// The open project's tabs, created on first use.
+    /// The open project's tabs in the workspace shown, if any yet.
+    fn tab_set(&self) -> Option<&TabSet> {
+        let workspace = &self.store.active_workspace;
+        self.store.tabs.iter().find(|s| s.project == self.project && &s.workspace == workspace)
+    }
+
+    /// The open project's tabs in the workspace shown, created on first use.
     fn tab_set_mut(&mut self) -> &mut TabSet {
-        let ix = match self.store.tabs.iter().position(|s| s.project == self.project) {
+        let workspace = self.store.active_workspace.clone();
+        let ix = match self.store.tabs.iter().position(|s| s.project == self.project && s.workspace == workspace) {
             Some(ix) => ix,
-            None => {
-                self.store.tabs.push(TabSet::new(self.project.clone()));
-                self.store.tabs.len() - 1
-            }
+            None => match self.store.tabs.iter().position(|s| s.project == self.project && s.workspace.is_none()) {
+                // Tabs from before workspaces join the first one to open them.
+                Some(ix) => {
+                    self.store.tabs[ix].workspace = workspace;
+                    ix
+                }
+                None => {
+                    self.store.tabs.push(TabSet::new(self.project.clone(), workspace));
+                    self.store.tabs.len() - 1
+                }
+            },
         };
         &mut self.store.tabs[ix]
     }
 
     /// Whether any tab shows a thread; a lone new tab cannot be closed.
     pub fn has_open_thread(&self) -> bool {
-        self.store
-            .tabs
-            .iter()
-            .find(|s| s.project == self.project)
-            .is_some_and(|s| s.tabs.iter().any(Option::is_some))
+        self.tab_set().is_some_and(|s| s.tabs.iter().any(Option::is_some))
     }
 
     /// The open project's tabs, and the active one.
     pub fn tab_items(&self) -> (Vec<ChatTab>, usize) {
-        let (tabs, active) = match self.store.tabs.iter().find(|s| s.project == self.project) {
+        let (tabs, active) = match self.tab_set() {
             Some(set) => (set.tabs.clone(), set.active),
             None => (vec![self.active], 0),
         };
@@ -532,10 +581,11 @@ impl AgentPanel {
     /// Whether a tab of its project shows `id`.
     fn is_open_in_tab(&self, thread: &Thread) -> bool {
         let project = if thread.machine.is_some() { &self.project } else { &thread.project };
+        let workspace = self.store.workspace_of(thread).map(|w| w.id.clone());
         self.store
             .tabs
             .iter()
-            .find(|s| &s.project == project)
+            .find(|s| &s.project == project && s.workspace == workspace)
             .is_some_and(|s| s.tabs.contains(&Some(thread.id)))
     }
 
@@ -599,6 +649,16 @@ impl AgentPanel {
         }
         let project = thread.project.clone();
         let remote = thread.machine.is_some();
+        // The sidebar shows the workspace the thread is in.
+        let home = self.store.workspace_of(thread).map(|w| w.id.clone());
+        let switched = home.is_some() && home != self.store.active_workspace;
+        if switched {
+            self.store.active_workspace = home;
+            self.shown_project = None;
+            self.machine = thread.machine.clone();
+            self.store.machine = self.machine.clone();
+            self.store.save();
+        }
         self.active = Some(id);
         self.unread.remove(&id);
         // A folder on another machine is not one to open here.
@@ -606,6 +666,9 @@ impl AgentPanel {
             cx.emit(AgentPanelEvent::SwitchProject(project.clone()));
             self.project = project;
             // Another project's thread gets a tab there, beside its others.
+            self.tab_set_mut().open(id);
+        } else if switched {
+            // So does another workspace's.
             self.tab_set_mut().open(id);
         } else {
             // Like following a link: the active tab shows it.
@@ -729,7 +792,13 @@ impl AgentPanel {
         let machine = thread.machine.clone();
         let agent = thread.agent.clone();
         let name = thread.session_name();
-        let opts = SessionOptions {
+        // Another device's thread with no project works in a folder of its own
+        // there, as one here does; a device too old to make one uses its home.
+        let remote_dir = (thread.machine.is_some() && thread.project.is_none()).then(|| {
+            let backend = agl_bridge::backend_for(thread.machine.as_deref(), "codeany");
+            async move { backend.call("threads.dir", serde_json::json!({ "id": id })).await }
+        });
+        let mut opts = SessionOptions {
             agent: thread.agent.clone(),
             cwd: thread.cwd(),
             model: thread.model.clone(),
@@ -753,6 +822,11 @@ impl AgentPanel {
                     .map_err(|err| format!("Cannot create the worktree: {err}"))?;
                 // The workspace shows the worktree now that it exists.
                 this.update(cx, |_, cx| cx.notify()).ok();
+            }
+            if let Some(dir) = remote_dir {
+                if let Ok(reply) = dir.await {
+                    opts.cwd = reply["path"].as_str().map(PathBuf::from);
+                }
             }
             let meta = agl_bridge::backend(machine.as_deref())
                 .open_session(name, opts)
@@ -897,6 +971,7 @@ impl AgentPanel {
                     }
                     None => Thread::new(self.project.clone(), agent, self.access.clone()),
                 };
+                thread.workspace = self.store.active_workspace.clone();
                 thread.model = self.model.clone();
                 thread.effort = self.effort.clone();
                 thread.title = if text.is_empty() {
@@ -1058,6 +1133,13 @@ impl AgentPanel {
         }
     }
 
+    /// Whether `machine` can run a conversation now: its connection is up,
+    /// or the device list says it is reachable.
+    fn machine_online(&self, machine: &str) -> bool {
+        agl_bridge::is_connected(machine)
+            || self.hosts.iter().any(|h| h.id == machine && h.usable())
+    }
+
     /// A machine's name: as the relay lists it, else as it was when a
     /// thread started there.
     fn machine_name(&self, id: &str, fallback: Option<&str>) -> String {
@@ -1102,6 +1184,10 @@ impl AgentPanel {
 
     /// Run the next new thread on `machine`; `None` is this one.
     fn set_machine(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
+        // Another device has other projects.
+        if machine != self.machine {
+            self.shown_project = None;
+        }
         self.machine = machine.clone();
         self.store.machine = machine;
         self.store.save();
@@ -1246,11 +1332,38 @@ impl AgentPanel {
                     }
                     None => self.store.threads.push(thread),
                 }
+                // A device seen for the first time gets a workspace to show it in.
+                self.store.ensure_workspaces(&remote::this_name());
                 if self.active == Some(id) {
                     self.follow_to_bottom();
                 }
                 self.store.save();
                 cx.notify();
+            }
+            Incoming::PutWorkspace(ws) => {
+                match self.store.workspaces.iter_mut().find(|w| w.id == ws.id) {
+                    Some(existing) => *existing = ws,
+                    None => self.store.workspaces.push(ws),
+                }
+                self.store.save();
+                cx.notify();
+            }
+            Incoming::Workspaces { machine, list } => {
+                let mut changed = false;
+                for ws in self.store.workspaces.iter_mut().filter(|w| w.device.as_deref() == Some(machine.as_str())) {
+                    if let Some(theirs) = list.iter().find(|r| r.id == ws.id) {
+                        if (&ws.title, &ws.icon, &ws.projects) != (&theirs.title, &theirs.icon, &theirs.projects) {
+                            ws.title = theirs.title.clone();
+                            ws.icon = theirs.icon.clone();
+                            ws.projects = theirs.projects.clone();
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    self.store.save();
+                    cx.notify();
+                }
             }
             Incoming::Delete(id) => {
                 if self.store.threads.iter().any(|t| t.id == id && t.machine.is_none()) {
@@ -1753,6 +1866,25 @@ impl AgentPanel {
     }
 
     fn new_thread_in_project(&mut self, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        // Another device's project is a folder there: the new thread works
+        // in it on that device; this window's project stays as it is.
+        if let Some(machine) = self.machine.clone() {
+            if let Some(dir) = &project {
+                let active = self.store.active_workspace.clone();
+                if let Some(ws) = self.store.workspaces.iter_mut().find(|w| Some(&w.id) == active.as_ref()) {
+                    if !ws.projects.contains(dir) {
+                        ws.projects.insert(0, dir.clone());
+                    }
+                }
+            }
+            match project {
+                Some(dir) => self.store.remote_dirs.insert(machine, dir),
+                None => self.store.remote_dirs.remove(&machine),
+            };
+            self.store.save();
+            self.new_thread(window, cx);
+            return;
+        }
         if project != self.project {
             cx.emit(AgentPanelEvent::SwitchProject(project.clone()));
             self.project = project;
@@ -1848,7 +1980,9 @@ impl AgentPanel {
                     .when(open, |this| this.font_weight(FontWeight::MEDIUM))
                     .child(display_title(&thread.title)),
             )
-            .when_some(thread.machine.as_deref(), |this, machine| {
+            // The sidebar shows one device at a time; only a thread from
+            // another one (in a tab, say) names its device.
+            .when_some(thread.machine.as_deref().filter(|m| self.machine.as_deref() != Some(*m)), |this, machine| {
                 let name = self.machine_name(machine, thread.machine_name.as_deref());
                 this.child(
                     div().flex_none().max_w(px(90.)).overflow_hidden().text_ellipsis().whitespace_nowrap()
@@ -1932,27 +2066,263 @@ impl AgentPanel {
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx))),
             )
             .when(section == SidebarSection::Projects, |this| {
-                let panel = cx.entity().downgrade();
-                let by_name = self.sort_repositories_by_name;
-                this.child(crate::style::with_tooltip(
-                    crate::style::chrome_button("repository-sort")
-                        .child(Icon::new(IconName::ListFilter).size(ICON))
-                        .text_color(theme.muted_foreground)
-                        .accessibility_label("Sort projects")
-                        .dropdown_menu(move |mut menu, _, _| {
-                            for (label, value) in [("Recently active", false), ("Name", true)] {
-                                let panel = panel.clone();
-                                menu = menu.item(crate::style::menu_item(t(label)).checked(by_name == value)
-                                    .on_click(move |_, _, cx| {
-                                        panel.update(cx, |this, cx| { this.sort_repositories_by_name = value; cx.notify(); }).ok();
-                                    }));
+                let filtering = self.shown_project.is_some();
+                let filter = self.project_filter.clone();
+                this.child(
+                    Popover::new("project-filter")
+                        .anchor(Anchor::TopRight)
+                        .open(self.project_filter_open)
+                        .on_open_change(cx.listener(|this, open: &bool, window, cx| {
+                            this.project_filter_open = *open;
+                            if *open {
+                                let projects = this.device_projects();
+                                let (shown, by_name) = (this.shown_project.clone(), this.sort_repositories_by_name);
+                                this.project_filter.update(cx, |filter, cx| filter.open(projects, shown, by_name, window, cx));
                             }
-                            menu
-                        }),
-                    t("Sort projects"),
-                ))
+                            cx.notify();
+                        }))
+                        .p_0()
+                        .trigger(
+                            crate::style::chrome_button("project-filter-button")
+                                .child(Icon::new(IconName::ListFilter).size(ICON))
+                                // Showing one project: say so.
+                                .text_color(if filtering { theme.primary } else { theme.muted_foreground })
+                                .accessibility_label(t("Filter projects")),
+                        )
+                        .content(move |_, _, _| filter.clone()),
+                )
             })
             .child(action)
+            .into_any_element()
+    }
+
+    /// The projects of the device the sidebar shows, most recently active
+    /// first: this one's opened folders, another's last picked folder, and
+    /// the folders their threads work in.
+    fn device_projects(&self) -> Vec<PathBuf> {
+        let mut projects: Vec<PathBuf> = self.store.active_workspace().map(|w| w.projects.clone()).unwrap_or_default();
+        let mut latest: HashMap<PathBuf, u64> = HashMap::new();
+        for thread in self.store.threads.iter().filter(|t| !t.settled && self.in_active_workspace(t)) {
+            if let Some(project) = &thread.project {
+                let at = latest.entry(project.clone()).or_default();
+                *at = (*at).max(thread.updated_at);
+                if !projects.contains(project) {
+                    projects.push(project.clone());
+                }
+            }
+        }
+        projects.sort_by_key(|p| std::cmp::Reverse(latest.get(p).copied().unwrap_or(0)));
+        projects
+    }
+
+    /// Whether `thread` is in the workspace the window shows.
+    fn in_active_workspace(&self, thread: &Thread) -> bool {
+        let active = self.store.active_workspace.as_ref();
+        active.is_some() && self.store.workspace_of(thread).map(|w| &w.id) == active
+    }
+
+    /// The other devices a workspace can live on, for the workspace menu.
+    fn menu_devices(&self) -> Vec<MenuDevice> {
+        let mut devices: Vec<MenuDevice> = self
+            .hosts
+            .iter()
+            .map(|h| MenuDevice { id: h.id.clone(), name: h.name.clone(), online: self.machine_online(&h.id) })
+            .collect();
+        for w in &self.store.workspaces {
+            if let Some(id) = &w.device {
+                if !devices.iter().any(|d| &d.id == id) {
+                    let name = self.machine_name(id, w.device_name.as_deref());
+                    devices.push(MenuDevice { id: id.clone(), name, online: self.machine_online(id) });
+                }
+            }
+        }
+        devices
+    }
+
+    /// Show workspace `id`: its projects and chats, its device for new threads.
+    /// Run new threads on `device`: show its workspace, made if it has none.
+    fn switch_device(&mut self, device: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.store.active_workspace().filter(|w| w.device == device).map(|w| w.id.clone());
+        let id = current.or_else(|| self.store.workspaces.iter().find(|w| w.device == device).map(|w| w.id.clone()));
+        let id = match id {
+            Some(id) => id,
+            None => {
+                let Some(machine) = device.clone() else { return };
+                let name = self.machine_name(&machine, None);
+                let ws = crate::threads::Workspace::new(name.clone(), Some("💻".into()), Some(machine.clone()), Some(name));
+                let id = ws.id.clone();
+                // One on another device is that device's record.
+                let put = crate::sync::put_workspace(machine, ws.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Err(err) = put.await {
+                            eprintln!("codeany: creating the workspace on its device failed: {err:#}");
+                        }
+                    })
+                    .detach();
+                self.store.workspaces.push(ws);
+                id
+            }
+        };
+        self.activate_workspace(id, window, cx);
+    }
+
+    fn activate_workspace(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.store.workspaces.iter().find(|w| w.id == id).cloned() else { return };
+        self.store.active_workspace = Some(id);
+        self.shown_project = None;
+        self.set_machine(ws.device.clone(), cx);
+        // Each workspace keeps its own tabs: show the one last active there.
+        self.active = self.tab_set_mut().current();
+        if self.active_thread().is_some_and(|t| !self.in_active_workspace(t)) {
+            self.new_thread(window, cx);
+        }
+        self.sync_machine(cx);
+        self.pin_to_bottom(cx);
+        self.store.save();
+        cx.notify();
+    }
+
+    fn on_workspace_menu(
+        &mut self,
+        _: &Entity<WorkspaceMenu>,
+        event: &WorkspaceMenuEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            WorkspaceMenuEvent::Activate(id) => {
+                self.workspace_menu_open = false;
+                self.activate_workspace(id.clone(), window, cx);
+            }
+            WorkspaceMenuEvent::Create { title, icon, device } => {
+                let (device, device_name) = match device {
+                    Some((id, name)) => (Some(id.clone()), Some(name.clone())),
+                    None => (None, None),
+                };
+                let ws = crate::threads::Workspace::new(title.clone(), icon.clone(), device.clone(), device_name);
+                // One on another device is that device's record.
+                if let Some(machine) = device {
+                    let put = crate::sync::put_workspace(machine, ws.clone());
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Err(err) = put.await {
+                                eprintln!("codeany: creating the workspace on its device failed: {err:#}");
+                            }
+                        })
+                        .detach();
+                }
+                let id = ws.id.clone();
+                self.store.workspaces.push(ws);
+                self.workspace_menu_open = false;
+                self.activate_workspace(id, window, cx);
+            }
+            WorkspaceMenuEvent::Edit { id, title, icon } => {
+                if let Some(ws) = self.store.workspaces.iter_mut().find(|w| &w.id == id) {
+                    ws.title = title.clone();
+                    ws.icon = icon.clone();
+                    if let Some(machine) = ws.device.clone() {
+                        let put = crate::sync::put_workspace(machine, ws.clone());
+                        cx.background_executor().spawn(async move { put.await.ok() }).detach();
+                    }
+                }
+                self.store.save();
+                cx.notify();
+            }
+            WorkspaceMenuEvent::Delete(id) => {
+                if !crate::threads::Workspace::deletable(&self.store.workspaces, id) {
+                    return;
+                }
+                let Some(ws) = self.store.workspaces.iter().find(|w| &w.id == id).cloned() else { return };
+                if ws.device.is_none() {
+                    // Its threads and projects go to the first workspace left here.
+                    for thread in self.store.threads.iter_mut().filter(|t| t.workspace.as_ref() == Some(id)) {
+                        thread.workspace = None;
+                    }
+                    let projects = ws.projects.clone();
+                    if let Some(first) = self.store.workspaces.iter_mut().find(|w| w.device.is_none() && &w.id != id) {
+                        for p in projects {
+                            if !first.projects.contains(&p) {
+                                first.projects.push(p);
+                            }
+                        }
+                    }
+                }
+                self.store.workspaces.retain(|w| &w.id != id);
+                self.store.ensure_workspaces(&remote::this_name());
+                if self.store.active_workspace.as_ref() == Some(id) {
+                    if let Some(first) = self.store.workspaces.first().map(|w| w.id.clone()) {
+                        self.activate_workspace(first, window, cx);
+                    }
+                }
+                self.store.save();
+                cx.notify();
+            }
+            WorkspaceMenuEvent::Mount(ws) => {
+                let id = ws.id.clone();
+                if !self.store.workspaces.iter().any(|w| w.id == id) {
+                    self.store.workspaces.push(ws.clone());
+                }
+                self.workspace_menu_open = false;
+                self.activate_workspace(id, window, cx);
+            }
+            WorkspaceMenuEvent::OpenSettings => {
+                self.workspace_menu_open = false;
+                cx.emit(AgentPanelEvent::OpenSettings);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The workspace menu's button: the workspace shown, its device when it
+    /// is another one.
+    pub fn render_workspace_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let ws = self.store.active_workspace().cloned();
+        let title = ws.as_ref().map(|w| w.title.clone()).unwrap_or_else(remote::this_name);
+        let icon = ws.as_ref().and_then(|w| w.icon.clone());
+        let menu = self.workspace_menu.clone();
+        Popover::new("workspace-menu")
+            .anchor(Anchor::TopLeft)
+            .open(self.workspace_menu_open)
+            .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                this.workspace_menu_open = *open;
+                if *open {
+                    let (workspaces, active, devices) =
+                        (this.store.workspaces.clone(), this.store.active_workspace.clone(), this.menu_devices());
+                    this.workspace_menu.update(cx, |menu, cx| menu.open(workspaces, active, devices, cx));
+                }
+                cx.notify();
+            }))
+            .p_0()
+            .trigger(
+                Button::new("workspace-switcher")
+                    .ghost()
+                    .w_full()
+                    .h(layout::CONTROL)
+                    .px(layout::SPACE_2)
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap(layout::SPACE_2)
+                            .text_size(TEXT)
+                            .child(crate::workspace_switcher::avatar(icon.as_deref(), &title, px(22.), cx))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(div().flex_1())
+                            .child(Icon::new(IconName::ChevronDown).size(ICON).text_color(theme.muted_foreground)),
+                    ),
+            )
+            .content(move |_, _, _| menu.clone())
             .into_any_element()
     }
 
@@ -1972,15 +2342,11 @@ impl AgentPanel {
         }
         // Ordered, so equal timestamps never reshuffle from one frame to the next.
         let mut groups: std::collections::BTreeMap<Option<PathBuf>, Vec<Entry>> = Default::default();
-        // Threads that run on another device, listed under its name.
-        let mut devices: std::collections::BTreeMap<String, Vec<Entry>> = Default::default();
-        for thread in self.store.threads.iter().filter(|t| !t.settled) {
-            match &thread.machine {
-                Some(machine) => devices.entry(machine.clone()).or_default().push(Entry::Thread(thread)),
-                None => groups.entry(thread.project.clone()).or_default().push(Entry::Thread(thread)),
-            }
+        // One workspace at a time, picked at the top: its projects and chats.
+        for thread in self.store.threads.iter().filter(|t| !t.settled && self.in_active_workspace(t)) {
+            groups.entry(thread.project.clone()).or_default().push(Entry::Thread(thread));
         }
-        for entries in groups.values_mut().chain(devices.values_mut()) {
+        for entries in groups.values_mut() {
             entries.sort_by(|a, b| {
                 let key = |e: &Entry| match e {
                     Entry::Thread(t) => t.id.to_string(),
@@ -1995,7 +2361,8 @@ impl AgentPanel {
         };
 
         // ---- Projects, most recently active first; the open one leads.
-        let mut projects: Vec<PathBuf> = self.store.projects.clone();
+        // The workspace's own, and the folders its threads work in.
+        let mut projects: Vec<PathBuf> = self.store.active_workspace().map(|w| w.projects.clone()).unwrap_or_default();
         for project in groups.keys().flatten() {
             if !projects.contains(project) {
                 projects.push(project.clone());
@@ -2018,7 +2385,15 @@ impl AgentPanel {
                 rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
             }
         });
-        let hidden_projects = if self.all_projects {
+        // One project picked in the filter menu: only it, opened.
+        let filtered = self.shown_project.clone();
+        if let Some(shown) = &filtered {
+            projects.retain(|p| p == shown);
+            if projects.is_empty() {
+                projects.push(shown.clone());
+            }
+        }
+        let hidden_projects = if self.all_projects || filtered.is_some() {
             0
         } else {
             projects.len().saturating_sub(5)
@@ -2033,7 +2408,8 @@ impl AgentPanel {
             .px(layout::SIDEBAR_INSET)
             .pb(layout::SPACE_2)
             .flex()
-            .flex_col();
+            .flex_col()
+            ;
 
         // The entries of one group, capped unless asked for all.
         let push_entries = |this: &Self,
@@ -2082,7 +2458,17 @@ impl AgentPanel {
             list = list.child(self.render_section_header(
                 SidebarSection::Projects,
                 icon_button("add-project", IconName::FolderPlus)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(AgentPanelEvent::OpenFolder)))
+                    .on_click(cx.listener(|this, _, window, cx| match this.machine.clone() {
+                        None => cx.emit(AgentPanelEvent::OpenFolder),
+                        // A folder on that device: pick it for a new thread.
+                        Some(machine) => {
+                            this.new_thread(window, cx);
+                            let dir = this.store.remote_dirs.get(&machine).cloned();
+                            this.folders.update(cx, |folders, cx| folders.open(machine, dir, cx));
+                            this.folders_open = true;
+                            cx.notify();
+                        }
+                    }))
                     .app_tooltip(t("Open Folder (⌘O)"))
                     .into_any_element(),
                 cx,
@@ -2106,7 +2492,7 @@ impl AgentPanel {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| project.display().to_string())
                         .into();
-                    let expanded = self.expanded_projects.contains(project);
+                    let expanded = filtered.is_some() || self.expanded_projects.contains(project);
                     let current = self.project.as_ref() == Some(project);
                     let live = entries.iter().any(|e| match e {
                         Entry::Thread(t) => self.running.contains(&t.id),
@@ -2220,8 +2606,8 @@ impl AgentPanel {
             }
         }
 
-        // ---- Conversations without a repository
-        if groups.get(&None).is_some_and(|entries| !entries.is_empty()) {
+        // ---- Conversations without a repository (not while one project is shown)
+        if filtered.is_none() && groups.get(&None).is_some_and(|entries| !entries.is_empty()) {
             list = list.child(self.render_section_header(
                 SidebarSection::Recent,
                 icon_button("new-chat", IconName::SquarePen)
@@ -2246,56 +2632,15 @@ impl AgentPanel {
             }
         }
 
-        // ---- Other devices' threads
-        let mut devices: Vec<(String, Vec<Entry>)> = devices.into_iter().collect();
-        devices.sort_by_key(|(_, entries)| std::cmp::Reverse(entries.first().map(Entry::updated).unwrap_or(0)));
-        for (machine, entries) in devices {
-            let fallback = entries.iter().find_map(|e| match e {
-                Entry::Thread(t) => t.machine_name.clone(),
-            });
-            let name = self.machine_name(&machine, fallback.as_deref());
-            let online = self.hosts.iter().any(|h| h.id == machine && h.usable());
-            let folded = self.folded_devices.contains(&machine);
-            let toggle = machine.clone();
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("device-section-{machine}")))
-                    .mt(layout::SPACE_4)
-                    .mb(layout::SPACE_2)
-                    .h(layout::SIDEBAR_ROW)
-                    .flex_none()
-                    .px(layout::SIDEBAR_ROW_INSET)
-                    .flex()
-                    .items_center()
-                    .gap(layout::SPACE_1)
-                    .text_size(TEXT)
-                    .text_color(theme.muted_foreground)
-                    .cursor_pointer()
-                    .child(Icon::new(IconName::Monitor).size(ICON).flex_none())
-                    .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(name))
-                    .child(
-                        div()
-                            .flex_none()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(if online { theme.success } else { theme.muted_foreground.opacity(0.4) }),
-                    )
-                    .when(folded, |this| this.child(Icon::new(IconName::ChevronRight).size(ICON)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.folded_devices.remove(&toggle) {
-                            this.folded_devices.insert(toggle.clone());
-                        }
-                        cx.notify();
-                    })),
-            );
-            if !folded {
-                let key = Some(PathBuf::from(format!("device:{machine}")));
-                list = push_entries(self, list, key, &entries, false, cx);
-            }
-        }
-
         // ---- Archived threads: out of the lists above, kept until deleted.
-        let mut archived: Vec<Entry> = self.store.threads.iter().filter(|t| t.settled).map(Entry::Thread).collect();
+        let mut archived: Vec<Entry> =
+            self.store
+                .threads
+                .iter()
+                .filter(|t| t.settled && self.in_active_workspace(t))
+                .filter(|t| filtered.is_none() || t.project == filtered)
+                .map(Entry::Thread)
+                .collect();
         if !archived.is_empty() {
             archived.sort_by(|a, b| b.updated().cmp(&a.updated()));
             let count = div()
@@ -3107,7 +3452,7 @@ impl AgentPanel {
                 return self.context_label("machine", IconName::Laptop, remote::this_name(), None, cx);
             };
             let name = self.machine_name(machine, thread.machine_name.as_deref());
-            let online = self.hosts.iter().any(|h| h.id == machine && h.usable());
+            let online = self.machine_online(machine);
             let label = if online { name } else { tf("{name} · offline", &[("name", name.clone())]) };
             return self.context_label("machine", IconName::Monitor, label, None, cx);
         }
@@ -3116,6 +3461,59 @@ impl AgentPanel {
             Some(id) => (IconName::Monitor, self.machine_name(id, None)),
             None => (IconName::Laptop, remote::this_name()),
         };
+        // The workspace decides the device: pick another workspace to run
+        // somewhere else.
+        if !self.store.workspaces.is_empty() {
+            let label = match &current {
+                Some(id) if !self.machine_online(id) => tf("{name} · offline", &[("name", label.clone())]),
+                _ => label,
+            };
+            // Another device is another workspace: picking one switches to it.
+            let mut devices: Vec<(Option<String>, String, bool)> = vec![(None, remote::this_name(), true)];
+            for w in self.store.workspaces.iter().filter(|w| w.device.is_some()) {
+                let id = w.device.clone().unwrap();
+                if !devices.iter().any(|(d, _, _)| d.as_deref() == Some(id.as_str())) {
+                    devices.push((Some(id.clone()), self.machine_name(&id, w.device_name.as_deref()), self.machine_online(&id)));
+                }
+            }
+            for h in &self.hosts {
+                if !devices.iter().any(|(d, _, _)| d.as_deref() == Some(h.id.as_str())) {
+                    devices.push((Some(h.id.clone()), h.name.clone(), h.usable()));
+                }
+            }
+            if devices.len() < 2 {
+                let tip = t("Connect your other devices in Settings → Devices to run agents there").to_string();
+                return self.context_label("machine", icon, label, Some(tip), cx);
+            }
+            let entity = cx.entity().downgrade();
+            return Self::context_button("machine-picker", icon, label, cx)
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (ix, (id, name, online)) in devices.iter().enumerate() {
+                        if ix == 1 {
+                            menu = menu.separator();
+                        }
+                        let entity = entity.clone();
+                        let pick = id.clone();
+                        let label = if id.is_none() {
+                            tf("This machine ({name})", &[("name", name.clone())])
+                        } else if *online {
+                            name.clone().into()
+                        } else {
+                            tf("{name} (offline)", &[("name", name.clone())])
+                        };
+                        menu = menu.item(
+                            crate::style::menu_item(label)
+                                .checked(current == *id)
+                                .on_click(move |_, window, cx| {
+                                    let pick = pick.clone();
+                                    entity.update(cx, |this, cx| this.switch_device(pick, window, cx)).ok();
+                                }),
+                        );
+                    }
+                    menu
+                })
+                .into_any_element();
+        }
         if self.hosts.is_empty() && current.is_none() {
             let tip = t("Connect your other devices in Settings → Devices to run agents there").to_string();
             return self.context_label("machine", icon, label, Some(tip), cx);
@@ -3270,8 +3668,8 @@ impl AgentPanel {
             .as_ref()
             .and_then(|d| d.file_name())
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| t("Home folder").into());
-        let full = dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| t("Home folder").into());
+            .unwrap_or_else(|| t("No project").into());
+        let full = dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| t("No project").into());
         if thread.is_some() {
             return Some(
                 div()

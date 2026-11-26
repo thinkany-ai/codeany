@@ -28,17 +28,21 @@ const MAIN_MODELS: usize = 5;
 actions!(model_picker, [Pick1, Pick2, Pick3, Pick4, Pick5, Pick6, Pick7, Pick8, Pick9]);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("cmd-1", Pick1, Some("ModelPicker")),
-        KeyBinding::new("cmd-2", Pick2, Some("ModelPicker")),
-        KeyBinding::new("cmd-3", Pick3, Some("ModelPicker")),
-        KeyBinding::new("cmd-4", Pick4, Some("ModelPicker")),
-        KeyBinding::new("cmd-5", Pick5, Some("ModelPicker")),
-        KeyBinding::new("cmd-6", Pick6, Some("ModelPicker")),
-        KeyBinding::new("cmd-7", Pick7, Some("ModelPicker")),
-        KeyBinding::new("cmd-8", Pick8, Some("ModelPicker")),
-        KeyBinding::new("cmd-9", Pick9, Some("ModelPicker")),
-    ]);
+    // ⌘ on macOS, Ctrl elsewhere.
+    let picks: [Box<dyn Action>; 9] = [
+        Box::new(Pick1), Box::new(Pick2), Box::new(Pick3),
+        Box::new(Pick4), Box::new(Pick5), Box::new(Pick6),
+        Box::new(Pick7), Box::new(Pick8), Box::new(Pick9),
+    ];
+    let context = KeyBindingContextPredicate::parse("ModelPicker").ok().map(std::rc::Rc::new);
+    let bindings: Vec<KeyBinding> = picks
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ix, action)| {
+            KeyBinding::load(&format!("secondary-{}", ix + 1), action, context.clone(), false, None, cx).ok()
+        })
+        .collect();
+    cx.bind_keys(bindings);
 }
 
 pub enum ModelPickerEvent {

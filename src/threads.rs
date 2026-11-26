@@ -48,6 +48,7 @@ pub fn agent_name(id: &str) -> String {
         "codex" => "Codex".into(),
         "gemini" => "Gemini CLI".into(),
         "antigravity" => "Antigravity".into(),
+        "kiro" => "Kiro CLI".into(),
         "opencode" => "OpenCode".into(),
         "cursor" => "Cursor Agent".into(),
         "kimi" => "Kimi Code".into(),
@@ -217,6 +218,10 @@ pub struct Thread {
     /// That device's name when the thread started, for while it is offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_name: Option<String>,
+    /// The workspace it belongs to; `None`: its device's first workspace
+    /// (threads from before workspaces).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     pub agent: String,
     pub access: String,
     #[serde(default)]
@@ -250,6 +255,7 @@ impl Thread {
             project,
             machine: None,
             machine_name: None,
+            workspace: None,
             agent,
             access,
             model: None,
@@ -701,8 +707,108 @@ pub struct Store {
     /// The folder last picked on each other machine, by device id.
     #[serde(default)]
     pub remote_dirs: std::collections::HashMap<String, PathBuf>,
+    /// Workspaces, each on one device, as Termany has them.
+    #[serde(default)]
+    pub workspaces: Vec<Workspace>,
+    /// The workspace the window shows.
+    #[serde(default)]
+    pub active_workspace: Option<String>,
     #[serde(skip)]
     db: Option<Db>,
+}
+
+/// A workspace: projects and conversations on one device, under a name and
+/// an icon. One on another device is that device's own record, mounted
+/// here: its name, icon and projects come from there.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: String,
+    pub title: String,
+    /// An emoji, or `None` for the title's initial.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// The device it lives on; `None` is this one.
+    #[serde(default)]
+    pub device: Option<String>,
+    /// That device's name, for while it is offline.
+    #[serde(default)]
+    pub device_name: Option<String>,
+    /// Its projects, beyond the folders its threads work in.
+    #[serde(default)]
+    pub projects: Vec<PathBuf>,
+}
+
+impl Workspace {
+    pub fn new(title: String, icon: Option<String>, device: Option<String>, device_name: Option<String>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            title,
+            icon,
+            device,
+            device_name,
+            projects: Vec::new(),
+        }
+    }
+
+    /// Whether `id` may be deleted: every device keeps at least one workspace.
+    pub fn deletable(all: &[Workspace], id: &str) -> bool {
+        let Some(ws) = all.iter().find(|w| w.id == id) else { return false };
+        all.iter().any(|w| w.id != ws.id && w.device == ws.device)
+    }
+}
+
+impl Store {
+    /// The workspace the window shows.
+    pub fn active_workspace(&self) -> Option<&Workspace> {
+        let id = self.active_workspace.as_ref()?;
+        self.workspaces.iter().find(|w| &w.id == id)
+    }
+
+    /// The workspace `thread` shows in: the one it names when that is one
+    /// of its device's here, else its device's first.
+    pub fn workspace_of(&self, thread: &Thread) -> Option<&Workspace> {
+        let mut on_device = self.workspaces.iter().filter(|w| w.device == thread.machine);
+        let first = on_device.clone().next();
+        thread
+            .workspace
+            .as_ref()
+            .and_then(|id| on_device.find(|w| &w.id == id))
+            .or(first)
+    }
+
+    /// Give every device that threads run on a workspace, so nothing from
+    /// before workspaces goes missing; and pick one to show.
+    pub fn ensure_workspaces(&mut self, this_device: &str) {
+        if !self.workspaces.iter().any(|w| w.device.is_none()) {
+            let mut local = Workspace::new(this_device.to_string(), Some("⭐".into()), None, None);
+            local.projects = self.projects.clone();
+            self.workspaces.insert(0, local);
+        }
+        let mut machines: Vec<(String, Option<String>)> = Vec::new();
+        for thread in &self.threads {
+            if let Some(machine) = &thread.machine {
+                if !machines.iter().any(|(m, _)| m == machine) {
+                    machines.push((machine.clone(), thread.machine_name.clone()));
+                }
+            }
+        }
+        for (machine, name) in machines {
+            if !self.workspaces.iter().any(|w| w.device.as_deref() == Some(machine.as_str())) {
+                let title = name.clone().unwrap_or_else(|| machine.clone());
+                self.workspaces.push(Workspace::new(title, Some("💻".into()), Some(machine), name));
+            }
+        }
+        if self.active_workspace().is_none() {
+            // Where the window was: the device new threads ran on.
+            let id = self
+                .workspaces
+                .iter()
+                .find(|w| w.device == self.machine)
+                .or(self.workspaces.first())
+                .map(|w| w.id.clone());
+            self.active_workspace = id;
+        }
+    }
 }
 
 fn default_enabled_agents() -> Vec<String> {
@@ -733,6 +839,8 @@ impl Default for Store {
             agent_args: HashMap::new(),
             enabled_agents: default_enabled_agents(),
             remote_dirs: Default::default(),
+            workspaces: Vec::new(),
+            active_workspace: None,
             db: None,
         }
     }
@@ -847,6 +955,8 @@ impl Store {
                 agent_args: db.setting("agent_args").unwrap_or_default(),
                 enabled_agents: db.setting("enabled_agents").unwrap_or_else(default_enabled_agents),
                 remote_dirs: db.setting("remote_dirs").unwrap_or_default(),
+                workspaces: db.setting("workspaces").unwrap_or_default(),
+                active_workspace: db.setting("active_workspace").flatten(),
                 db: Some(db),
             },
             Err(err) => {
@@ -880,6 +990,8 @@ impl Store {
         db.set_setting("agent_args", &self.agent_args);
         db.set_setting("enabled_agents", &self.enabled_agents);
         db.set_setting("remote_dirs", &self.remote_dirs);
+        db.set_setting("workspaces", &self.workspaces);
+        db.set_setting("active_workspace", &self.active_workspace);
         // A copy is cheap next to serializing every item to see what changed;
         // that happens on the writer's thread.
         if !crate::db::save_in_background(self.threads.clone()) {
@@ -889,6 +1001,7 @@ impl Store {
         }
         // Serve the threads that run here; write others back to their device.
         crate::sync::saved(&self.threads);
+        crate::sync::saved_workspaces(&self.workspaces);
     }
 }
 
@@ -927,31 +1040,26 @@ fn now_millis() -> u64 {
 
 /// "4:38 PM" today, "Oct 12, 4:38 PM" before that, in local time.
 pub fn clock_time(secs: u64) -> String {
-    fn local(secs: u64) -> Option<libc::tm> {
-        let t = secs as libc::time_t;
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        // SAFETY: localtime_r only writes the provided struct.
-        let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
-        ok.then_some(tm)
-    }
+    use chrono::{Datelike as _, Local, TimeZone as _, Timelike as _};
+    let local = |secs: u64| Local.timestamp_opt(secs as i64, 0).single();
     let (Some(tm), Some(today)) = (local(secs), local(now_secs())) else {
         return String::new();
     };
-    let hour = match tm.tm_hour % 12 {
+    let hour = match tm.hour() % 12 {
         0 => 12,
         h => h,
     };
-    let time = format!("{hour}:{:02}", tm.tm_min);
-    let clock = tf(if tm.tm_hour < 12 { "{time} AM" } else { "{time} PM" }, &[("time", time)]);
-    if (tm.tm_year, tm.tm_yday) == (today.tm_year, today.tm_yday) {
+    let time = format!("{hour}:{:02}", tm.minute());
+    let clock = tf(if tm.hour() < 12 { "{time} AM" } else { "{time} PM" }, &[("time", time)]);
+    if tm.date_naive() == today.date_naive() {
         return clock;
     }
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     tf(
         "{month} {day}, {clock}",
         &[
-            ("month", t(MONTHS[tm.tm_mon.clamp(0, 11) as usize]).to_string()),
-            ("day", tm.tm_mday.to_string()),
+            ("month", t(MONTHS[tm.month0() as usize]).to_string()),
+            ("day", tm.day().to_string()),
             ("clock", clock),
         ],
     )
@@ -1077,5 +1185,74 @@ mod provider_error_tests {
         assert_eq!(provider_error(r#"Here is the config: {"error": {"message": "x"}}"#), None);
         assert_eq!(provider_error(r#"{"name": "codeany"}"#), None);
         assert_eq!(provider_error("All done."), None);
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    #[test]
+    fn every_device_keeps_a_workspace() {
+        let mut a = super::Workspace::new("a".into(), None, None, None);
+        a.id = "a".into();
+        let mut b = super::Workspace::new("b".into(), None, None, None);
+        b.id = "b".into();
+        let mut m = super::Workspace::new("m".into(), None, Some("mini".into()), None);
+        m.id = "m".into();
+        let all = vec![a, b.clone(), m];
+        assert!(super::Workspace::deletable(&all, "a"));
+        assert!(!super::Workspace::deletable(&all, "m"));
+        let left: Vec<_> = all.into_iter().filter(|w| w.id != "a").collect();
+        assert!(!super::Workspace::deletable(&left, "b"));
+    }
+
+    use super::*;
+
+    fn thread(machine: Option<&str>, workspace: Option<&str>) -> Thread {
+        let mut t = Thread::new(None, "codex".into(), "full".into());
+        t.machine = machine.map(str::to_string);
+        t.machine_name = machine.map(|m| format!("{m}-name"));
+        t.workspace = workspace.map(str::to_string);
+        t
+    }
+
+    #[test]
+    fn threads_from_before_workspaces_land_in_one_per_device() {
+        let mut store = Store::default();
+        store.projects = vec!["/code/a".into()];
+        store.threads = vec![thread(None, None), thread(Some("mini"), None)];
+        store.machine = Some("mini".into());
+        store.ensure_workspaces("mbp");
+        assert_eq!(store.workspaces.len(), 2);
+        let local = &store.workspaces[0];
+        assert_eq!((local.title.as_str(), local.device.as_deref()), ("mbp", None));
+        assert_eq!(local.projects, vec![PathBuf::from("/code/a")]);
+        assert_eq!(store.workspaces[1].title, "mini-name");
+        // It opens where new threads last ran.
+        assert_eq!(store.active_workspace().unwrap().device.as_deref(), Some("mini"));
+        // Running it again changes nothing.
+        let before = store.workspaces.clone();
+        store.ensure_workspaces("mbp");
+        assert_eq!(store.workspaces, before);
+    }
+
+    #[test]
+    fn a_thread_shows_in_the_workspace_it_names_on_its_device() {
+        let mut store = Store::default();
+        store.ensure_workspaces("mbp");
+        let first = store.workspaces[0].id.clone();
+        let second = Workspace::new("client".into(), None, None, None);
+        let second_id = second.id.clone();
+        store.workspaces.push(second);
+        let mounted = Workspace::new("mini".into(), None, Some("mini".into()), None);
+        let mounted_id = mounted.id.clone();
+        store.workspaces.push(mounted);
+
+        assert_eq!(store.workspace_of(&thread(None, None)).unwrap().id, first);
+        assert_eq!(store.workspace_of(&thread(None, Some(&second_id))).unwrap().id, second_id);
+        // A workspace of another device does not take a local thread.
+        assert_eq!(store.workspace_of(&thread(None, Some(&mounted_id))).unwrap().id, first);
+        // An unknown id falls back to its device's first workspace.
+        assert_eq!(store.workspace_of(&thread(Some("mini"), Some("gone"))).unwrap().id, mounted_id);
+        assert!(store.workspace_of(&thread(Some("other"), None)).is_none());
     }
 }

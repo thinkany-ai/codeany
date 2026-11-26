@@ -898,7 +898,12 @@ pub fn start() {
         tokio::time::sleep(Duration::from_secs(2)).await;
         loop {
             remeasure().await;
-            tokio::time::sleep(Duration::from_secs(45)).await;
+            // A device that does not answer may just be starting: look
+            // again soon rather than show it offline for long.
+            let unanswered = peers().iter().any(|p| {
+                p.pending || direct_status(&p.public_key).is_none_or(|s| s.rtt_ms.is_none())
+            });
+            tokio::time::sleep(Duration::from_secs(if unanswered { 10 } else { 45 })).await;
         }
     });
 }
@@ -1206,7 +1211,22 @@ async fn open_paired(peer: &Peer, allow_relay: bool) -> Result<(DuplexStream, Vi
 /// A WebSocket to `service` on a paired device.
 pub async fn connect(peer: &Peer, service: &str) -> Result<(crate::remote::Ws, Via)> {
     let (mut stream, via) = open_paired(peer, true).await?;
+    let started = Instant::now();
     exchange(&mut stream, &json!({ "service": service, "hello": invite() })).await?;
+    // It answered and serves us: that is fresher than the last measurement,
+    // which may have failed while it was starting up.
+    if let Via::Direct(endpoint) = &via {
+        set_direct(
+            &peer.public_key,
+            DirectStatus {
+                rtt_ms: Some((started.elapsed().as_millis() as u32).max(1)),
+                endpoint: Some(endpoint.clone()),
+                note: None,
+                share: true,
+                at: Instant::now(),
+            },
+        );
+    }
     let (ws, _) = tokio_tungstenite::client_async(format!("ws://{}/{service}", peer.id().replace(':', "-")), stream)
         .await
         .context("open the stream")?;

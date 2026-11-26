@@ -1,5 +1,6 @@
 //! The agent window's tabs, like a browser's: each shows one thread, or a
-//! new one not sent yet. Every project keeps its own row of tabs.
+//! new one not sent yet. Every project keeps its own row of tabs in each
+//! workspace it belongs to.
 
 use std::path::PathBuf;
 
@@ -8,15 +9,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TabSet {
     pub project: Option<PathBuf>,
+    /// The workspace these tabs belong to; `None` for tabs saved before
+    /// workspaces, which the first workspace to open the project adopts.
+    #[serde(default)]
+    pub workspace: Option<String>,
     /// Each tab's thread; `None` is a new thread.
     pub tabs: Vec<Option<u64>>,
     pub active: usize,
 }
 
 impl TabSet {
-    pub fn new(project: Option<PathBuf>) -> Self {
+    pub fn new(project: Option<PathBuf>, workspace: Option<String>) -> Self {
         Self {
             project,
+            workspace,
             tabs: vec![None],
             active: 0,
         }
@@ -145,7 +151,7 @@ mod tests {
 
     #[test]
     fn behaves_like_browser_tabs() {
-        let mut set = TabSet::new(None);
+        let mut set = TabSet::new(None, None);
         set.navigate(1);
         assert_eq!(set.tabs, [Some(1)]);
         set.open_new();
@@ -175,7 +181,7 @@ mod tests {
 
     #[test]
     fn closes_others_and_to_the_right() {
-        let mut set = TabSet { project: None, tabs: vec![Some(1), Some(2), None, Some(3)], active: 3 };
+        let mut set = TabSet { project: None, workspace: None, tabs: vec![Some(1), Some(2), None, Some(3)], active: 3 };
         assert_eq!(set.close_right(1), vec![3]);
         assert_eq!((set.tabs.clone(), set.active), (vec![Some(1), Some(2)], 1));
         assert_eq!(set.close_others(1), vec![1]);
@@ -187,6 +193,7 @@ mod tests {
     fn drops_tabs_of_gone_threads() {
         let mut set = TabSet {
             project: None,
+            workspace: None,
             tabs: vec![Some(1), Some(2), None, Some(3)],
             active: 3,
         };

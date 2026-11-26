@@ -1,3 +1,6 @@
+// A GUI app on Windows: no console window opens with it.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod agent_icons;
 mod agent_panel;
 mod agl_bridge;
@@ -15,6 +18,7 @@ mod panel_views;
 mod paths;
 mod peer;
 mod project_avatar;
+mod project_filter;
 mod remote;
 mod remote_folders;
 mod search_palette;
@@ -27,7 +31,15 @@ mod themes;
 mod threads;
 #[cfg(target_os = "macos")]
 mod updater;
+/// Sparkle is macOS only; elsewhere nothing ever offers an update.
+#[cfg(not(target_os = "macos"))]
+mod updater {
+    pub struct AvailableUpdate(pub Option<String>);
+    impl gpui_kit::Global for AvailableUpdate {}
+    pub fn check() {}
+}
 mod workspace;
+mod workspace_switcher;
 
 use std::path::PathBuf;
 

@@ -40,6 +40,17 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+/// The default shell's name, the tab title until the shell sets one.
+fn shell_name() -> String {
+    if cfg!(windows) {
+        return "PowerShell".into();
+    }
+    std::env::var("SHELL")
+        .ok()
+        .and_then(|shell| std::path::Path::new(&shell).file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "sh".into())
+}
+
 #[derive(Clone)]
 struct Listener(mpsc::UnboundedSender<TermEvent>);
 
@@ -163,7 +174,7 @@ impl TerminalView {
                 notifier,
                 size,
                 bounds: Bounds::default(),
-                title: "zsh".into(),
+                title: shell_name().into(),
                 exited: false,
                 selecting: false,
                 focus_handle: cx.focus_handle(),
@@ -175,7 +186,7 @@ impl TerminalView {
     fn handle_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
         match event {
             TermEvent::Title(title) => self.title = title.into(),
-            TermEvent::ResetTitle => self.title = "zsh".into(),
+            TermEvent::ResetTitle => self.title = shell_name().into(),
             TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
             TermEvent::ClipboardStore(_, text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text))

@@ -135,8 +135,22 @@ pub fn keys(id: &str, cx: &App) -> Vec<String> {
     SHORTCUTS
         .iter()
         .find(|s| s.id == id)
-        .map(|s| s.defaults.iter().map(|k| k.to_string()).collect())
+        .map(|s| s.defaults.iter().map(|k| for_platform(id, k)).collect())
         .unwrap_or_default()
+}
+
+/// Defaults are written for macOS. Elsewhere Command becomes Control, and
+/// the terminal's copy, paste and clear add Shift, as Ctrl-C and Ctrl-V
+/// belong to the shell there.
+fn for_platform(id: &str, keys: &str) -> String {
+    if cfg!(target_os = "macos") {
+        return keys.to_string();
+    }
+    let keys = keys.replace("cmd-", "ctrl-");
+    if id.starts_with("terminal-") {
+        return keys.replace("ctrl-", "ctrl-shift-");
+    }
+    keys
 }
 
 pub fn is_custom(id: &str, cx: &App) -> bool {
@@ -246,6 +260,25 @@ pub fn display(keys: &str) -> String {
     let Some((mut mods, key)) = parse(keys) else { return keys.to_string() };
     let order = ["fn", "⌃", "⌥", "⇧", "⌘"];
     mods.sort_by_key(|m| order.iter().position(|o| o == m));
+    if !cfg!(target_os = "macos") {
+        // "Ctrl+Shift+T", the way Linux and Windows write it.
+        let names: Vec<&str> = mods
+            .iter()
+            .map(|m| match *m {
+                "⌃" => "Ctrl",
+                "⌥" => "Alt",
+                "⇧" => "Shift",
+                "⌘" => "Super",
+                other => other,
+            })
+            .chain(std::iter::once(key))
+            .collect();
+        return names
+            .iter()
+            .map(|n| if n.len() == 1 { n.to_uppercase() } else { capitalize(n) })
+            .collect::<Vec<_>>()
+            .join("+");
+    }
     let key = match key {
         "tab" => "Tab".to_string(),
         "enter" => "↩".to_string(),
@@ -266,10 +299,16 @@ pub fn display(keys: &str) -> String {
     format!("{}{key}", mods.concat())
 }
 
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{display, parse, SHORTCUTS};
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn displays_keystrokes() {
         assert_eq!(display("cmd-shift-t"), "⇧⌘T");

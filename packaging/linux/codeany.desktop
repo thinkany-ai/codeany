@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CodeAny
+Comment=A local-first coding agent
+Exec=codeany %f
+Icon=codeany
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=codeany

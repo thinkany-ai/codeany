@@ -1,10 +1,25 @@
 [package]
 name = "codeany"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A local-first coding agent"
 license = "AGPL-3.0-only"
 repository = "https://github.com/thinkany-ai/codeany"
+
+# `cargo deb --no-build` after `cargo build --release` (see the Linux CI job).
+[package.metadata.deb]
+name = "codeany"
+maintainer = "ThinkAny, LLC"
+copyright = "ThinkAny, LLC"
+section = "devel"
+priority = "optional"
+extended-description = "CodeAny: a lightweight coding-agent app with an editor."
+depends = "$auto, libwebkit2gtk-4.1-0, libxkbcommon-x11-0, libvulkan1"
+assets = [
+    ["target/release/codeany", "usr/bin/", "755"],
+    ["packaging/linux/codeany.desktop", "usr/share/applications/", "644"],
+    ["assets/codeany.png", "usr/share/pixmaps/codeany.png", "644"],
+]
 
 [dependencies]
 gpui-kit = { version = "0.8.1", features = [
@@ -27,6 +42,7 @@ gpui-kit = { version = "0.8.1", features = [
 ] }
 alacritty_terminal = "0.26"
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "ico", "webp"] }
 resvg = { version = "0.46", default-features = false }
@@ -37,7 +53,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-agl = { git = "https://github.com/thinkany-ai/agl", tag = "v0.3.19" }
+agl = { git = "https://github.com/thinkany-ai/agl", tag = "v0.3.20" }
 nex = { git = "https://github.com/thinkany-ai/nex", rev = "12ea252" }
 tokio-tungstenite = "0.26"
 tokio-util = "0.7"

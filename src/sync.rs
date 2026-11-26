@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{agl_bridge, threads::Thread};
+use crate::{agl_bridge, threads::{Thread, Workspace}};
 
 pub const SERVICE: &str = "codeany";
 const POLL: Duration = Duration::from_secs(6);
@@ -82,6 +82,10 @@ pub enum Incoming {
     Mirror(Thread),
     /// Write back the threads kept here for `machine` that it did not list.
     Resend { machine: String, listed: HashSet<u64> },
+    /// Another device made a workspace that lives here.
+    PutWorkspace(Workspace),
+    /// The workspaces that live on `machine`, as it has them now.
+    Workspaces { machine: String, list: Vec<Workspace> },
     /// A thread `machine` no longer has.
     Gone { machine: String, id: u64 },
 }
@@ -89,6 +93,8 @@ pub enum Incoming {
 struct State {
     /// Threads that run here, as last saved.
     local: HashMap<u64, Thread>,
+    /// Workspaces that live here, as last saved.
+    workspaces: Vec<Workspace>,
     /// Threads that run on another device: (device, id) → what that device
     /// has, as far as we know; a change from it is pushed there.
     known: HashMap<(String, u64), Fingerprint>,
@@ -107,6 +113,7 @@ struct State {
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
     Mutex::new(State {
         local: HashMap::new(),
+        workspaces: Vec::new(),
         known: HashMap::new(),
         dirty: HashMap::new(),
         listed: HashMap::new(),
@@ -167,6 +174,27 @@ pub fn saved(threads: &[Thread]) {
             state.dirty.insert(key, thread.clone());
         }
     }
+}
+
+/// After every save: the workspaces that live here, for other devices.
+pub fn saved_workspaces(workspaces: &[Workspace]) {
+    STATE.lock().unwrap().workspaces = workspaces.iter().filter(|w| w.device.is_none()).cloned().collect();
+}
+
+/// Make a workspace on the device it lives on (it keeps the record).
+pub async fn put_workspace(machine: String, mut workspace: Workspace) -> anyhow::Result<()> {
+    workspace.device = None;
+    workspace.device_name = None;
+    agl_bridge::backend_for(Some(&machine), SERVICE)
+        .call("workspaces.put", json!({ "workspace": workspace }))
+        .await
+        .map(|_| ())
+}
+
+/// The workspaces that live on `machine`, to mount one here.
+pub async fn device_workspaces(machine: String) -> anyhow::Result<Vec<Workspace>> {
+    let list = agl_bridge::backend_for(Some(&machine), SERVICE).call("workspaces.list", json!({})).await?;
+    Ok(serde_json::from_value(list)?)
 }
 
 /// Queue threads kept here for writing back to their device.
@@ -284,7 +312,22 @@ fn handle(method: &str, params: Value) -> Result<Value> {
             send(Incoming::Delete(id));
             Ok(json!({ "ok": true }))
         }
+        "workspaces.list" => Ok(serde_json::to_value(&STATE.lock().unwrap().workspaces)?),
+        "workspaces.put" => {
+            let mut workspace: Workspace = serde_json::from_value(params["workspace"].clone())?;
+            workspace.device = None;
+            workspace.device_name = None;
+            send(Incoming::PutWorkspace(workspace));
+            Ok(json!({ "ok": true }))
+        }
         "machine.info" => Ok(json!({ "name": crate::remote::this_name() })),
+        // The folder of a thread with no project, as this device gives its own.
+        "threads.dir" => {
+            let id = params["id"].as_u64().ok_or_else(|| anyhow!("id is required"))?;
+            let dir = crate::paths::thread_dir(id);
+            std::fs::create_dir_all(&dir)?;
+            Ok(json!({ "path": dir }))
+        }
         other => Err(anyhow!("unknown method '{other}'")),
     }
 }
@@ -335,6 +378,12 @@ async fn poll() {
 
     for (machine, name) in reachable {
         let backend = agl_bridge::backend_for(Some(&machine), SERVICE);
+        // An older CodeAny there has no workspaces to list.
+        if let Ok(list) = backend.call("workspaces.list", json!({})).await {
+            if let Ok(list) = serde_json::from_value::<Vec<Workspace>>(list) {
+                send(Incoming::Workspaces { machine: machine.clone(), list });
+            }
+        }
         let Ok(list) = backend.call("threads.list", json!({})).await else { continue };
         let Ok(list) = serde_json::from_value::<Vec<Summary>>(list) else { continue };
         let ids: HashSet<u64> = list.iter().map(|s| s.id).collect();

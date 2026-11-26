@@ -127,6 +127,8 @@ pub fn builtin() -> Vec<Rc<dyn Extension>> {
         Rc::new(files::Files::default()),
         Rc::new(diff::Diff::default()),
         Rc::new(pull_request::PullRequest::default()),
+        // iOS simulators: Xcode is macOS only.
+        #[cfg(target_os = "macos")]
         Rc::new(device::Device::default()),
     ]
 }

@@ -66,10 +66,28 @@ pub struct SessionOptions {
 
 /// The executable chosen for an agent on this machine, if any. It is kept
 /// as agl's `custom_agents` entry of the same id: the built-in definition
-/// (arguments, environment, protocol) with only its command replaced.
+/// (arguments, environment, protocol) with only its command replaced. An
+/// entry that only adds environment keeps the agent's own command name.
 pub fn agent_command(agent: &str) -> Option<String> {
     let cfg = agl::config::Config::load().ok()?;
-    cfg.custom_agents.iter().find(|c| c.id == agent).map(|c| c.command.clone())
+    let entry = cfg.custom_agents.iter().find(|c| c.id == agent)?;
+    let own = builtin_agent(agent).is_some_and(|d| d.commands.contains(&entry.command));
+    (!own).then(|| entry.command.clone())
+}
+
+/// Variables set for an agent on this machine, beyond its built-in ones.
+pub fn agent_env(agent: &str) -> Vec<(String, String)> {
+    let Ok(cfg) = agl::config::Config::load() else { return Vec::new() };
+    let Some(entry) = cfg.custom_agents.iter().find(|c| c.id == agent) else { return Vec::new() };
+    let builtin = builtin_agent(agent).map(|d| d.env).unwrap_or_default();
+    let mut env: Vec<(String, String)> = entry
+        .env
+        .iter()
+        .filter(|(k, v)| !builtin.iter().any(|(bk, bv)| bk == *k && bv == *v))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.sort();
+    env
 }
 
 /// Whether an agent's executable can be chosen here: agl's custom agents
@@ -83,9 +101,14 @@ fn builtin_agent(agent: &str) -> Option<agl::agents::AgentDef> {
     agl::agents::registry(&agl::config::Config::default()).into_iter().find(|d| d.id == agent)
 }
 
-/// Choose an agent's executable on this machine (`None` or blank: look it
-/// up on the PATH again); agl then re-reads its configuration.
-pub fn set_agent_command(agent: String, command: Option<String>) -> impl Future<Output = Result<()>> + Send + 'static {
+/// Choose an agent's executable (`None` or blank: look it up on the PATH)
+/// and the variables its processes start with, on this machine; agl then
+/// re-reads its configuration. Both live in agl's `custom_agents` entry.
+pub fn set_agent_launch(
+    agent: String,
+    command: Option<String>,
+    env: Vec<(String, String)>,
+) -> impl Future<Output = Result<()>> + Send + 'static {
     spawn(async move {
         use agl::agents::Protocol;
         let command = command
@@ -97,21 +120,29 @@ pub fn set_agent_command(agent: String, command: Option<String>) -> impl Future<
             });
         let mut cfg = agl::config::Config::load()?;
         cfg.custom_agents.retain(|c| c.id != agent);
-        if let Some(command) = command {
+        if command.is_some() || !env.is_empty() {
             let def = builtin_agent(&agent).ok_or_else(|| anyhow!("unknown agent {agent}"))?;
             let protocol = match def.protocol {
                 Protocol::Claude => "claude",
                 Protocol::Codex => "codex",
                 Protocol::Acp => "acp",
-                Protocol::Cursor | Protocol::Pi => bail!("this agent's executable cannot be changed"),
+                Protocol::Cursor | Protocol::Pi => bail!("this agent's executable and environment cannot be changed"),
             };
+            // No executable chosen: the agent's own command name, the first
+            // one found on the PATH, as agl would pick.
+            let command = command
+                .or_else(|| def.commands.iter().find(|c| agl::shellenv::which(c).is_some()).cloned())
+                .or_else(|| def.commands.first().cloned())
+                .ok_or_else(|| anyhow!("{agent} has no command"))?;
+            let mut merged: std::collections::HashMap<String, String> = def.env.into_iter().collect();
+            merged.extend(env);
             cfg.custom_agents.push(agl::config::CustomAgent {
                 id: def.id,
                 name: Some(def.name),
                 command,
                 args: def.args,
                 protocol: protocol.into(),
-                env: def.env.into_iter().collect(),
+                env: merged,
                 // agl keeps a built-in agent's own icon when none is named.
                 icon: None,
             });
@@ -371,6 +402,17 @@ static BACKENDS: Mutex<Option<HashMap<BackendKey, Arc<Backend>>>> = Mutex::new(N
 /// `peer:` id), `None` for this machine.
 pub fn backend(machine: Option<&str>) -> Arc<Backend> {
     backend_for(machine, "agl")
+}
+
+/// Whether this window talks to `machine`'s agents right now. Only looks:
+/// it never opens a connection.
+pub fn is_connected(machine: &str) -> bool {
+    BACKENDS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|all| all.get(&(Some(machine.to_string()), "agl")))
+        .is_some_and(|b| b.state() == ConnState::Connected)
 }
 
 /// A connection to `service` on `machine`, kept up like [`backend`]'s.

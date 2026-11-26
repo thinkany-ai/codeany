@@ -828,6 +828,7 @@ impl Workspace {
                 }
             }
             AgentPanelEvent::OpenFolder => self.open_folder(&OpenFolder, window, cx),
+            AgentPanelEvent::OpenSettings => self.open_settings(&OpenSettings, window, cx),
             AgentPanelEvent::TurnFinished => {
                 self.file_tree.update(cx, |tree, cx| tree.refresh(cx));
                 self.surfaces.update(cx, |surfaces, cx| surfaces.refresh(window, cx));
@@ -1109,8 +1110,29 @@ impl Workspace {
             Mode::Agent => crate::panel_views::cached(self.sidebar_view.clone()).into_any_element(),
             Mode::Editor => self.file_tree.clone().into_any_element(),
         };
-        let can_back = self.mode == Mode::Agent && self.agent_panel.read(cx).can_navigate(false);
-        let can_forward = self.mode == Mode::Agent && self.agent_panel.read(cx).can_navigate(true);
+        // Beside the window buttons: the workspace menu, as in Termany. The
+        // sidebar, back and forward buttons sit at the left of the tab strip.
+        let header: AnyElement = match self.mode {
+            Mode::Agent => self.agent_panel.update(cx, |panel, cx| panel.render_workspace_switcher(cx)),
+            Mode::Editor => div()
+                .flex()
+                .items_center()
+                .child(
+                    chrome_button("hide-sidebar")
+                        .child(crate::icons::sidebar().size(ICON))
+                        .text_color(theme.muted_foreground)
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)))
+                        .app_tooltip(t("Hide Sidebar (⌘B)")),
+                )
+                .child(
+                    chrome_button("sidebar-search")
+                        .child(crate::icons::search().size(ICON))
+                        .text_color(theme.muted_foreground)
+                        .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
+                        .app_tooltip(t("Search (⌘P)")),
+                )
+                .into_any_element(),
+        };
         let sidebar = div()
             .size_full().min_w_0().flex().flex_col().bg(theme.sidebar)
             .child(
@@ -1118,44 +1140,22 @@ impl Workspace {
                     .h(layout::HEADER).flex_none().flex().items_center()
                     .pt(layout::HEADER_TOP_INSET)
                     .pl(px(TRAFFIC_LIGHTS_WIDTH)).pr(layout::SIDEBAR_INSET)
-                    .child(
-                        chrome_button("hide-sidebar")
-                            .child(crate::icons::sidebar().size(ICON))
-                            .text_color(theme.muted_foreground)
-                            .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)))
-                            .app_tooltip(t("Hide Sidebar (⌘B)")),
-                    )
-                    .child(
-                        chrome_button("sidebar-search")
-                            .child(crate::icons::search().size(ICON))
-                            .text_color(theme.muted_foreground)
-                            .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
-                            .app_tooltip(t("Search (⌘P)")),
-                    )
-                    .child(Self::drag_region("sidebar-drag"))
-                    .child(
-                        chrome_button("sidebar-back").disabled(!can_back)
-                            .child(Icon::new(IconName::ArrowLeft).size(ICON))
-                            .text_color(theme.muted_foreground)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.agent_panel.update(cx, |panel, cx| panel.navigate(false, window, cx));
-                            }))
-                            .app_tooltip(t("Previous conversation")),
-                    )
-                    .child(
-                        chrome_button("sidebar-forward").disabled(!can_forward)
-                            .child(Icon::new(IconName::ArrowRight).size(ICON))
-                            .text_color(theme.muted_foreground)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.agent_panel.update(cx, |panel, cx| panel.navigate(true, window, cx));
-                            }))
-                            .app_tooltip(t("Next conversation")),
-                    ),
+                    .child(div().flex_1().min_w_0().child(header))
+                    .when(self.mode == Mode::Editor, |this| this.child(Self::drag_region("sidebar-drag"))),
             )
             .child(
                 div().flex_none().px(layout::SIDEBAR_INSET).pt(layout::SPACE_3)
-                    .flex().flex_col()
-                    .child(self.render_new_chat_button(cx)),
+                    .flex().items_center().gap(layout::SPACE_1)
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(self.render_new_chat_button(cx)))
+                    .when(self.mode == Mode::Agent, |this| {
+                        this.child(
+                            chrome_button("sidebar-search")
+                                .child(crate::icons::search().size(ICON))
+                                .text_color(theme.muted_foreground)
+                                .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
+                                .app_tooltip(t("Search (⌘P)")),
+                        )
+                    }),
             )
             .child(div().flex_1().min_h_0().min_w_0().child(content));
 
@@ -1194,26 +1194,18 @@ impl Workspace {
                     .app_tooltip(t("Settings (⌘,)")),
             )
             .child(div().flex_1())
-            .when_some(update, |this, _version| {
+            .when_some(update, |this, version| {
+                // Like the other chrome icons, in the accent color so a
+                // waiting update is noticed.
                 this.child(
-                    div()
-                        .id("install-update")
-                        .size(px(32.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.foreground.opacity(0.7))
-                        .text_color(theme.foreground)
-                        .cursor_pointer()
-                        .hover(|this| this.bg(theme.list_hover))
-                        .child(Icon::new(IconName::ArrowUp).size(ICON))
+                    chrome_button("install-update")
+                        .child(Icon::new(IconName::Download).size(ICON))
+                        .text_color(theme.primary)
                         .on_click(|_, _, _| {
                             #[cfg(target_os = "macos")]
                             crate::updater::check();
-                        }),
+                        })
+                        .app_tooltip(crate::i18n::tf("Update to v{version}", &[("version", version)])),
                 )
             })
     }
@@ -1497,9 +1489,50 @@ impl Workspace {
             .gap_2()
             .pr_2()
             .when(self.mode == Mode::Agent, |this| this.bg(theme.tab_bar))
-            .map(|this| {
+            .when(self.mode == Mode::Agent, |this| {
+                let can_back = self.agent_panel.read(cx).can_navigate(false);
+                let can_forward = self.agent_panel.read(cx).can_navigate(true);
+                let shown = self.show_sidebar;
+                // Left of the tabs, as in Termany: past the window buttons
+                // when the sidebar is hidden.
+                this.pl(if shown { layout::SPACE_2 } else { px(TRAFFIC_LIGHTS_WIDTH) })
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .child(
+                                chrome_button("toggle-sidebar")
+                                    .child(crate::icons::sidebar().size(ICON))
+                                    .text_color(theme.muted_foreground)
+                                    .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)))
+                                    .app_tooltip(if shown { t("Hide Sidebar (⌘B)") } else { t("Show Sidebar (⌘B)") }),
+                            )
+                            .child(
+                                chrome_button("conversation-back")
+                                    .disabled(!can_back)
+                                    .child(Icon::new(IconName::ChevronLeft).size(ICON))
+                                    .text_color(theme.muted_foreground)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.agent_panel.update(cx, |panel, cx| panel.navigate(false, window, cx));
+                                    }))
+                                    .app_tooltip(t("Previous conversation")),
+                            )
+                            .child(
+                                chrome_button("conversation-forward")
+                                    .disabled(!can_forward)
+                                    .child(Icon::new(IconName::ChevronRight).size(ICON))
+                                    .text_color(theme.muted_foreground)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.agent_panel.update(cx, |panel, cx| panel.navigate(true, window, cx));
+                                    }))
+                                    .app_tooltip(t("Next conversation")),
+                            ),
+                    )
+            })
+            .when(self.mode == Mode::Editor, |this| this.map(|this| {
                 if self.show_sidebar {
-                    this.when(self.mode == Mode::Editor, |this| this.pl_4())
+                    this.pl_4()
                 } else {
                     this.pl(px(TRAFFIC_LIGHTS_WIDTH)).child(
                         chrome_button("show-sidebar")
@@ -1510,7 +1543,7 @@ impl Workspace {
                             .app_tooltip(t("Show Sidebar (⌘B)")),
                     )
                 }
-            })
+            }))
             // The agent window's tabs say enough; the editor names its project.
             .when(self.mode == Mode::Editor, |this| this.child(
                 div()
