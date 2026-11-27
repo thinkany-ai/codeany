@@ -33,26 +33,27 @@ impl Extension for Diff {
     }
 
     fn build(&self, ctx: &SurfaceContext, _host: Host, _window: &mut Window, cx: &mut App) -> Box<dyn Surface> {
-        let project = ctx.project.clone();
+        let at = (ctx.machine.clone(), ctx.project.clone());
         Box::new(cx.new(|cx| {
             let panel = cx.new(GitPanel::new);
-            panel.update(cx, |panel, cx| panel.set_root(project.clone(), cx));
-            DiffSurface { panel, project }
+            panel.update(cx, |panel, cx| panel.set_root(at.0.clone(), at.1.clone(), cx));
+            DiffSurface { panel, at }
         }))
     }
 }
 
 pub struct DiffSurface {
     panel: Entity<GitPanel>,
-    project: Option<std::path::PathBuf>,
+    /// The device and the project there.
+    at: (Option<String>, Option<std::path::PathBuf>),
 }
 
 impl SurfaceView for DiffSurface {
     fn set_context(&mut self, ctx: &SurfaceContext, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.project != ctx.project {
-            self.project = ctx.project.clone();
-            let root = ctx.project.clone();
-            self.panel.update(cx, |panel, cx| panel.set_root(root, cx));
+        let at = (ctx.machine.clone(), ctx.project.clone());
+        if self.at != at {
+            self.at = at.clone();
+            self.panel.update(cx, |panel, cx| panel.set_root(at.0, at.1, cx));
         }
     }
 

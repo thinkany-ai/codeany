@@ -36,6 +36,10 @@ pub const ZH_CN: &[(&str, &str)] = &[
     // Terminal.
     ("Failed to start a shell: {err}", "无法启动 Shell：{err}"),
     ("[process exited]", "[进程已退出]"),
+    ("Could not open a terminal on {device}: {err}", "无法在 {device} 上打开终端：{err}"),
+    ("Update CodeAny on that device to use its terminal here.", "请更新那台设备上的 CodeAny，才能在这里使用它的终端。"),
+    ("that device did not answer", "那台设备没有响应"),
+    ("the connection closed", "连接已关闭"),
     // Pull request.
     ("The GitHub CLI (gh) is not installed. Install it with `brew install gh`.", "未安装 GitHub CLI (gh)。请使用 `brew install gh` 安装。"),
     ("Merged", "已合并"),
@@ -144,6 +148,10 @@ pub const ZH_TW: &[(&str, &str)] = &[
     // Terminal.
     ("Failed to start a shell: {err}", "無法啟動 Shell：{err}"),
     ("[process exited]", "[程序已結束]"),
+    ("Could not open a terminal on {device}: {err}", "無法在 {device} 上開啟終端機：{err}"),
+    ("Update CodeAny on that device to use its terminal here.", "請更新那台裝置上的 CodeAny，才能在這裡使用它的終端機。"),
+    ("that device did not answer", "那台裝置沒有回應"),
+    ("the connection closed", "連線已關閉"),
     // Pull request.
     ("The GitHub CLI (gh) is not installed. Install it with `brew install gh`.", "尚未安裝 GitHub CLI (gh)。請使用 `brew install gh` 安裝。"),
     ("Merged", "已合併"),
@@ -252,6 +260,10 @@ pub const JA: &[(&str, &str)] = &[
     // Terminal.
     ("Failed to start a shell: {err}", "シェルを起動できませんでした: {err}"),
     ("[process exited]", "[プロセスが終了しました]"),
+    ("Could not open a terminal on {device}: {err}", "{device} でターミナルを開けませんでした: {err}"),
+    ("Update CodeAny on that device to use its terminal here.", "ここでそのデバイスのターミナルを使うには、そのデバイスの CodeAny を更新してください。"),
+    ("that device did not answer", "そのデバイスが応答しませんでした"),
+    ("the connection closed", "接続が閉じられました"),
     // Pull request.
     ("The GitHub CLI (gh) is not installed. Install it with `brew install gh`.", "GitHub CLI (gh) がインストールされていません。`brew install gh` でインストールしてください。"),
     ("Merged", "マージ済み"),
@@ -360,6 +372,10 @@ pub const KO: &[(&str, &str)] = &[
     // Terminal.
     ("Failed to start a shell: {err}", "셸을 시작할 수 없습니다: {err}"),
     ("[process exited]", "[프로세스 종료됨]"),
+    ("Could not open a terminal on {device}: {err}", "{device}에서 터미널을 열 수 없습니다: {err}"),
+    ("Update CodeAny on that device to use its terminal here.", "여기에서 그 기기의 터미널을 사용하려면 그 기기의 CodeAny를 업데이트하세요."),
+    ("that device did not answer", "그 기기가 응답하지 않았습니다"),
+    ("the connection closed", "연결이 닫혔습니다"),
     // Pull request.
     ("The GitHub CLI (gh) is not installed. Install it with `brew install gh`.", "GitHub CLI(gh)가 설치되어 있지 않습니다. `brew install gh`로 설치하세요."),
     ("Merged", "병합됨"),

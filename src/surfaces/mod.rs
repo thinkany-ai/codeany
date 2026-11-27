@@ -24,6 +24,9 @@ use crate::style::size::TEXT;
 /// What every surface knows about where it is.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SurfaceContext {
+    /// The device the workspace is on; `None` is this one. The folders
+    /// below are folders there.
+    pub machine: Option<String>,
     /// The open project, if any.
     pub project: Option<PathBuf>,
     /// The project's git work tree, if it is in one.

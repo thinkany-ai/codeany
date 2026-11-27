@@ -106,6 +106,8 @@ enum TabContent {
 }
 
 struct EditorTab {
+    /// The device the file is on; `None` is this one.
+    machine: Option<String>,
     path: PathBuf,
     content: TabContent,
     dirty: bool,
@@ -163,6 +165,9 @@ pub struct Workspace {
     /// The active thread's worktree, shown in the file tree, surfaces and git
     /// status in place of `root`.
     work_dir: Option<PathBuf>,
+    /// The other device the conversation shown runs on, and its folder
+    /// there: the surfaces show that in place of anything on this one.
+    remote: Option<(String, Option<PathBuf>)>,
     /// The main window shows the agent; an editor window, opened from it, the editor.
     mode: Mode,
     /// From the main window: its editor window, while open.
@@ -232,13 +237,49 @@ fn modified_at(path: &Path) -> Option<SystemTime> {
 fn load_text(path: &Path) -> Result<String, SharedString> {
     let meta = std::fs::metadata(path).map_err(|e| SharedString::from(e.to_string()))?;
     if meta.len() > MAX_FILE_BYTES {
-        return Err(tf("File is too large to open ({size} MB)", &[("size", (meta.len() / 1024 / 1024).to_string())]).into());
+        return Err(too_large(meta.len()));
     }
     let bytes = std::fs::read(path).map_err(|e| SharedString::from(e.to_string()))?;
+    text_of(bytes)
+}
+
+fn too_large(bytes: u64) -> SharedString {
+    tf("File is too large to open ({size} MB)", &[("size", (bytes / 1024 / 1024).to_string())]).into()
+}
+
+fn text_of(bytes: Vec<u8>) -> Result<String, SharedString> {
     if bytes.iter().take(8192).any(|b| *b == 0) {
         return Err(t("Binary file is not displayed").into());
     }
     String::from_utf8(bytes).map_err(|_| t("File is not valid UTF-8").into())
+}
+
+/// [`load_text`] for a file on another device, through its agl. Blocks.
+fn load_remote_text(machine: &str, path: &Path) -> Result<String, SharedString> {
+    use base64::Engine as _;
+    // Its size first: a big file is not worth the trip.
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    let name = path.to_string_lossy();
+    let size = crate::exec::run(Some(machine), dir, &["wc", "-c", &name], &[]).map_err(SharedString::from)?;
+    if !size.ok() {
+        return Err(size.stderr.trim().to_string().into());
+    }
+    let size: u64 = size.stdout.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    if size > MAX_FILE_BYTES {
+        return Err(too_large(size));
+    }
+    let file = crate::exec::call(machine, "fs.read", serde_json::json!({ "path": path })).map_err(SharedString::from)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(file["content_base64"].as_str().unwrap_or_default())
+        .map_err(|err| SharedString::from(err.to_string()))?;
+    text_of(bytes)
+}
+
+/// Write a file on another device, through its agl. Blocks.
+fn save_remote_text(machine: &str, path: &Path, text: &str) -> Result<(), String> {
+    use base64::Engine as _;
+    let content = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    crate::exec::call(machine, "fs.write", serde_json::json!({ "path": path, "content_base64": content })).map(|_| ())
 }
 
 impl Workspace {
@@ -285,11 +326,11 @@ impl Workspace {
                 &file_tree,
                 window,
                 |this, _, event: &FileTreeEvent, window, cx| match event {
-                    FileTreeEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
+                    FileTreeEvent::OpenFile(path) => this.open_file(None, path.clone(), window, cx),
                 },
             ),
             cx.subscribe_in(&surfaces, window, |this, _, event: &SurfaceHostEvent, window, cx| match event {
-                SurfaceHostEvent::OpenFile(path) => this.show_file(path.clone(), window, cx),
+                SurfaceHostEvent::OpenFile { machine, path } => this.show_file(machine.clone(), path.clone(), window, cx),
             }),
             cx.observe(&surfaces, |_, _, cx| cx.notify()),
             // The system went light or dark: each window redraws in its theme.
@@ -302,9 +343,16 @@ impl Workspace {
             );
             subscriptions.push(cx.subscribe_in(&agent_panel, window, Self::on_agent_event));
             subscriptions.push(cx.observe_in(&agent_panel, window, |this, panel, window, cx| {
-                let work_dir = panel.read(cx).work_dir();
+                let (work_dir, remote) = {
+                    let panel = panel.read(cx);
+                    (panel.work_dir(), panel.remote_location())
+                };
                 if work_dir != this.work_dir {
                     this.set_work_dir(work_dir, window, cx);
+                }
+                if remote != this.remote {
+                    this.remote = remote;
+                    this.sync_surfaces(window, cx);
                 }
                 cx.notify();
             }));
@@ -313,6 +361,7 @@ impl Workspace {
         let mut this = Self {
             root: None,
             work_dir: None,
+            remote: None,
             renaming_tab: None,
             _rename_subscription: None,
             mode,
@@ -339,7 +388,24 @@ impl Workspace {
         if root.is_some() {
             this.set_root(root, window, cx);
         }
+        // A window that opens on another device's workspace.
+        if mode == Mode::Agent {
+            this.remote = this.agent_panel.read(cx).remote_location();
+            if this.remote.is_some() {
+                this.sync_surfaces(window, cx);
+            }
+        }
         this
+    }
+
+    /// Point the surfaces at what the window shows: the conversation's
+    /// folder on its device, or this one's project.
+    fn sync_surfaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (machine, dir) = match self.remote.clone() {
+            Some((machine, dir)) => (Some(machine), dir),
+            None => (None, self.shown_dir()),
+        };
+        self.surfaces.update(cx, |surfaces, cx| surfaces.set_location(machine, dir, window, cx));
     }
 
     /// The folder the file tree, surfaces and git status show.
@@ -353,8 +419,8 @@ impl Workspace {
         self.work_dir = work_dir;
         let dir = self.shown_dir();
         self.git = RepoSnapshot::default();
-        self.file_tree.update(cx, |tree, cx| tree.set_root(dir.clone(), cx));
-        self.surfaces.update(cx, |surfaces, cx| surfaces.set_project(dir, window, cx));
+        self.file_tree.update(cx, |tree, cx| tree.set_root(dir, cx));
+        self.sync_surfaces(window, cx);
     }
 
     fn set_root(&mut self, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
@@ -365,8 +431,7 @@ impl Workspace {
         self.git = RepoSnapshot::default();
         self.file_tree
             .update(cx, |tree, cx| tree.set_root(root.clone(), cx));
-        self.surfaces
-            .update(cx, |surfaces, cx| surfaces.set_project(root.clone(), window, cx));
+        self.sync_surfaces(window, cx);
         if self.mode == Mode::Agent {
             self.agent_panel
                 .update(cx, |panel, cx| panel.set_project(root.clone(), cx));
@@ -400,7 +465,7 @@ impl Workspace {
                         .flatten();
                     let (snapshot, listing) = cx
                         .background_executor()
-                        .spawn(async move { (git::snapshot(&root), dirs.map(FileTree::read_dirs)) })
+                        .spawn(async move { (git::snapshot(None, &root), dirs.map(FileTree::read_dirs)) })
                         .await;
                     let alive = this.update_in(cx, |this, window, cx| {
                         this.apply_snapshot(snapshot.unwrap_or_default(), listing, window, cx);
@@ -425,10 +490,6 @@ impl Workspace {
     ) {
         let changed = snapshot != self.git;
         self.git = snapshot.clone();
-        if self.mode == Mode::Agent {
-            let branch = snapshot.branch.clone();
-            self.agent_panel.update(cx, |panel, cx| panel.set_branch(branch, cx));
-        }
         self.file_tree.update(cx, |tree, cx| {
             tree.set_git(snapshot, cx);
             if let Some(listing) = listing {
@@ -447,7 +508,8 @@ impl Workspace {
 
     fn reload_changed_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for tab in &mut self.tabs {
-            if tab.dirty {
+            // A file on another device is read when it is opened.
+            if tab.dirty || tab.machine.is_some() {
                 continue;
             }
             let TabContent::Editor(editor) = &tab.content else {
@@ -468,50 +530,88 @@ impl Workspace {
         }
     }
 
-    fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.tabs.iter().position(|tab| tab.path == path) {
+    /// An editor on `text`, and what marks its tab dirty when it changes.
+    fn editor_content(path: &Path, text: String, window: &mut Window, cx: &mut Context<Self>) -> (TabContent, Option<Subscription>) {
+        let language = language_for(path);
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language(language)
+                .line_number(true)
+        });
+        editor.update(cx, |editor, cx| editor.set_value(text, window, cx));
+        let subscription = cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                if let Some(tab) = this.tabs.iter_mut().find(|tab| {
+                    matches!(&tab.content, TabContent::Editor(e) if *e == editor)
+                }) {
+                    if !tab.dirty {
+                        tab.dirty = true;
+                        cx.notify();
+                    }
+                }
+            }
+        });
+        (TabContent::Editor(editor), Some(subscription))
+    }
+
+    /// Open a file of `machine` (`None`: this one) in a tab.
+    fn open_file(&mut self, machine: Option<String>, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|tab| tab.path == path && tab.machine == machine) {
             self.activate_tab(ix, window, cx);
             return;
         }
 
-        let (content, subscription) = match load_text(&path) {
-            Ok(text) => {
-                let language = language_for(&path);
-                let editor = cx.new(|cx| {
-                    EditorState::new(window, cx)
-                        .language(language)
-                        .line_number(true)
-                });
-                editor.update(cx, |editor, cx| editor.set_value(text, window, cx));
-                let subscription = cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        if let Some(tab) = this.tabs.iter_mut().find(|tab| {
-                            matches!(&tab.content, TabContent::Editor(e) if *e == editor)
-                        }) {
-                            if !tab.dirty {
-                                tab.dirty = true;
-                                cx.notify();
-                            }
-                        }
-                    }
-                });
-                (TabContent::Editor(editor), Some(subscription))
-            }
-            Err(message) => (TabContent::Message(message), None),
+        let (content, subscription) = match &machine {
+            None => match load_text(&path) {
+                Ok(text) => Self::editor_content(&path, text, window, cx),
+                Err(message) => (TabContent::Message(message), None),
+            },
+            // It arrives from its device below.
+            Some(_) => (TabContent::Message(t("Loading…").into()), None),
         };
 
         let ix = self.active_tab.map(|ix| ix + 1).unwrap_or(self.tabs.len());
         self.tabs.insert(
             ix,
             EditorTab {
-                modified_at: modified_at(&path),
-                path,
+                modified_at: if machine.is_none() { modified_at(&path) } else { None },
+                machine: machine.clone(),
+                path: path.clone(),
                 content,
                 dirty: false,
                 _subscription: subscription,
             },
         );
         self.activate_tab(ix, window, cx);
+
+        let Some(machine) = machine else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn({
+                    let (machine, path) = (machine.clone(), path.clone());
+                    async move { load_remote_text(&machine, &path) }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                // Closed meanwhile.
+                let Some(ix) = this.tabs.iter().position(|tab| tab.path == path && tab.machine.as_ref() == Some(&machine)) else {
+                    return;
+                };
+                let (content, subscription) = match loaded {
+                    Ok(text) => Self::editor_content(&path, text, window, cx),
+                    Err(message) => (TabContent::Message(message), None),
+                };
+                this.tabs[ix].content = content;
+                this.tabs[ix]._subscription = subscription;
+                if this.active_tab == Some(ix) {
+                    this.activate_tab(ix, window, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn activate_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -575,14 +675,40 @@ impl Workspace {
             return;
         };
         let text = editor.read(cx).value();
-        match std::fs::write(&tab.path, text.as_bytes()) {
+        let (machine, path) = (tab.machine.clone(), tab.path.clone());
+        let Some(machine) = machine else {
+            let saved = std::fs::write(&path, text.as_bytes()).map_err(|err| err.to_string());
+            self.saved(None, path, saved, window, cx);
+            return;
+        };
+        // Its device writes it; the tab stays dirty until that is done.
+        cx.spawn_in(window, async move |this, cx| {
+            let saved = cx
+                .background_executor()
+                .spawn({
+                    let (machine, path) = (machine.clone(), path.clone());
+                    async move { save_remote_text(&machine, &path, &text) }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| this.saved(Some(machine), path, saved, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// A save ended: the tab is clean, or the window says why not.
+    fn saved(&mut self, machine: Option<String>, path: PathBuf, result: Result<(), String>, window: &mut Window, cx: &mut Context<Self>) {
+        match result {
             Ok(()) => {
-                tab.dirty = false;
-                tab.modified_at = modified_at(&tab.path);
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path == path && tab.machine == machine) {
+                    tab.dirty = false;
+                    if machine.is_none() {
+                        tab.modified_at = modified_at(&path);
+                    }
+                }
                 self.surfaces.update(cx, |surfaces, cx| surfaces.refresh(window, cx));
             }
             Err(err) => {
-                let message = tf("Failed to save {path}: {err}", &[("path", tab.path.display().to_string()), ("err", err.to_string())]);
+                let message = tf("Failed to save {path}: {err}", &[("path", path.display().to_string()), ("err", err)]);
                 let message: SharedString = message.into();
                 window.push_notification(
                     Notification::new()
@@ -659,7 +785,7 @@ impl Workspace {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default()
                     .into();
-                let status = self.git.statuses.get(&tab.path).copied();
+                let status = self.git.statuses.get(&tab.path).copied().filter(|_| tab.machine.is_none());
                 div()
                     .id(ix)
                     .group("tab")
@@ -891,11 +1017,16 @@ impl Workspace {
     ) {
         match event {
             AgentPanelEvent::OpenFile(path) => {
-                let path = match (&self.shown_dir(), path.is_relative()) {
+                // A file the conversation names is on the device it runs on.
+                let (machine, root) = match self.remote.clone() {
+                    Some((machine, dir)) => (Some(machine), dir),
+                    None => (None, self.shown_dir()),
+                };
+                let path = match (&root, path.is_relative()) {
                     (Some(root), true) => root.join(path),
                     _ => path.clone(),
                 };
-                self.show_file(path, window, cx);
+                self.show_file(machine, path, window, cx);
             }
             AgentPanelEvent::SwitchProject(project) => {
                 if *project != self.root {
@@ -913,13 +1044,13 @@ impl Workspace {
 
     /// Open a file in the editor: here in an editor window, or in the main
     /// window's editor window.
-    fn show_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn show_file(&mut self, machine: Option<String>, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match self.mode {
-            Mode::Editor => self.open_file(path, window, cx),
+            Mode::Editor => self.open_file(machine, path, window, cx),
             Mode::Agent => {
                 if let Some((handle, editor)) = self.ensure_editor_window(window, cx) {
                     let _ = handle.update(cx, |_, window, cx| {
-                        editor.update(cx, |editor, cx| editor.open_file(path, window, cx))
+                        editor.update(cx, |editor, cx| editor.open_file(machine, path, window, cx))
                     });
                 }
             }

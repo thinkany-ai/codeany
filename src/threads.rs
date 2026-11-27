@@ -168,12 +168,23 @@ pub struct Worktree {
     /// Where the worktree is checked out, under `~/.codeany/worktrees`.
     pub path: PathBuf,
     pub branch: String,
+    /// The project folder resolved inside the checkout by the owning device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_dir: Option<PathBuf>,
 }
+
+// Preparing and deleting a worktree both touch the repository's worktree list.
+static WORKTREE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Worktree {
     /// A worktree for thread `id` of `project`, named after its title.
+    #[cfg(test)]
     pub fn plan(project: &Path, id: u64, title: &str) -> Option<Self> {
-        let repo = crate::git::toplevel(project)?;
+        let git = crate::git::ProjectGit::read(project)?;
+        Some(Self::from_project(&git, id, title))
+    }
+
+    pub fn from_project(git: &crate::git::ProjectGit, id: u64, title: &str) -> Self {
         let mut slug = String::new();
         for c in title.chars() {
             if c.is_ascii_alphanumeric() {
@@ -193,19 +204,54 @@ impl Worktree {
         } else {
             format!("codeany/{slug}-{suffix}")
         };
-        Some(Self {
-            path: crate::paths::worktree_dir(&repo, id),
-            repo,
-            branch,
-        })
+        // Join with the separator of the device that owns the checkout.
+        let mut path = git.worktrees.clone().into_os_string();
+        path.push(git.path_separator.to_string());
+        path.push(id.to_string());
+        Self { repo: git.repo.clone(), path: path.into(), branch, checkout_dir: None }
+    }
+
+    pub fn validate_on_host(&self, project: &Path, id: u64) -> Result<(), String> {
+        let repo = crate::git::toplevel(None, project).ok_or("The project is not a Git repository")?;
+        let managed_branch = self.branch.strip_prefix("codeany/").is_some_and(|name| {
+            name.ends_with(&format!("-{}", id % 1_000_000))
+                && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        });
+        if self.repo != repo || self.path != crate::paths::worktree_dir(&repo, id) || !managed_branch {
+            return Err("Invalid worktree for this project".into());
+        }
+        Ok(())
+    }
+
+    pub fn prepare(&self, base: Option<&str>) -> Result<(), String> {
+        let _checkout = WORKTREE_LOCK.lock().unwrap();
+        if !self.path.exists() {
+            crate::git::add_worktree(&self.repo, &self.path, &self.branch, base)
+                .map_err(|err| format!("Cannot create the worktree: {err}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn cleanup(&self) {
+        let _checkout = WORKTREE_LOCK.lock().unwrap();
+        if let Err(err) = crate::git::remove_worktree(&self.repo, &self.path, &self.branch) {
+            eprintln!("codeany: kept worktree {} ({}): {err}", self.path.display(), self.branch);
+        }
     }
 
     /// The folder in the worktree that matches `project` in the main checkout.
     pub fn dir_for(&self, project: &Path) -> PathBuf {
-        match project.strip_prefix(&self.repo) {
-            Ok(rel) => self.path.join(rel),
-            Err(_) => self.path.clone(),
+        if let Ok(relative) = project.strip_prefix(&self.repo) {
+            return self.path.join(relative);
         }
+        // Git returns a physical checkout path even when the project was
+        // opened through a symlink.
+        if let (Ok(project), Ok(repo)) = (project.canonicalize(), self.repo.canonicalize())
+            && let Ok(relative) = project.strip_prefix(&repo)
+        {
+            return self.path.join(relative);
+        }
+        self.path.clone()
     }
 }
 
@@ -240,6 +286,9 @@ pub struct Thread {
     /// The worktree the agent works in instead of `project` itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
+    /// The starting branch for a new worktree or a pending project checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_branch: Option<String>,
     /// Done with: kept, but listed apart.
     #[serde(default)]
     pub settled: bool,
@@ -266,6 +315,7 @@ impl Thread {
             native_ids: HashMap::new(),
             seen: HashMap::new(),
             worktree: None,
+            start_branch: None,
             settled: false,
             items: Vec::new(),
             updated_at: now_secs(),
@@ -278,7 +328,8 @@ impl Thread {
     pub fn cwd(&self) -> Option<PathBuf> {
         if let Some(project) = &self.project {
             return Some(match &self.worktree {
-                Some(worktree) => worktree.dir_for(project),
+                Some(worktree) if self.machine.is_none() => worktree.dir_for(project),
+                Some(_) => return None, // The owning device resolves this path.
                 None => project.clone(),
             });
         }
@@ -1188,6 +1239,8 @@ mod worktree_plan_tests {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let plan = Worktree::plan(&src, 1_700_000_123_456, "Fix the Login bug!").unwrap();
         assert_eq!(plan.branch, "codeany/fix-the-login-bug-123456");
+        assert!(plan.validate_on_host(&src, 1_700_000_123_456).is_ok());
+        assert!(plan.validate_on_host(&src, 42).is_err());
         // Named after the checkout's folder, whatever it is called (CI's is `codeany`).
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).file_name().unwrap();
         assert!(plan.path.ends_with(Path::new("worktrees").join(repo).join("1700000123456")));

@@ -40,7 +40,14 @@ pub enum FileTreeEvent {
 }
 
 pub struct FileTree {
+    /// The device `root` is on; `None` is this one.
+    machine: Option<String>,
     root: Option<PathBuf>,
+    /// Why the root's folder on another device is not listed (yet).
+    notice: Option<SharedString>,
+    /// Bumped whenever the root changes, so a late listing of the old one
+    /// is dropped.
+    generation: usize,
     children: HashMap<PathBuf, Vec<DirEntry>>,
     expanded: HashSet<PathBuf>,
     rows: Vec<Row>,
@@ -87,10 +94,43 @@ fn read_dir(dir: &Path) -> Vec<DirEntry> {
     entries
 }
 
+/// The entries of `dir` on another device, through its agl. Blocks.
+fn read_remote_dir(machine: &str, dir: &Path) -> Result<Vec<DirEntry>, String> {
+    // `-p` marks folders, `-L` those behind a link too.
+    let output = crate::exec::run(Some(machine), dir, &["ls", "-1ApL"], &[])?;
+    // A dangling link fails the listing without spoiling the rest of it.
+    if !output.ok() && output.stdout.is_empty() {
+        return Err(output.stderr.trim().to_string());
+    }
+    let mut entries: Vec<DirEntry> = output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let (name, is_dir) = match line.strip_suffix('/') {
+                Some(name) => (name, true),
+                None => (line, false),
+            };
+            if name.is_empty() || HIDDEN_NAMES.contains(&name) {
+                return None;
+            }
+            Some(DirEntry { path: dir.join(name), name: name.to_string().into(), is_dir })
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
 impl FileTree {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            machine: None,
             root: None,
+            notice: None,
+            generation: 0,
             children: HashMap::new(),
             expanded: HashSet::new(),
             rows: Vec::new(),
@@ -102,16 +142,69 @@ impl FileTree {
     }
 
     pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.set_location(None, root, cx);
+    }
+
+    /// Show `root` on `machine` (`None`: this one).
+    pub fn set_location(&mut self, machine: Option<String>, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.machine = machine;
         self.root = root;
+        self.generation += 1;
+        self.notice = None;
         self.children.clear();
         self.expanded.clear();
         self.selected = None;
         if let Some(root) = self.root.clone() {
-            self.children.insert(root.clone(), read_dir(&root));
-            self.expanded.insert(root);
+            self.expanded.insert(root.clone());
+            self.load_dir(root, cx);
         }
         self.rebuild_rows();
         cx.notify();
+    }
+
+    /// Read `dir`: at once here, in the background on another device.
+    fn load_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(machine) = self.machine.clone() else {
+            self.children.insert(dir.clone(), read_dir(&dir));
+            return;
+        };
+        let is_root = self.root.as_ref() == Some(&dir);
+        if is_root {
+            self.notice = Some(t("Loading…").into());
+        }
+        let generation = self.generation;
+        cx.spawn(async move |this, cx| {
+            let entries = cx
+                .background_executor()
+                .spawn({
+                    let dir = dir.clone();
+                    async move { read_remote_dir(&machine, &dir) }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match entries {
+                    Ok(entries) => {
+                        if is_root {
+                            this.notice = None;
+                        }
+                        this.children.insert(dir, entries);
+                    }
+                    Err(err) => {
+                        if is_root {
+                            this.notice = Some(err.into());
+                        }
+                        this.expanded.remove(&dir);
+                    }
+                }
+                this.rebuild_rows();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn set_git(&mut self, git: RepoSnapshot, cx: &mut Context<Self>) {
@@ -124,8 +217,32 @@ impl FileTree {
     /// Re-read every loaded directory, picking up files created or removed
     /// outside the editor.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let listing = Self::read_dirs(self.loaded_dirs());
-        self.apply_listing(listing, cx);
+        let Some(machine) = self.machine.clone() else {
+            let listing = Self::read_dirs(self.loaded_dirs());
+            self.apply_listing(listing, cx);
+            return;
+        };
+        let (dirs, generation) = (self.loaded_dirs(), self.generation);
+        cx.spawn(async move |this, cx| {
+            let listing = cx
+                .background_executor()
+                .spawn(async move {
+                    // A folder that cannot be read right now keeps what it showed.
+                    Listing(
+                        dirs.into_iter()
+                            .filter_map(|dir| read_remote_dir(&machine, &dir).ok().map(|entries| (dir, Some(entries))))
+                            .collect(),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.apply_listing(listing, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The directories loaded, to read again with [`Self::read_dirs`].
@@ -185,7 +302,7 @@ impl FileTree {
                 break;
             }
             if !self.children.contains_key(d) {
-                self.children.insert(d.to_path_buf(), read_dir(d));
+                self.load_dir(d.to_path_buf(), cx);
             }
             self.expanded.insert(d.to_path_buf());
             dir = d.parent();
@@ -219,12 +336,12 @@ impl FileTree {
         }
     }
 
-    fn toggle_dir(&mut self, path: &Path) {
+    fn toggle_dir(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.expanded.remove(path) {
             return;
         }
         if !self.children.contains_key(path) {
-            self.children.insert(path.to_path_buf(), read_dir(path));
+            self.load_dir(path.to_path_buf(), cx);
         }
         self.expanded.insert(path.to_path_buf());
     }
@@ -235,7 +352,7 @@ impl FileTree {
         };
         self.selected = Some(row.entry.path.clone());
         if row.entry.is_dir {
-            self.toggle_dir(&row.entry.path);
+            self.toggle_dir(&row.entry.path, cx);
             self.rebuild_rows();
         } else {
             cx.emit(FileTreeEvent::OpenFile(row.entry.path));
@@ -374,6 +491,9 @@ impl Render for FileTree {
                     .text_color(theme.muted_foreground)
                     .child(title),
             )
+            .when_some(self.notice.clone().filter(|_| self.rows.is_empty()), |this, notice| {
+                this.child(div().px_3().py_2().text_size(TEXT).text_color(theme.muted_foreground).child(notice))
+            })
             .child(
                 uniform_list(
                     "file-tree",

@@ -29,6 +29,7 @@ use crate::hub::{Hub, HubEvent, PromptState, Shared};
 use crate::{
     agent_icons::{agent_color, agent_icon},
     agl_bridge,
+    git::ProjectGit,
     chat_tabs::TabSet,
     i18n::{t, tf},
     model_picker::{ModelPicker, ModelPickerEvent, model_display_name},
@@ -60,7 +61,7 @@ const THREADS_PER_PROJECT: usize = 8;
 
 /// An error line for display. The errors CodeAny writes itself are stored in
 /// English and shown in the current language; agents' own errors pass through.
-fn display_error(text: &str) -> String {
+pub fn display_error(text: &str) -> String {
     match text {
         "Interrupted" => t("Interrupted").into(),
         "The turn failed" => t("The turn failed").into(),
@@ -152,8 +153,10 @@ pub struct AgentPanel {
     composer: Entity<TextareaState>,
     /// Images pasted into the composer, sent with the next message.
     attachments: Vec<PathBuf>,
-    /// The open project's git branch, from the workspace's polling.
-    branch: Option<String>,
+    git_project: Option<(Option<String>, PathBuf)>,
+    project_git: Option<ProjectGit>,
+    git_poll: Option<Task<()>>,
+    start_branch: Option<String>,
     /// The transcript, virtualized: one row per turn (and one for the
     /// "Working…" line), laid out only while in view. It follows the tail
     /// as a reply grows; scrolling up stops that, so a running turn cannot
@@ -331,7 +334,10 @@ impl AgentPanel {
             copied: None,
             composer,
             attachments: Vec::new(),
-            branch: None,
+            git_project: None,
+            project_git: None,
+            git_poll: None,
+            start_branch: None,
             chat_list,
             chat_thread: None,
             chat_turns: Vec::new(),
@@ -365,7 +371,6 @@ impl AgentPanel {
             return;
         }
         self.project = project;
-        self.branch = None;
         // Each project has its own tabs; show the one last active there.
         let current = self.tab_set_mut().current();
         self.active = current;
@@ -819,12 +824,50 @@ impl AgentPanel {
         pasted
     }
 
-    /// The open project's current branch, as the workspace last saw it.
-    pub fn set_branch(&mut self, branch: Option<String>, cx: &mut Context<Self>) {
-        if self.branch != branch {
-            self.branch = branch;
-            cx.notify();
+    fn project_target(&self, thread: Option<&Thread>) -> Option<(Option<String>, PathBuf)> {
+        let (machine, project) = match thread {
+            Some(thread) => (thread.machine.clone(), thread.project.clone()),
+            None => match &self.machine {
+                Some(machine) => (Some(machine.clone()), self.s().store.remote_dirs.get(machine).cloned()),
+                None => (None, self.project.clone()),
+            },
+        };
+        project.map(|project| (machine, project))
+    }
+
+    fn poll_project_git(&mut self, target: Option<(Option<String>, PathBuf)>, cx: &mut Context<Self>) {
+        if self.git_project == target {
+            return;
         }
+        self.git_project = target.clone();
+        self.project_git = None;
+        self.start_branch = None;
+        self.git_poll = target.map(|(machine, path)| cx.spawn(async move |this, cx| {
+            loop {
+                let git = match machine.as_deref() {
+                    Some(machine) => agl_bridge::backend_for(Some(machine), crate::sync::SERVICE)
+                        .call("git.project", serde_json::json!({ "path": path }))
+                        .await
+                        .ok()
+                        .and_then(|reply| serde_json::from_value::<Option<ProjectGit>>(reply).ok()),
+                    None => {
+                        let path = path.clone();
+                        Some(cx.background_executor().spawn(async move { ProjectGit::read(&path) }).await)
+                    }
+                };
+                if this.update(cx, |this, cx| {
+                    if let Some(git) = git
+                        && git != this.project_git
+                    {
+                        this.project_git = git;
+                        cx.notify();
+                    }
+                }).is_err() {
+                    break;
+                }
+                cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
+            }
+        }));
     }
 
     /// Pick files to attach: images show as pictures, other files by name.
@@ -892,11 +935,13 @@ impl AgentPanel {
                 } else {
                     text.lines().next().unwrap_or("").chars().take(60).collect()
                 };
-                if self.use_worktree && thread.machine.is_none() {
-                    thread.worktree = thread
-                        .project
-                        .as_deref()
-                        .and_then(|project| Worktree::plan(project, thread.id, &thread.title));
+                if self.git_project == self.project_target(None)
+                    && let Some(git) = &self.project_git
+                {
+                    if self.use_worktree {
+                        thread.worktree = Some(Worktree::from_project(git, thread.id, &thread.title));
+                    }
+                    thread.start_branch = self.start_branch.take();
                 }
                 let id = thread.id;
                 self.sm().store.threads.insert(0, thread);
@@ -1024,6 +1069,19 @@ impl AgentPanel {
             Some(Ok(agents)) => Some(agents.clone()),
             _ => None,
         }
+    }
+
+    /// How looking for this machine's agents went: `None` while it runs or
+    /// before it has (a thread on another device looks there instead).
+    pub fn local_agents_result(&self) -> Option<Result<Vec<AgentInfo>, String>> {
+        self.s().agents_cache.get(&None).cloned()
+    }
+
+    /// Look for this machine's agents again, after they could not be listed.
+    pub fn retry_local_agents(&mut self, cx: &mut Context<Self>) {
+        self.sm().agents_cache.remove(&None);
+        self.detect_agents(None, cx);
+        cx.notify();
     }
 
     /// Look for the agents of the machine the composer talks to again, after
@@ -1584,7 +1642,6 @@ impl AgentPanel {
         if project != self.project {
             cx.emit(AgentPanelEvent::SwitchProject(project.clone()));
             self.project = project;
-            self.branch = None;
         }
         self.new_thread(window, cx);
     }
@@ -2427,12 +2484,14 @@ impl AgentPanel {
 
     pub fn render_chat(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.report();
+        let (id, target) = {
+            let thread = self.active_thread()
+                .filter(|t| !t.items.is_empty() || self.s().pending_prompts.contains_key(&t.id));
+            (thread.as_ref().map(|t| t.id), self.project_target(thread.as_deref()))
+        };
+        self.poll_project_git(target, cx);
         let theme = cx.theme().clone();
-        let Some(id) = self
-            .active_thread()
-            .filter(|t| !t.items.is_empty() || self.s().pending_prompts.contains_key(&t.id))
-            .map(|t| t.id)
-        else {
+        let Some(id) = id else {
             return self.render_empty(cx);
         };
         self.sync_chat_rows(id);
@@ -3214,6 +3273,7 @@ impl AgentPanel {
             .child(div().text_size(TEXT).child(label.into()))
             .text_size(TEXT)
             .text_color(cx.theme().muted_foreground)
+            .dropdown_caret(true)
     }
 
     /// The machine the agent runs on: fixed for a thread, a choice for a new one.
@@ -3388,7 +3448,7 @@ impl AgentPanel {
             };
         }
         // Only a git repository can have worktrees.
-        let git = self.branch.is_some();
+        let git = self.project_git.is_some();
         let worktree = self.use_worktree && git;
         let label = t(if worktree { "New worktree" } else { "Local" });
         let entity = cx.entity().downgrade();
@@ -3411,6 +3471,54 @@ impl AgentPanel {
             .into_any_element()
     }
 
+    fn render_branch_picker(&self, thread: Option<&Thread>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if let Some(thread) = thread {
+            let branch = thread.worktree.as_ref().map(|worktree| worktree.branch.clone())
+                .or_else(|| thread.start_branch.clone())
+                .or_else(|| {
+                    let git = self.project_git.as_ref()?;
+                    Some(git.branch.clone().unwrap_or_else(|| t("Detached HEAD").into()))
+                })?;
+            return Some(self.context_label("branch", IconName::GitBranch, branch, Some(t("Current branch").into()), cx));
+        }
+
+        let git = self.project_git.as_ref()?;
+        let picked = self.start_branch.clone();
+        let current = git.branch.clone();
+        let label = picked.clone().or_else(|| current.clone()).unwrap_or_else(|| t("Detached HEAD").into());
+        let branches = git.branches.clone();
+        if branches.is_empty() {
+            return Some(self.context_label("branch", IconName::GitBranch, label, None, cx));
+        }
+        let entity = cx.entity().downgrade();
+        Some(Self::context_button("branch-picker", IconName::GitBranch, label, cx)
+            .dropdown_menu(move |mut menu, _, _| {
+                let panel = entity.clone();
+                menu = menu.item(crate::style::menu_item(t("Current branch"))
+                    .checked(picked.is_none())
+                    .on_click(move |_, _, cx| {
+                        panel.update(cx, |this, cx| {
+                            this.start_branch = None;
+                            cx.notify();
+                        }).ok();
+                    }));
+                for branch in &branches {
+                    let panel = entity.clone();
+                    let branch = branch.clone();
+                    menu = menu.item(crate::style::menu_item(branch.clone())
+                        .checked(picked.as_ref() == Some(&branch))
+                        .on_click(move |_, _, cx| {
+                            panel.update(cx, |this, cx| {
+                                this.start_branch = Some(branch.clone());
+                                cx.notify();
+                            }).ok();
+                        }));
+                }
+                menu
+            })
+            .into_any_element())
+    }
+
     fn set_use_worktree(&mut self, on: bool, cx: &mut Context<Self>) {
         self.use_worktree = on;
         cx.notify();
@@ -3422,6 +3530,27 @@ impl AgentPanel {
         let thread = self.active_thread().filter(|t| t.machine.is_none())?;
         let dir = thread.worktree.as_ref()?.dir_for(thread.project.as_deref()?);
         dir.exists().then_some(dir)
+    }
+
+    /// The other device the conversation shown runs on (the open thread's,
+    /// or a new thread's) and its folder there; `None` on this device. The
+    /// workspace points its surfaces there.
+    pub fn remote_location(&self) -> Option<(String, Option<PathBuf>)> {
+        match self.active_thread() {
+            Some(thread) => {
+                let machine = thread.machine.clone()?;
+                let folder = match &thread.worktree {
+                    Some(worktree) => worktree.checkout_dir.clone(),
+                    None => thread.project.clone(),
+                };
+                Some((machine, folder))
+            }
+            None => {
+                let machine = self.machine.clone()?;
+                let dir = self.s().store.remote_dirs.get(&machine).cloned();
+                Some((machine, dir))
+            }
+        }
     }
 
     /// The folder on another machine a new thread works in.
@@ -3472,14 +3601,7 @@ impl AgentPanel {
                 }))
                 .p_0()
                 .trigger(
-                    Button::new("remote-folder-button")
-                        .ghost()
-                        .small()
-                        .h(layout::CONTROL)
-                        .app_icon(IconName::Folder)
-                        .child(div().text_size(TEXT).child(label))
-                        .text_size(TEXT)
-                        .text_color(theme.muted_foreground)
+                    Self::context_button("remote-folder-button", IconName::Folder, label, cx)
                         .app_tooltip(full),
                 )
                 .content(move |_, _, _| folders.clone())
@@ -3621,17 +3743,9 @@ impl AgentPanel {
         } else {
             Some(self.render_project_picker(thread, cx))
         };
-        let local_project = !remote && thread.map_or(self.project.is_some(), |t| t.project.is_some());
-        let workspace_picker = local_project.then(|| self.render_workspace_picker(thread, cx));
-        // A worktree thread shows its own branch, even before it is checked out.
-        let branch = thread
-            .and_then(|t| t.worktree.as_ref())
-            .map(|w| w.branch.clone())
-            .or_else(|| self.branch.clone())
-            .filter(|_| local_project);
-        let branch = branch.map(|branch| {
-            self.context_label("branch", IconName::GitBranch, branch, Some(t("Current branch").into()), cx)
-        });
+        let has_project = self.project_target(thread).is_some();
+        let workspace_picker = has_project.then(|| self.render_workspace_picker(thread, cx));
+        let branch = has_project.then(|| self.render_branch_picker(thread, cx)).flatten();
 
         let access = self.access.clone();
         let access_picker = Button::new("access-picker")
@@ -3833,6 +3947,7 @@ impl AgentPanel {
                                 )
                             })
                     })
+                    .child(access_picker)
                     .child(div().flex_1())
                     .when(will_queue && can_send, |this| {
                         this.child(
@@ -3858,10 +3973,17 @@ impl AgentPanel {
             .gap(layout::SPACE_1)
             .child(machine_picker)
             .when_some(project_picker, |this, picker| this.child(divider()).child(picker))
-            .when_some(workspace_picker, |this, picker| this.child(picker))
-            .child(div().flex_1())
-            .when_some(branch, |this, branch| this.child(branch))
-            .child(access_picker);
+            .when_some(workspace_picker, |this, picker| {
+                this.child(
+                    div()
+                        .ml_auto()
+                        .flex()
+                        .items_center()
+                        .gap(layout::SPACE_1)
+                        .child(picker)
+                        .when_some(branch, |this, branch| this.child(branch)),
+                )
+            });
 
         div()
             .w_full()

@@ -64,10 +64,11 @@ impl FilesSurface {
     /// Color files by their git status.
     fn load_status(&self, cx: &mut Context<Self>) {
         let (Some(project), tree) = (self.ctx.project.clone(), self.tree.clone()) else { return };
+        let machine = self.ctx.machine.clone();
         cx.spawn(async move |_, cx| {
             let snapshot = cx
                 .background_executor()
-                .spawn(async move { git::snapshot(&project) })
+                .spawn(async move { git::snapshot(machine.as_deref(), &project) })
                 .await
                 .unwrap_or_default();
             tree.update(cx, |tree, cx| tree.set_git(snapshot, cx));
@@ -78,9 +79,9 @@ impl FilesSurface {
 
 impl SurfaceView for FilesSurface {
     fn set_context(&mut self, ctx: &SurfaceContext, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.ctx.project != ctx.project {
-            let root = ctx.project.clone();
-            self.tree.update(cx, |tree, cx| tree.set_root(root, cx));
+        if self.ctx.project != ctx.project || self.ctx.machine != ctx.machine {
+            let (machine, root) = (ctx.machine.clone(), ctx.project.clone());
+            self.tree.update(cx, |tree, cx| tree.set_location(machine, root, cx));
         }
         self.ctx = ctx.clone();
         self.load_status(cx);

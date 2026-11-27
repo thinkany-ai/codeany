@@ -407,6 +407,7 @@ async fn services() -> Result<Vec<ExposedService>> {
             let endpoint = agl_bridge::local_endpoint().await?;
             out.push(ExposedService::ws(SERVICE, &endpoint.url())?);
             out.push(ExposedService::ws(crate::sync::SERVICE, &crate::sync::server_url().await?)?);
+            out.push(ExposedService::ws(crate::pty_host::SERVICE, &crate::pty_host::server_url().await?)?);
         }
     }
     Ok(out)

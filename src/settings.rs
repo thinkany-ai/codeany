@@ -769,21 +769,54 @@ impl Settings {
     fn render_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let _ = window;
         let theme = cx.theme().clone();
-        let agents = self
-            .agent_panel
-            .upgrade()
-            .and_then(|panel| panel.read(cx).local_agents().map(|a| a.to_vec()));
+        let result = self.agent_panel.upgrade().and_then(|panel| panel.read(cx).local_agents_result());
+        if result.is_none() {
+            // Nothing has looked on this machine yet when the open thread
+            // runs on another device; asking twice looks once.
+            let panel = self.agent_panel.clone();
+            cx.defer(move |cx| {
+                panel.update(cx, |panel, cx| panel.redetect_local_agents(cx)).ok();
+            });
+        }
         let intro = div()
             .mb_2()
             .text_size(TEXT)
             .text_color(theme.muted_foreground)
             .child(t("Each agent you turn on is offered when you start or switch a thread. Its executable, arguments and icon are under Edit, with a connection test."));
-        let Some(mut agents) = agents else {
-            return div()
-                .child(Self::heading("Agents", cx))
-                .child(intro)
-                .child(div().text_size(TEXT).text_color(theme.muted_foreground).child(t("Detecting agents…")))
-                .into_any_element();
+        let mut agents = match result {
+            Some(Ok(agents)) => agents,
+            // Why none are listed, and a way to look again.
+            Some(Err(err)) => {
+                let panel = self.agent_panel.clone();
+                return div()
+                    .child(Self::heading("Agents", cx))
+                    .child(intro)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap(crate::style::layout::SPACE_2)
+                            .child(div().text_size(TEXT).text_color(theme.danger).child(t("Agents unavailable")))
+                            .child(
+                                div()
+                                    .text_size(TEXT)
+                                    .text_color(theme.muted_foreground)
+                                    .child(SharedString::from(crate::agent_panel::display_error(&err))),
+                            )
+                            .child(Button::new("agents-retry").small().app_label(t("Try again")).on_click(move |_, _, cx| {
+                                panel.update(cx, |panel, cx| panel.retry_local_agents(cx)).ok();
+                            })),
+                    )
+                    .into_any_element();
+            }
+            None => {
+                return div()
+                    .child(Self::heading("Agents", cx))
+                    .child(intro)
+                    .child(div().text_size(TEXT).text_color(theme.muted_foreground).child(t("Detecting agents…")))
+                    .into_any_element();
+            }
         };
         agents.sort_by_key(|a| !a.available);
         let mut rows = div();

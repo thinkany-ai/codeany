@@ -1,4 +1,4 @@
-//! Terminal: a shell in the project directory.
+//! Terminal: a shell in the project directory, on the workspace's device.
 
 use std::path::PathBuf;
 
@@ -32,30 +32,36 @@ impl Extension for TerminalExt {
     }
 
     fn build(&self, ctx: &SurfaceContext, _host: Host, window: &mut Window, cx: &mut App) -> Box<dyn Surface> {
-        Box::new(cx.new(|cx| TerminalSurface::new(ctx.project.clone(), window, cx)))
+        Box::new(cx.new(|cx| TerminalSurface::new(ctx.machine.clone(), ctx.project.clone(), window, cx)))
     }
 }
 
 pub struct TerminalSurface {
+    /// The device the shell runs on; `None` is this one.
+    machine: Option<String>,
     cwd: Option<PathBuf>,
     terminal: Result<Entity<TerminalView>, String>,
 }
 
 impl TerminalSurface {
-    fn new(cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let terminal = TerminalView::new(cwd.clone(), cx).map_err(|err| tf("Failed to start a shell: {err}", &[("err", format!("{err:#}"))]));
+    fn new(machine: Option<String>, cwd: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let terminal = match machine.clone() {
+            None => TerminalView::new(cwd.clone(), cx).map_err(|err| tf("Failed to start a shell: {err}", &[("err", format!("{err:#}"))])),
+            // The workspace is on another device: so is its shell.
+            Some(machine) => Ok(TerminalView::remote(machine, cwd.clone(), cx)),
+        };
         if let Ok(terminal) = &terminal {
             terminal.read(cx).focus_handle(cx).focus(window, cx);
         }
-        Self { cwd, terminal }
+        Self { machine, cwd, terminal }
     }
 }
 
 impl SurfaceView for TerminalSurface {
     fn set_context(&mut self, ctx: &SurfaceContext, window: &mut Window, cx: &mut Context<Self>) {
-        // A new project gets a fresh shell in its directory.
-        if ctx.project != self.cwd {
-            *self = Self::new(ctx.project.clone(), window, cx);
+        // A new project or device gets a fresh shell in its directory.
+        if ctx.project != self.cwd || ctx.machine != self.machine {
+            *self = Self::new(ctx.machine.clone(), ctx.project.clone(), window, cx);
             cx.notify();
         }
     }

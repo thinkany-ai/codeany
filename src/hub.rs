@@ -460,17 +460,60 @@ impl Hub {
                 Vec::new()
             },
         };
-        // A worktree is checked out on first use, and again if its folder went away.
-        let checkout = thread.worktree.clone().filter(|w| thread.machine.is_none() && !w.path.exists());
+        let worktree = thread.worktree.clone();
+        let branch = thread.start_branch.clone();
+        let project = thread.project.clone();
         drop(s);
         cx.spawn(async move |this, cx| {
-            if let Some(worktree) = checkout {
-                cx.background_executor()
-                    .spawn(async move { git::add_worktree(&worktree.repo, &worktree.path, &worktree.branch) })
-                    .await
-                    .map_err(|err| format!("Cannot create the worktree: {err}"))?;
-                // The windows show the worktree now that it exists.
-                this.update(cx, |_, cx| cx.notify()).ok();
+            if let Some(project) = project.filter(|_| worktree.is_some() || branch.is_some()) {
+                if let Some(machine) = machine.as_deref() {
+                    let checkout = agl_bridge::backend_for(Some(machine), crate::sync::SERVICE)
+                        .call("git.prepare", serde_json::json!({
+                            "id": id, "path": project, "worktree": worktree, "branch": branch,
+                        }))
+                        .await
+                        .map_err(|err| format!("{err:#}"))?;
+                    let cwd = checkout["cwd"].as_str().ok_or("The device did not return a checkout path")?;
+                    opts.cwd = Some(cwd.into());
+                } else {
+                    let worktree = worktree.clone();
+                    let branch = branch.clone();
+                    let project = project.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Some(worktree) = worktree {
+                                worktree.prepare(branch.as_deref())?;
+                            } else if let Some(branch) = branch {
+                                git::switch_branch(&project, &branch)?;
+                            }
+                            Ok::<_, String>(())
+                        })
+                        .await?;
+                }
+                let exists = this.update(cx, |this, cx| {
+                    let mut state = this.sm();
+                    let Some(thread) = state.thread_mut(id) else { return false };
+                    if machine.is_some()
+                        && let Some(worktree) = &mut thread.worktree
+                        && worktree.checkout_dir != opts.cwd
+                    {
+                        worktree.checkout_dir.clone_from(&opts.cwd);
+                        state.store.save();
+                    }
+                    cx.notify();
+                    true
+                }).map_err(|_| "the app is closing".to_string())?;
+                if !exists {
+                    // Deletion can arrive while checkout is still in flight.
+                    if let Some(worktree) = worktree {
+                        if let Some(machine) = machine.as_deref() {
+                            crate::sync::deleted(machine, id, Some((project, worktree)));
+                        } else {
+                            cx.background_executor().spawn(async move { worktree.cleanup() }).detach();
+                        }
+                    }
+                    return Err("thread is gone".into());
+                }
             }
             if let Some(dir) = remote_dir {
                 if let Ok(reply) = dir.await {
@@ -628,17 +671,13 @@ impl Hub {
         }
         if let Some(thread) = s.thread(id) {
             if let Some(machine) = thread.machine.as_deref().filter(|_| propagate) {
-                crate::sync::deleted(machine, id);
+                crate::sync::deleted(machine, id, thread.project.clone().zip(thread.worktree.clone()));
             }
             delete_thread_files(thread);
             // Another machine's worktree is that machine's to remove.
             if let Some(worktree) = thread.worktree.clone().filter(|_| thread.machine.is_none()) {
                 cx.background_executor()
-                    .spawn(async move {
-                        if let Err(err) = git::remove_worktree(&worktree.repo, &worktree.path, &worktree.branch) {
-                            eprintln!("codeany: kept worktree {} ({}): {err}", worktree.path.display(), worktree.branch);
-                        }
-                    })
+                    .spawn(async move { worktree.cleanup() })
                     .detach();
             }
         }
@@ -801,6 +840,9 @@ impl Hub {
         };
         let sent_message = sent.is_some();
         if let Some(pending) = sent {
+            if thread.worktree.is_none() {
+                thread.start_branch = None;
+            }
             thread.items.push(ChatItem::User(pending.message));
         }
         thread.apply(event);

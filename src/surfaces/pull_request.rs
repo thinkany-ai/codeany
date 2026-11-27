@@ -49,9 +49,10 @@ impl Extension for PullRequest {
     }
 
     fn build(&self, ctx: &SurfaceContext, host: Host, _window: &mut Window, cx: &mut App) -> Box<dyn Surface> {
-        let root = ctx.git_root.clone();
+        let (machine, root) = (ctx.machine.clone(), ctx.git_root.clone());
         Box::new(cx.new(|cx| {
             let mut surface = PrSurface {
+                machine: None,
                 root: None,
                 host,
                 state: State::Loading,
@@ -59,7 +60,7 @@ impl Extension for PullRequest {
                 loaded_at: None,
                 _load: None,
             };
-            surface.load(root, cx);
+            surface.load(machine, root, cx);
             surface
         }))
     }
@@ -74,6 +75,8 @@ enum State {
 }
 
 pub struct PrSurface {
+    /// The device the repository is on; `None` is this one.
+    machine: Option<String>,
     root: Option<PathBuf>,
     host: Host,
     state: State,
@@ -83,30 +86,33 @@ pub struct PrSurface {
     _load: Option<Task<()>>,
 }
 
-fn gh(root: &PathBuf, args: &[&str]) -> Result<String, String> {
-    let output = crate::command("gh")
-        .args(args)
-        .current_dir(root)
-        .env("PATH", shell_path())
-        .env("GH_PROMPT_DISABLED", "1")
-        .output()
-        .map_err(|_| t("The GitHub CLI (gh) is not installed. Install it with `brew install gh`.").to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+fn gh(machine: Option<&str>, root: &PathBuf, args: &[&str]) -> Result<String, String> {
+    let argv: Vec<&str> = std::iter::once("gh").chain(args.iter().copied()).collect();
+    // Over there agl already runs it with the login shell's PATH.
+    let path = shell_path().to_string_lossy().into_owned();
+    let mut env = vec![("GH_PROMPT_DISABLED", "1")];
+    if machine.is_none() {
+        env.push(("PATH", path.as_str()));
+    }
+    let output = crate::exec::run(machine, root, &argv, &env)
+        .map_err(|err| match machine {
+            None => t("The GitHub CLI (gh) is not installed. Install it with `brew install gh`.").to_string(),
+            // Not installed there, or the device did not answer: it says which.
+            Some(_) => err,
+        })?;
+    if output.ok() {
+        Ok(output.stdout)
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(output.stderr.trim().to_string())
     }
 }
 
 /// The branch's PR and the repo's open PRs. Blocks.
-fn fetch(root: &PathBuf) -> (State, Vec<Value>) {
-    let branch = crate::command("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(root)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+fn fetch(machine: Option<&str>, root: &PathBuf) -> (State, Vec<Value>) {
+    let branch = crate::exec::run(machine, root, &["git", "rev-parse", "--abbrev-ref", "HEAD"], &[])
+        .map(|o| o.stdout.trim().to_string())
         .unwrap_or_default();
-    let state = match gh(root, &["pr", "view", "--json", FIELDS]) {
+    let state = match gh(machine, root, &["pr", "view", "--json", FIELDS]) {
         Ok(json) => serde_json::from_str(&json)
             .map(State::Found)
             .unwrap_or_else(|err| State::Failed(err.to_string())),
@@ -114,6 +120,7 @@ fn fetch(root: &PathBuf) -> (State, Vec<Value>) {
         Err(err) => State::Failed(err),
     };
     let others = gh(
+        machine,
         root,
         &["pr", "list", "--limit", "20", "--json", "number,title,url,headRefName,isDraft,author"],
     )
@@ -126,8 +133,17 @@ fn fetch(root: &PathBuf) -> (State, Vec<Value>) {
     (state, others)
 }
 
+/// Where github.com opens a new PR for the current branch of `root`.
+fn create_url(machine: Option<&str>, root: &PathBuf) -> Option<String> {
+    let repo = gh(machine, root, &["repo", "view", "--json", "url", "--jq", ".url"]).ok()?;
+    let branch = crate::exec::run(machine, root, &["git", "rev-parse", "--abbrev-ref", "HEAD"], &[]).ok()?;
+    let (repo, branch) = (repo.trim(), branch.stdout.trim());
+    (!repo.is_empty() && !branch.is_empty()).then(|| format!("{repo}/compare/{branch}?expand=1"))
+}
+
 impl PrSurface {
-    fn load(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+    fn load(&mut self, machine: Option<String>, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.machine = machine.clone();
         self.root = root.clone();
         self.loaded_at = Some(std::time::Instant::now());
         self.state = State::Loading;
@@ -136,7 +152,7 @@ impl PrSurface {
             return;
         };
         self._load = Some(cx.spawn(async move |this, cx| {
-            let (state, others) = cx.background_executor().spawn(async move { fetch(&root) }).await;
+            let (state, others) = cx.background_executor().spawn(async move { fetch(machine.as_deref(), &root) }).await;
             this.update(cx, |this, cx| {
                 this.state = state;
                 this.others = others;
@@ -153,12 +169,28 @@ impl PrSurface {
 
     fn create(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
-        // `--web` hands off to github.com, where the form already knows the branch.
-        cx.background_executor()
-            .spawn(async move {
-                let _ = gh(&root, &["pr", "create", "--web"]);
-            })
-            .detach();
+        let machine = self.machine.clone();
+        // `--web` hands off to github.com, where the form already knows the
+        // branch. On another device the browser to open is this one's: ask
+        // gh there for the address only.
+        cx.spawn(async move |this, cx| {
+            let url = cx
+                .background_executor()
+                .spawn(async move {
+                    match &machine {
+                        None => {
+                            let _ = gh(None, &root, &["pr", "create", "--web"]);
+                            None
+                        }
+                        Some(_) => create_url(machine.as_deref(), &root),
+                    }
+                })
+                .await;
+            if let Some(url) = url {
+                this.update(cx, |_, cx| cx.open_url(&url)).ok();
+            }
+        })
+        .detach();
     }
 
     fn render_pr(&self, pr: &Value, cx: &mut Context<Self>) -> AnyElement {
@@ -351,8 +383,8 @@ fn section_title(text: String, cx: &App) -> impl IntoElement {
 
 impl SurfaceView for PrSurface {
     fn set_context(&mut self, ctx: &SurfaceContext, _window: &mut Window, cx: &mut Context<Self>) {
-        if ctx.git_root != self.root {
-            self.load(ctx.git_root.clone(), cx);
+        if ctx.git_root != self.root || ctx.machine != self.machine {
+            self.load(ctx.machine.clone(), ctx.git_root.clone(), cx);
         }
     }
 
@@ -360,7 +392,7 @@ impl SurfaceView for PrSurface {
     /// not be asked more than twice a minute.
     fn refresh(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.loaded_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(30)) {
-            self.load(self.root.clone(), cx);
+            self.load(self.machine.clone(), self.root.clone(), cx);
         }
     }
 }

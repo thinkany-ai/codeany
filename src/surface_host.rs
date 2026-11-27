@@ -21,7 +21,8 @@ use crate::style::{
 };
 
 pub enum SurfaceHostEvent {
-    OpenFile(PathBuf),
+    /// Open a file of `machine` (`None`: this one) in the editor.
+    OpenFile { machine: Option<String>, path: PathBuf },
 }
 
 struct OpenSurface {
@@ -64,10 +65,43 @@ impl SurfaceHost {
         self.launcher || self.active.is_none()
     }
 
-    pub fn set_project(&mut self, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let git_root = project.as_deref().and_then(git::toplevel);
-        self.ctx = SurfaceContext { project, git_root };
-        let ctx = self.ctx.clone();
+    /// Show `project` on `machine` (`None`: this one): every surface follows
+    /// the workspace to the device it is on.
+    pub fn set_location(&mut self, machine: Option<String>, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(device) = machine.clone() else {
+            let git_root = project.as_deref().and_then(|p| git::toplevel(None, p));
+            self.set_context(SurfaceContext { machine, project, git_root }, window, cx);
+            return;
+        };
+        if self.ctx.machine == machine && self.ctx.project == project {
+            return;
+        }
+        // Its work tree is a round trip away: surfaces open without it and
+        // hear of it when it is known.
+        self.set_context(SurfaceContext { machine, project: project.clone(), git_root: None }, window, cx);
+        let Some(project) = project else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let git_root = cx
+                .background_executor()
+                .spawn({
+                    let (device, project) = (device.clone(), project.clone());
+                    async move { git::toplevel(Some(&device), &project) }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                // Moved on meanwhile.
+                if this.ctx.machine.as_ref() == Some(&device) && this.ctx.project.as_ref() == Some(&project) && git_root.is_some() {
+                    let ctx = SurfaceContext { git_root, ..this.ctx.clone() };
+                    this.set_context(ctx, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_context(&mut self, ctx: SurfaceContext, window: &mut Window, cx: &mut Context<Self>) {
+        self.ctx = ctx.clone();
         for open in &self.open {
             open.surface.set_context(&ctx, window, cx);
         }
@@ -176,7 +210,7 @@ impl SurfaceHost {
 
     fn handle(&mut self, request: Request, window: &mut Window, cx: &mut Context<Self>) {
         match request {
-            Request::OpenFile(path) => cx.emit(SurfaceHostEvent::OpenFile(path)),
+            Request::OpenFile(path) => cx.emit(SurfaceHostEvent::OpenFile { machine: self.ctx.machine.clone(), path }),
             Request::OpenUrl(url) => {
                 if self.open("browser", window, cx) {
                     if let Some(ix) = self.index_of("browser") {

@@ -17,6 +17,8 @@ use crate::i18n::{t, tf};
 use crate::style::size::TEXT;
 
 pub struct GitPanel {
+    /// The device `root` is on; `None` is this one.
+    machine: Option<String>,
     root: Option<PathBuf>,
     is_repo: bool,
     patch: String,
@@ -29,6 +31,7 @@ pub struct GitPanel {
 impl GitPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            machine: None,
             root: None,
             is_repo: false,
             patch: String::new(),
@@ -39,7 +42,8 @@ impl GitPanel {
         }
     }
 
-    pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+    pub fn set_root(&mut self, machine: Option<String>, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.machine = machine;
         self.root = root;
         self.patch.clear();
         self.diff
@@ -53,9 +57,10 @@ impl GitPanel {
             cx.notify();
             return;
         };
+        let machine = self.machine.clone();
         let task = cx
             .background_executor()
-            .spawn(async move { git::working_tree_diff(&root) });
+            .spawn(async move { git::working_tree_diff(machine.as_deref(), &root) });
         self._refresh_task = Some(cx.spawn(async move |this, cx| {
             let patch = task.await;
             this.update(cx, |this, cx| this.apply_patch(patch, cx)).ok();

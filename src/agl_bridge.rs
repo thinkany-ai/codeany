@@ -239,7 +239,10 @@ pub fn set_home() {
     if let Err(err) = agl::brand::set(brand) {
         eprintln!("codeany: {err:#}");
     }
-    if std::env::var_os("AGL_HOME").is_some() {
+    // A `CODEANY_HOME` set for this run says where its data lives, whatever
+    // `AGL_HOME` came along: one started from a CodeAny terminal or agent
+    // (`make dev` is) inherits that app's, and would try to serve its home.
+    if std::env::var_os("AGL_HOME").is_some() && std::env::var_os("CODEANY_HOME").is_none() {
         return;
     }
     let dir = crate::paths::agent_home();
@@ -316,6 +319,13 @@ fn running_daemon() -> Option<(u32, Endpoint)> {
     pid_alive(pid).then_some((pid, endpoint))
 }
 
+/// Whether an agent service answers at `endpoint`. Something listening on
+/// its port is not enough: another program may have taken the port since.
+async fn answers(endpoint: &Endpoint) -> bool {
+    let connect = tokio_tungstenite::connect_async(endpoint.url());
+    matches!(tokio::time::timeout(Duration::from_secs(3), connect).await, Ok(Ok(_)))
+}
+
 /// This machine's daemon: the one already running for CodeAny's agent
 /// home (another CodeAny on the same data), or one hosted in this process.
 pub async fn local_endpoint() -> Result<Endpoint> {
@@ -328,7 +338,14 @@ pub async fn local_endpoint() -> Result<Endpoint> {
     // already running on another port is then not reused.
     let port = std::env::var("CODEANY_AGL_PORT").ok().and_then(|p| p.parse::<u16>().ok());
     if let Some((_, endpoint)) = running_daemon().filter(|(_, e)| port.is_none_or(|p| p == e.port)) {
-        return Ok(endpoint);
+        if answers(&endpoint).await {
+            return Ok(endpoint);
+        }
+        // Left by a daemon that did not get to clean up: its pid may be
+        // another process by now (and Windows cannot be asked here at all),
+        // its port another program's. A daemon writes the file once it
+        // listens, so nothing is starting.
+        let _ = std::fs::remove_file(agl::config::daemon_file());
     }
     let cfg = agl::config::Config::load()?;
     let opts = agl::daemon::DaemonOptions {

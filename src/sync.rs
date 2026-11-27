@@ -11,7 +11,9 @@
 //! - `threads.put {thread}`: a thread another device started or continued
 //!   here, written back;
 //! - `threads.delete {id}`;
-//! - `projects.logo {path}`: a project's logo, as the sidebar shows it.
+//! - `projects.logo {path}`: a project's logo, as the sidebar shows it;
+//! - `git.project {path}`: the current branch and available local branches;
+//! - `git.prepare {id, path, branch, worktree}`: prepare a thread's checkout.
 //!
 //! The other devices poll the list, fetch what changed, and show those
 //! threads under the device's name in their sidebar. Continuing one there
@@ -32,7 +34,9 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::{agl_bridge, threads::{Thread, Workspace}};
+use crate::{agl_bridge, git, threads::{Thread, Workspace, Worktree}};
+
+type WorktreeCheckout = (std::path::PathBuf, Worktree);
 
 pub const SERVICE: &str = "codeany";
 const POLL: Duration = Duration::from_secs(6);
@@ -104,7 +108,7 @@ struct State {
     /// Ids each device listed last time, to notice deletions.
     listed: HashMap<String, HashSet<u64>>,
     /// Ids deleted here that their device should drop.
-    deletes: Vec<(String, u64)>,
+    deletes: Vec<(String, u64, Option<WorktreeCheckout>)>,
     /// Devices whose missing threads the agent panel should write back.
     resend: Vec<String>,
     inbox: Option<mpsc::UnboundedSender<Incoming>>,
@@ -209,12 +213,12 @@ pub fn resend(threads: &[Thread]) {
 }
 
 /// Deleted here: delete it on its device too.
-pub fn deleted(machine: &str, id: u64) {
+pub fn deleted(machine: &str, id: u64, checkout: Option<WorktreeCheckout>) {
     let mut state = STATE.lock().unwrap();
     let key = (machine.to_string(), id);
     state.known.remove(&key);
     state.dirty.remove(&key);
-    state.deletes.push(key);
+    state.deletes.push((key.0, id, checkout));
 }
 
 fn send(incoming: Incoming) {
@@ -277,6 +281,10 @@ async fn serve(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
                 .unwrap_or_else(|err| Err(anyhow!("{err}")))
         } else if method == "files.put" {
             tokio::task::spawn_blocking(move || put_file(params))
+                .await
+                .unwrap_or_else(|err| Err(anyhow!("{err}")))
+        } else if method.starts_with("git.") || method == "threads.delete" {
+            tokio::task::spawn_blocking(move || handle(&method, params))
                 .await
                 .unwrap_or_else(|err| Err(anyhow!("{err}")))
         } else {
@@ -353,7 +361,17 @@ fn handle(method: &str, params: Value) -> Result<Value> {
         }
         "threads.delete" => {
             let id = params["id"].as_u64().ok_or_else(|| anyhow!("id is required"))?;
-            STATE.lock().unwrap().local.remove(&id);
+            let stored = STATE.lock().unwrap().local.remove(&id);
+            // A worktree can exist before the first turn is mirrored.
+            if stored.as_ref().is_none_or(|thread| thread.worktree.is_none())
+                && let Some((project, worktree)) =
+                    serde_json::from_value::<Option<WorktreeCheckout>>(params["checkout"].clone())?
+            {
+                match worktree.validate_on_host(&project, id) {
+                    Ok(()) => worktree.cleanup(),
+                    Err(err) => eprintln!("codeany: kept worktree {}: {err}", worktree.path.display()),
+                }
+            }
             send(Incoming::Delete(id));
             Ok(json!({ "ok": true }))
         }
@@ -364,6 +382,28 @@ fn handle(method: &str, params: Value) -> Result<Value> {
             workspace.device_name = None;
             send(Incoming::PutWorkspace(workspace));
             Ok(json!({ "ok": true }))
+        }
+        "git.project" => {
+            let path = params["path"].as_str().ok_or_else(|| anyhow!("path is required"))?;
+            Ok(serde_json::to_value(git::ProjectGit::read(std::path::Path::new(path)))?)
+        }
+        "git.prepare" => {
+            let id = params["id"].as_u64().ok_or_else(|| anyhow!("id is required"))?;
+            let path = params["path"].as_str().ok_or_else(|| anyhow!("path is required"))?;
+            let project = std::path::Path::new(path);
+            let worktree: Option<Worktree> = serde_json::from_value(params["worktree"].clone())?;
+            let branch = params["branch"].as_str();
+            let cwd = if let Some(worktree) = worktree {
+                worktree.validate_on_host(project, id).map_err(|err| anyhow!(err))?;
+                worktree.prepare(branch).map_err(|err| anyhow!(err))?;
+                worktree.dir_for(project)
+            } else {
+                if let Some(branch) = branch {
+                    git::switch_branch(project, branch).map_err(|err| anyhow!(err))?;
+                }
+                project.to_path_buf()
+            };
+            Ok(json!({ "cwd": cwd }))
         }
         "machine.info" => Ok(json!({ "name": crate::remote::this_name() })),
         // The folder of a thread with no project, as this device gives its own.
@@ -391,14 +431,14 @@ async fn poll() {
         .map(|d| (d.id.clone(), d.name.clone()))
         .collect();
     let mut failed_deletes = Vec::new();
-    for (machine, id) in deletes {
+    for (machine, id, checkout) in deletes {
         if !reachable.contains_key(&machine) {
-            failed_deletes.push((machine, id));
+            failed_deletes.push((machine, id, checkout));
             continue;
         }
-        let call = agl_bridge::backend_for(Some(&machine), SERVICE).call("threads.delete", json!({ "id": id }));
+        let call = agl_bridge::backend_for(Some(&machine), SERVICE).call("threads.delete", json!({ "id": id, "checkout": checkout }));
         if call.await.is_err() {
-            failed_deletes.push((machine, id));
+            failed_deletes.push((machine, id, checkout));
         }
     }
     if !failed_deletes.is_empty() {

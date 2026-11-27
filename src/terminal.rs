@@ -1,5 +1,8 @@
 //! An embedded terminal: `alacritty_terminal` runs the PTY and parses escape
 //! sequences, and this view paints the visible grid in fixed-width cells.
+//!
+//! The shell runs on this machine, or on another device: then its PTY is
+//! over there ([`crate::pty_host`]) and only its bytes travel.
 
 use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
@@ -16,9 +19,10 @@ use alacritty_terminal::{
         color::Colors,
     },
     tty,
-    vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb},
+    vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb},
 };
-use futures::{StreamExt as _, channel::mpsc};
+use futures::{SinkExt as _, StreamExt as _, channel::mpsc};
+use tokio_tungstenite::tungstenite::Message;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -99,9 +103,21 @@ struct VisibleCell {
     run: TextRun,
 }
 
+/// What the view tells a shell on another device.
+enum RemoteMsg {
+    Input(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+}
+
+/// Where the shell is.
+enum Link {
+    Local(Notifier),
+    Remote(tokio::sync::mpsc::UnboundedSender<RemoteMsg>),
+}
+
 pub struct TerminalView {
     term: Arc<FairMutex<Term<Listener>>>,
-    notifier: Notifier,
+    link: Link,
     size: TermSize,
     bounds: Bounds<Pixels>,
     title: SharedString,
@@ -125,7 +141,7 @@ impl TerminalView {
             cell_width: px(8.),
             cell_height: line_height(cx.theme().font_size),
         };
-        let (tx, mut rx) = mpsc::unbounded();
+        let (tx, rx) = mpsc::unbounded();
         let listener = Listener(tx);
 
         let config = term::Config {
@@ -152,7 +168,40 @@ impl TerminalView {
         let notifier = Notifier(event_loop.channel());
         event_loop.spawn();
 
-        Ok(cx.new(|cx| {
+        Ok(Self::build(term, Link::Local(notifier), size, rx, cx))
+    }
+
+    /// A shell in `cwd` on another device. It opens at once and says so in
+    /// the terminal when that device cannot be reached.
+    pub fn remote(machine: String, cwd: Option<PathBuf>, cx: &mut App) -> Entity<Self> {
+        let size = TermSize {
+            columns: 80,
+            lines: 24,
+            cell_width: px(8.),
+            cell_height: line_height(cx.theme().font_size),
+        };
+        let (tx, rx) = mpsc::unbounded();
+        let listener = Listener(tx);
+        let config = term::Config {
+            scrolling_history: 10_000,
+            ..Default::default()
+        };
+        let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
+        let (to_remote, from_view) = tokio::sync::mpsc::unbounded_channel();
+        let device = crate::remote::name_of(&machine);
+        let connect = async move { crate::remote::connect(&machine, crate::pty_host::SERVICE).await };
+        crate::agl_bridge::runtime().spawn(run_remote(connect, device, cwd, size, term.clone(), listener, from_view));
+        Self::build(term, Link::Remote(to_remote), size, rx, cx)
+    }
+
+    fn build(
+        term: Arc<FairMutex<Term<Listener>>>,
+        link: Link,
+        size: TermSize,
+        mut rx: mpsc::UnboundedReceiver<TermEvent>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
             let events_task = cx.spawn(async move |this, cx| {
                 while let Some(event) = rx.next().await {
                     // Coalesce bursts of output into a single repaint.
@@ -174,7 +223,7 @@ impl TerminalView {
 
             Self {
                 term,
-                notifier,
+                link,
                 size,
                 bounds: Bounds::default(),
                 title: shell_name().into(),
@@ -183,7 +232,7 @@ impl TerminalView {
                 focus_handle: cx.focus_handle(),
                 _events_task: events_task,
             }
-        }))
+        })
     }
 
     fn handle_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
@@ -214,7 +263,12 @@ impl TerminalView {
     }
 
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        self.notifier.notify(bytes);
+        match &self.link {
+            Link::Local(notifier) => notifier.notify(bytes),
+            Link::Remote(remote) => {
+                let _ = remote.send(RemoteMsg::Input(bytes.into().into_owned()));
+            }
+        }
     }
 
     fn input(&mut self, bytes: impl Into<Cow<'static, [u8]>>) {
@@ -238,7 +292,12 @@ impl TerminalView {
         if size != self.size {
             self.size = size;
             self.term.lock().resize(size);
-            self.notifier.on_resize(size.window_size());
+            match &mut self.link {
+                Link::Local(notifier) => notifier.on_resize(size.window_size()),
+                Link::Remote(remote) => {
+                    let _ = remote.send(RemoteMsg::Resize { cols: columns as u16, rows: lines as u16 });
+                }
+            }
             cx.notify();
         }
     }
@@ -454,8 +513,102 @@ impl TerminalView {
 
 impl Drop for TerminalView {
     fn drop(&mut self) {
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        // A remote shell ends when its channel does.
+        if let Link::Local(notifier) = &self.link {
+            let _ = notifier.0.send(Msg::Shutdown);
+        }
     }
+}
+
+/// Carry a shell on the device `connect` reaches to `term`: its output in,
+/// keys and sizes out, until either side ends.
+async fn run_remote(
+    connect: impl Future<Output = anyhow::Result<crate::remote::Ws>>,
+    device: String,
+    cwd: Option<PathBuf>,
+    size: TermSize,
+    term: Arc<FairMutex<Term<Listener>>>,
+    listener: Listener,
+    mut from_view: tokio::sync::mpsc::UnboundedReceiver<RemoteMsg>,
+) {
+    use crate::i18n::{t, tf};
+    use serde_json::{Value, json};
+
+    let mut parser: Processor = Processor::new();
+    let mut print = |term: &FairMutex<Term<Listener>>, bytes: &[u8]| {
+        // A program that never ends a synchronized update still gets drawn.
+        if parser.sync_timeout().sync_timeout().is_some_and(|at| at <= std::time::Instant::now()) {
+            parser.stop_sync(&mut *term.lock());
+        }
+        parser.advance(&mut *term.lock(), bytes);
+        listener.send_event(TermEvent::Wakeup);
+    };
+    let refused = |err: String| {
+        let mut text = tf("Could not open a terminal on {device}: {err}", &[("device", device.clone()), ("err", err.clone())]);
+        // An older CodeAny there has no terminal to offer.
+        if err.contains("unknown service") {
+            text.push_str("\r\n");
+            text.push_str(t("Update CodeAny on that device to use its terminal here."));
+        }
+        text.replace('\n', "\r\n").replace("\r\r\n", "\r\n")
+    };
+
+    let opened = async {
+        let ws = connect.await?;
+        let (mut sink, mut stream) = ws.split();
+        let open = json!({ "open": { "cwd": cwd, "cols": size.columns, "rows": size.lines } });
+        sink.send(Message::Text(open.to_string().into())).await?;
+        anyhow::Ok((sink, stream.next().await, stream))
+    };
+    let (mut sink, mut stream) = match tokio::time::timeout(std::time::Duration::from_secs(20), opened).await {
+        Ok(Ok((sink, Some(Ok(Message::Text(reply))), stream))) => {
+            let reply: Value = serde_json::from_str(&reply).unwrap_or_default();
+            if let Some(err) = reply["error"].as_str() {
+                print(&term, refused(err.to_string()).as_bytes());
+                listener.send_event(TermEvent::Exit);
+                return;
+            }
+            (sink, stream)
+        }
+        other => {
+            let err = match other {
+                Ok(Err(err)) => format!("{err:#}"),
+                Err(_) => t("that device did not answer").to_string(),
+                Ok(Ok(_)) => t("the connection closed").to_string(),
+            };
+            print(&term, refused(err).as_bytes());
+            listener.send_event(TermEvent::Exit);
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            message = stream.next() => match message {
+                Some(Ok(Message::Binary(bytes))) => print(&term, &bytes),
+                // `{"exit":true}`: the shell ended.
+                Some(Ok(Message::Text(_))) | Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            message = from_view.recv() => {
+                let message = match message {
+                    Some(RemoteMsg::Input(bytes)) => Message::Binary(bytes.into()),
+                    Some(RemoteMsg::Resize { cols, rows }) => {
+                        Message::Text(json!({ "resize": { "cols": cols, "rows": rows } }).to_string().into())
+                    }
+                    // The view closed: so does the shell.
+                    None => {
+                        let _ = sink.close().await;
+                        return;
+                    }
+                };
+                if sink.send(message).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    listener.send_event(TermEvent::Exit);
 }
 
 impl Render for TerminalView {
@@ -750,4 +903,70 @@ fn default_rgb(index: usize) -> Rgb {
         _ => (0xcc, 0xcc, 0xcc),
     };
     Rgb { r, g, b }
+}
+
+#[cfg(all(test, unix))]
+mod remote_tests {
+    use super::*;
+
+    fn screen(term: &FairMutex<Term<Listener>>) -> String {
+        let term = term.lock();
+        let mut text = String::new();
+        for indexed in term.renderable_content().display_iter {
+            if indexed.point.column.0 == 0 {
+                text.push('\n');
+            }
+            text.push(indexed.cell.c);
+        }
+        text
+    }
+
+    /// The view's side of a remote shell, against this machine's shell
+    /// service: what is typed runs there and what it prints shows here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_shell_draws_into_the_terminal() {
+        let size = TermSize { columns: 100, lines: 30, cell_width: px(8.), cell_height: px(16.) };
+        let (tx, mut events) = mpsc::unbounded();
+        let listener = Listener(tx);
+        let term = Arc::new(FairMutex::new(Term::new(term::Config::default(), &size, listener.clone())));
+        let (to_remote, from_view) = tokio::sync::mpsc::unbounded_channel();
+        let connect = async {
+            let url = crate::pty_host::server_url().await?;
+            let (ws, _) = tokio_tungstenite::connect_async(url.as_str()).await?;
+            anyhow::Ok(Box::new(ws) as crate::remote::Ws)
+        };
+        let task = tokio::spawn(run_remote(connect, "mini".into(), None, size, term.clone(), listener, from_view));
+
+        to_remote.send(RemoteMsg::Resize { cols: 100, rows: 30 }).unwrap();
+        to_remote.send(RemoteMsg::Input(b"echo remote-$((40+2))\r".to_vec())).unwrap();
+        let drawn = async {
+            while !screen(&term).contains("remote-42") {
+                events.next().await.expect("the shell is still there");
+            }
+            to_remote.send(RemoteMsg::Input(b"exit\r".to_vec())).unwrap();
+            while !matches!(events.next().await, Some(TermEvent::Exit)) {}
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), drawn).await.expect("the shell answers in time");
+        task.await.unwrap();
+    }
+
+    /// A device that cannot be reached says so in the terminal.
+    #[tokio::test]
+    async fn a_refused_connection_is_explained() {
+        let size = TermSize { columns: 100, lines: 30, cell_width: px(8.), cell_height: px(16.) };
+        let (tx, mut events) = mpsc::unbounded();
+        let listener = Listener(tx);
+        let term = Arc::new(FairMutex::new(Term::new(term::Config::default(), &size, listener.clone())));
+        let (_to_remote, from_view) = tokio::sync::mpsc::unbounded_channel();
+        let connect = async { Err(anyhow::anyhow!("unknown service 'codeany.pty'")) };
+        run_remote(connect, "mini".into(), None, size, term.clone(), listener, from_view).await;
+        let mut exited = false;
+        while let Ok(event) = events.try_recv() {
+            exited |= matches!(event, TermEvent::Exit);
+        }
+        assert!(exited);
+        let text = screen(&term);
+        assert!(text.contains("mini") && text.contains("unknown service"), "{text}");
+        assert!(text.contains("Update CodeAny"), "{text}");
+    }
 }

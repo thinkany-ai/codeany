@@ -1038,6 +1038,7 @@ async fn serve_paired(mut stream: DuplexStream, remote: &str, request: Value) ->
     let target = match service {
         "agl" => agl_bridge::local_endpoint().await.map(|e| e.url()),
         "codeany" => crate::sync::server_url().await,
+        crate::pty_host::SERVICE => crate::pty_host::server_url().await,
         other => Err(anyhow!("unknown service '{other}'")),
     };
     let target = match target {
@@ -1748,6 +1749,45 @@ mod tests {
                 }
                 _ => panic!("expected the thread to arrive"),
             }
+
+            let project = home.join("repo");
+            std::fs::create_dir_all(&project).unwrap();
+            for args in [
+                &["init", "-b", "main"][..],
+                &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "--allow-empty", "-m", "initial"],
+                &["branch", "feature"],
+            ] {
+                let output = crate::command("git").args(args).current_dir(&project).output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            }
+            let git_call = |id: &str, method: &str, params: Value| {
+                agl::protocol::WireMsg::Request { id: id.into(), method: method.into(), params }.to_json()
+            };
+            let msg = git_call("4", "git.project", json!({ "path": project }));
+            ws.send(Message::Text(msg.into())).await.unwrap();
+            let Some(Ok(Message::Text(reply))) = ws.next().await else { panic!("no Git project reply") };
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            let git: crate::git::ProjectGit = serde_json::from_value(reply["result"].clone()).unwrap();
+            assert_eq!(git.branches, ["feature", "main"]);
+            let id = 42;
+            let worktree = crate::threads::Worktree::from_project(&git, id, "Remote checkout");
+            for (request, method, params) in [
+                ("5", "git.prepare", json!({
+                    "id": id, "path": project, "branch": "feature", "worktree": worktree,
+                })),
+                ("6", "threads.delete", json!({ "id": id, "checkout": (&project, &worktree) })),
+            ] {
+                let msg = git_call(request, method, params);
+                ws.send(Message::Text(msg.into())).await.unwrap();
+                let Some(Ok(Message::Text(reply))) = ws.next().await else { panic!("no Git checkout reply") };
+                let reply: Value = serde_json::from_str(&reply).unwrap();
+                assert!(reply.get("error").is_none(), "{reply}");
+                if request == "5" {
+                    let cwd = std::path::Path::new(reply["result"]["cwd"].as_str().unwrap());
+                    assert_eq!(cwd.canonicalize().unwrap(), worktree.path.canonicalize().unwrap());
+                }
+            }
+            assert!(!worktree.path.exists());
 
             // A stranger's key is refused.
             let other = snow::Builder::new(PATTERN_PAIRED.parse().unwrap()).generate_keypair().unwrap();
