@@ -31,11 +31,13 @@ pub async fn server_url() -> Result<String> {
     if let Some(url) = started.clone() {
         return Ok(url);
     }
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    // The cached listener must outlive whichever caller first opens it.
+    let runtime = crate::agl_bridge::runtime();
+    let listener = runtime.spawn(TcpListener::bind(("127.0.0.1", 0))).await??;
     let port = listener.local_addr()?.port();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let url = format!("ws://127.0.0.1:{port}/pty?token={token}");
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let token = token.clone();
             tokio::spawn(async move {

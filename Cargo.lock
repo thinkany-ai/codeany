@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "codeany"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "agl",
  "alacritty_terminal",
