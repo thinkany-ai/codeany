@@ -4,7 +4,6 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 /// Untracked files larger than this are listed but not diffed.
@@ -52,7 +51,7 @@ impl RepoSnapshot {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::command("git")
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -139,7 +138,7 @@ pub fn working_tree_diff(root: &Path) -> Option<String> {
 
 /// Run git and return its stdout, or its stderr as the error.
 fn git_checked(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = crate::command("git")
         .args(args)
         .current_dir(cwd)
         .output()

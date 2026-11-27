@@ -68,6 +68,7 @@ pub fn open_main_window(root: Option<PathBuf>, workspace: Option<String>, cx: &m
             appears_transparent: true,
             traffic_light_position: Some(point(px(14.), px(13.))),
         }),
+        window_decorations: window_decorations(),
         ..Default::default()
     };
     if let Err(err) = gpui_kit::open_window(options, cx, move |window, cx| {
@@ -130,8 +131,29 @@ impl Render for PanelDivider {
     }
 }
 
-/// Room for the macOS traffic lights in the transparent title bar.
+/// Room for the macOS traffic lights in the transparent title bar; on Linux
+/// the window buttons drawn by [`Workspace::render_window_buttons`] sit there.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 86.;
+/// How far a press in the title bar travels before it drags the window, so
+/// a click on one of its buttons stays a click.
+const WINDOW_DRAG_SLOP: Pixels = px(4.);
+
+/// Linux draws no title bar for a window like this one, so the window draws
+/// its own frame: the shadow and resize edges come with the root, the
+/// buttons and the dragging from [`Workspace`].
+fn window_decorations() -> Option<WindowDecorations> {
+    cfg!(target_os = "linux").then_some(WindowDecorations::Client)
+}
+
+/// Whether this window draws its own title bar buttons: on Linux when it
+/// draws its own frame, on Windows unless full screen, where the system
+/// answers for no part of the window.
+fn draws_window_buttons(window: &Window) -> bool {
+    if cfg!(target_os = "windows") {
+        return !window.is_fullscreen();
+    }
+    cfg!(target_os = "linux") && matches!(window.window_decorations(), Decorations::Client { .. })
+}
 
 pub struct Workspace {
     root: Option<PathBuf>,
@@ -161,6 +183,8 @@ pub struct Workspace {
     sidebar_width: Pixels,
     surfaces_width: Pixels,
     focus_handle: FocusHandle,
+    /// Where a press in the title bar landed, until it drags the window or lets go.
+    window_drag: Option<Point<Pixels>>,
     /// The open search palette's subscription.
     _palette: Option<Subscription>,
     _poll_task: Option<Task<()>>,
@@ -307,6 +331,7 @@ impl Workspace {
             sidebar_width: SIDEBAR_DEFAULT,
             surfaces_width: SURFACES_DEFAULT,
             focus_handle: cx.focus_handle(),
+            window_drag: None,
             _palette: None,
             _poll_task: None,
             _subscriptions: subscriptions,
@@ -933,6 +958,7 @@ impl Workspace {
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(14.), px(13.))),
             }),
+            window_decorations: window_decorations(),
             ..Default::default()
         };
         let (handle, editor) = gpui_kit::open_window(options, cx, move |window, cx| {
@@ -1115,13 +1141,84 @@ impl Workspace {
             .id(id)
             .flex_1()
             .h_full()
+            // Windows moves the window itself, and maximizes it on a double
+            // click, from wherever the window says its caption is; it keeps
+            // a strip to hold however many tabs crowd the bar.
+            .when(cfg!(target_os = "windows"), |this| {
+                this.min_w(px(32.)).window_control_area(WindowControlArea::Drag)
+            })
             .on_mouse_down(MouseButton::Left, |event, window, _| {
                 if event.click_count == 2 {
-                    window.titlebar_double_click();
+                    if cfg!(target_os = "linux") {
+                        window.zoom_window();
+                    } else {
+                        window.titlebar_double_click();
+                    }
                 } else {
                     window.start_window_move();
                 }
             })
+    }
+
+    /// Close, minimize and maximize, where macOS puts its traffic lights:
+    /// Linux and Windows leave them to a window that draws its own title bar.
+    fn render_window_buttons(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let active = window.is_window_active();
+        let supported = window.window_controls();
+        let windows = cfg!(target_os = "windows");
+        let button = |id: &'static str, color: u32, area: WindowControlArea| {
+            div()
+                .id(id)
+                .size(px(12.))
+                .flex_none()
+                .rounded_full()
+                .cursor_pointer()
+                .bg(if active { rgb(color).into() } else { theme.border })
+                .hover(|this| this.opacity(0.75))
+                // A press here is for the button, not a drag of the window.
+                .occlude()
+                // Windows presses these itself once told which is which.
+                .when(windows, |this| this.window_control_area(area))
+                .when(!windows, |this| {
+                    this.on_click(move |_, window, _| match area {
+                        WindowControlArea::Close => window.remove_window(),
+                        WindowControlArea::Min => window.minimize_window(),
+                        _ => window.zoom_window(),
+                    })
+                })
+        };
+        div()
+            .id("window-buttons")
+            .absolute()
+            .top_0()
+            .left_0()
+            .h(layout::HEADER)
+            .w(px(TRAFFIC_LIGHTS_WIDTH))
+            .pt(layout::HEADER_TOP_INSET)
+            .pl(px(14.))
+            .flex()
+            .items_center()
+            .gap(layout::SPACE_2)
+            // The room around the buttons drags the window, under them so
+            // that each button answers for itself.
+            .child(
+                div()
+                    .id("window-buttons-drag")
+                    .absolute()
+                    .inset_0()
+                    .when(windows, |this| this.window_control_area(WindowControlArea::Drag))
+                    .when(!windows, |this| {
+                        this.on_mouse_down(MouseButton::Left, |event, window, _| {
+                            if event.click_count == 2 {
+                                window.zoom_window();
+                            }
+                        })
+                    }),
+            )
+            .child(button("window-close", 0xff5f57, WindowControlArea::Close))
+            .when(supported.minimize, |this| this.child(button("window-minimize", 0xfebc2e, WindowControlArea::Min)))
+            .when(supported.maximize, |this| this.child(button("window-maximize", 0x28c840, WindowControlArea::Max)))
     }
 
     /// The main window's way into its editor window.
@@ -1800,12 +1897,35 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::search))
+            // Linux has no title bar of its own here: a press anywhere in
+            // the header row drags the window once it has moved far enough.
+            .when(cfg!(target_os = "linux"), |this| {
+                this.on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, _| {
+                    let top = event.position.y - window_paddings(window).top;
+                    this.window_drag = (event.click_count == 1 && top < layout::HEADER).then_some(event.position);
+                }))
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    let Some(from) = this.window_drag else { return };
+                    // Let go, or dragging something of its own, such as a panel divider.
+                    if !event.dragging() || cx.has_active_drag() {
+                        this.window_drag = None;
+                        return;
+                    }
+                    let moved = event.position - from;
+                    if moved.x.abs() > WINDOW_DRAG_SLOP || moved.y.abs() > WINDOW_DRAG_SLOP {
+                        this.window_drag = None;
+                        window.start_window_move();
+                    }
+                }))
+            })
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(div().flex_1().min_h_0().child(main))
+            .when(draws_window_buttons(window), |this| this.child(self.render_window_buttons(window, cx)))
             .when(self.mode == Mode::Editor, |this| {
                 this.child(self.render_status_bar(cx))
             })

@@ -47,6 +47,21 @@ use std::path::PathBuf;
 
 use gpui_kit::*;
 
+/// A command to run out of sight. Windows opens a console window for every
+/// console program a GUI app starts, unless told not to: one flashes up and
+/// takes the keyboard each time `git` or the like runs.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 
 actions!(
     codeany,
@@ -195,6 +210,16 @@ fn main() {
                 cx.on_action(|_: &CheckForUpdates, _| updater::check());
             }
             set_app_menus(cx);
+
+            // Linux has no dock to keep an app with no window within reach:
+            // closing the last one quits.
+            #[cfg(target_os = "linux")]
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
 
             cx.on_action(|_: &NewWindow, cx| workspace::open_new_window(cx));
             cx.on_action(|_: &Minimize, cx| {

@@ -696,7 +696,7 @@ fn lookup_tailscale_name() -> Option<String> {
         "/opt/homebrew/bin/tailscale",
         "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     ] {
-        let Ok(out) = std::process::Command::new(bin)
+        let Ok(out) = crate::command(bin)
             .args(["status", "--json", "--self", "--peers=false"])
             .stderr(std::process::Stdio::null())
             .output()

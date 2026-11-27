@@ -3,7 +3,7 @@
 
 use crate::style::AppButtonStyle as _;
 
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -84,7 +84,7 @@ pub struct PrSurface {
 }
 
 fn gh(root: &PathBuf, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("gh")
+    let output = crate::command("gh")
         .args(args)
         .current_dir(root)
         .env("PATH", shell_path())
@@ -100,7 +100,7 @@ fn gh(root: &PathBuf, args: &[&str]) -> Result<String, String> {
 
 /// The branch's PR and the repo's open PRs. Blocks.
 fn fetch(root: &PathBuf) -> (State, Vec<Value>) {
-    let branch = Command::new("git")
+    let branch = crate::command("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(root)
         .output()

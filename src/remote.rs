@@ -185,7 +185,7 @@ pub fn device_name() -> String {
             return name;
         }
     }
-    std::process::Command::new("hostname")
+    crate::command("hostname")
         .output()
         .ok()
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
