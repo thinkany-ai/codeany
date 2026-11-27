@@ -34,15 +34,49 @@ fetch_sparkle() {
     )
 }
 
+ensure_sparkle() {
+    mkdir -p "$RELEASES" "$(dirname "$SDK")"
+    [ -x "$SDK/bin/generate_appcast" ] || fetch_sparkle
+}
+
+sparkle_credentials() {
+    sparkle_args=(--account "$KEY_ACCOUNT")
+    if [ -z "${CODEANY_SPARKLE_KEY_FILE:-}" ]; then
+        [ "$("$SDK/bin/generate_keys" --account "$KEY_ACCOUNT" -p)" = "$PUBLIC_KEY" ] ||
+            fail "the Keychain must contain the CodeAny Sparkle key for $KEY_ACCOUNT"
+        return
+    fi
+
+    sparkle_args=(--ed-key-file "$CODEANY_SPARKLE_KEY_FILE")
+    # Prove that the CI key can sign for the public key in installed versions.
+    (
+        probe=$(mktemp -d)
+        trap 'rm -rf "$probe"' EXIT
+        printf '%s' 'CodeAny Sparkle signing check' >"$probe/check.zip"
+        signature=$("$SDK/bin/sign_update" "${sparkle_args[@]}" -p "$probe/check.zip")
+        /usr/bin/swift - "$PUBLIC_KEY" "$signature" "$probe/check.zip" <<'SWIFT'
+import CryptoKit
+import Foundation
+
+let args = CommandLine.arguments
+let key = try Curve25519.Signing.PublicKey(rawRepresentation: Data(base64Encoded: args[1])!)
+let message = try Data(contentsOf: URL(fileURLWithPath: args[3]))
+guard let signature = Data(base64Encoded: args[2]),
+      key.isValidSignature(signature, for: message) else {
+    FileHandle.standardError.write(Data("Sparkle key does not match CodeAny's public key\n".utf8))
+    exit(1)
+}
+SWIFT
+    )
+}
+
 package() {
     [ "$(uname -sm)" = 'Darwin arm64' ] || fail 'packaging requires an Apple Silicon Mac'
     [ ! -e "$DIST" ] || fail "package already exists at $DIST"
     local notary_profile=${CODEANY_NOTARY_PROFILE:-codeany-thinkany}
     /usr/bin/security find-identity -v -p codesigning | grep -F "\"$IDENTITY\"" >/dev/null || fail "missing $IDENTITY"
-    mkdir -p "$RELEASES" "$(dirname "$SDK")"
-    [ -x "$SDK/bin/generate_appcast" ] || fetch_sparkle
-    [ "$("$SDK/bin/generate_keys" --account "$KEY_ACCOUNT" -p)" = "$PUBLIC_KEY" ] || \
-        fail "the Keychain must contain the CodeAny Sparkle key for $KEY_ACCOUNT"
+    ensure_sparkle
+    sparkle_credentials
 
     local work app plist framework
     work=$(mktemp -d "$RELEASES/.package.XXXXXX")
@@ -79,10 +113,10 @@ package() {
 
         mkdir "$work/dist"
         /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$work/dist/$ZIP"
-        "$SDK/bin/generate_appcast" --account "$KEY_ACCOUNT" --maximum-deltas 0 \
+        "$SDK/bin/generate_appcast" "${sparkle_args[@]}" --maximum-deltas 0 \
             --download-url-prefix "$CDN/releases/$VERSION/" --link "$CDN/releases/$VERSION/$DMG" \
             "$work/dist"
-        "$SDK/bin/sign_update" --verify --account "$KEY_ACCOUNT" "$work/dist/appcast.xml"
+        "$SDK/bin/sign_update" --verify "${sparkle_args[@]}" "$work/dist/appcast.xml"
 
         ln -s /Applications "$work/image/Applications"
         /usr/bin/hdiutil create -quiet -volname CodeAny -srcfolder "$work/image" \
@@ -99,12 +133,16 @@ package() {
 
 submit_notarization() {
     local result status submission
-    result=$(/usr/bin/xcrun notarytool submit "$1" --keychain-profile "$2" --wait --output-format json)
+    local -a credentials=(--keychain-profile "$2")
+    if [ -n "${CODEANY_NOTARY_KEYCHAIN:-}" ]; then
+        credentials+=(--keychain "$CODEANY_NOTARY_KEYCHAIN")
+    fi
+    result=$(/usr/bin/xcrun notarytool submit "$1" "${credentials[@]}" --wait --output-format json)
     status=$(printf '%s' "$result" | /usr/bin/plutil -extract status raw -)
     submission=$(printf '%s' "$result" | /usr/bin/plutil -extract id raw -)
     echo "Apple notarization $status ($submission)"
     if [ "$status" != Accepted ]; then
-        /usr/bin/xcrun notarytool log "$submission" --keychain-profile "$2" >&2
+        /usr/bin/xcrun notarytool log "$submission" "${credentials[@]}" >&2
         fail 'Apple declined notarization'
     fi
 }
@@ -112,6 +150,8 @@ submit_notarization() {
 publish() {
     [ -f "$DIST/appcast.xml" ] && [ -f "$DIST/$ZIP" ] && [ -f "$DIST/$DMG" ] || \
         fail "run make release-package first ($DIST)"
+    ensure_sparkle
+    sparkle_credentials
     local work status artifact type url signature lock
     work=$(mktemp -d "$RELEASES/.publish.XXXXXX")
     lock="$RELEASES/.publish.lock"
@@ -155,8 +195,8 @@ if status == '200':
 print(enclosure.get(sparkle + 'edSignature'))
 PY
         )
-        "$SDK/bin/sign_update" --verify --account "$KEY_ACCOUNT" "$DIST/appcast.xml"
-        "$SDK/bin/sign_update" --verify --account "$KEY_ACCOUNT" "$DIST/$ZIP" "$signature"
+        "$SDK/bin/sign_update" --verify "${sparkle_args[@]}" "$DIST/appcast.xml"
+        "$SDK/bin/sign_update" --verify "${sparkle_args[@]}" "$DIST/$ZIP" "$signature"
         /usr/bin/codesign --verify --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$TEAM_ID\"" "$DIST/$DMG"
         /usr/bin/xcrun stapler validate "$DIST/$DMG"
         for artifact in "$ZIP" "$DMG"; do

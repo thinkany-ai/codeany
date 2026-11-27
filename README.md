@@ -76,7 +76,28 @@ launch and every four hours while open. When an update is available, click
 **Update to …** above the settings row at the bottom of the Chat sidebar to
 open the installer. You can also check manually from **CodeAny → Check for Updates…**.
 
-From the release Mac, with `../agl` and `../nex` checked out:
+GitHub Actions builds and tests on Apple Silicon. Configure the following
+secrets in the repository's `macos-release` environment before pushing a
+release tag:
+
+| Secret | Value |
+| --- | --- |
+| `THINKANY_CERTIFICATE` | Base64-encoded Developer ID Application `.p12` for ThinkAny, LLC (`8PL52G56V9`) |
+| `THINKANY_CERTIFICATE_PASSWORD` | Password for the `.p12` |
+| `THINKANY_API_KEY` | ThinkAny App Store Connect team API `.p8` contents for Apple notarization |
+| `THINKANY_API_KEY_ID` | App Store Connect API key ID |
+| `THINKANY_API_ISSUER` | App Store Connect team issuer ID |
+| `CODEANY_SPARKLE_PRIVATE_KEY` | Contents of the existing Sparkle key export for `ai.codeany.desktop` |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account hosting the `codeany-desktop` R2 bucket |
+| `CLOUDFLARE_API_TOKEN` | Token authorized to write to that R2 bucket with Wrangler |
+
+The macOS workflow signs and notarizes the DMG, attaches it to the GitHub
+release, and publishes the signed Sparkle feed on the existing CDN.
+To add macOS packages to an existing release, run the **macOS** workflow
+from `main` with its tag. If the publish job fails after uploading to R2,
+rerun only failed jobs to reuse the same notarized artifacts.
+
+To package and publish manually from a configured release Mac:
 
 1. Bump `version` in `Cargo.toml` and update `Cargo.lock` with `cargo check`.
 2. Run `make release-package`. This uses the **ThinkAny, LLC** Developer ID

@@ -1,5 +1,5 @@
-# Builds and packages CodeAny for Linux and Windows. The macOS release is
-# made locally (scripts/release-mac.sh). Packages are uploaded as workflow
+# Builds and packages CodeAny for Linux and Windows. macOS uses macos.yml.
+# Packages are uploaded as workflow
 # artifacts; on a v* tag they are also attached to that tag's GitHub Release.
 name: Linux & Windows
 

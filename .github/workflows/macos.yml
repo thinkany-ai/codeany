@@ -1,0 +1,150 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ (github.event_name == 'workflow_dispatch' || github.ref_type == 'tag') && 'release' || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch')
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  package:
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref_type == 'tag')
+    runs-on: macos-15
+    environment: macos-release
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out release source
+        id: version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git merge-base --is-ancestor "refs/tags/$TAG^{commit}" origin/main
+          git switch --detach "refs/tags/$TAG"
+          # Use the workflow revision's release script for older source tags.
+          git restore --source "$GITHUB_SHA" -- scripts/release-mac.sh
+          version=$(cargo pkgid --locked | sed 's/.*[#@]//')
+          [[ "v$version" == "$TAG" ]]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+      - name: Sign and notarize
+        env:
+          THINKANY_CERTIFICATE: ${{ secrets.THINKANY_CERTIFICATE }}
+          THINKANY_CERTIFICATE_PASSWORD: ${{ secrets.THINKANY_CERTIFICATE_PASSWORD }}
+          THINKANY_API_KEY: ${{ secrets.THINKANY_API_KEY }}
+          THINKANY_API_KEY_ID: ${{ secrets.THINKANY_API_KEY_ID }}
+          THINKANY_API_ISSUER: ${{ secrets.THINKANY_API_ISSUER }}
+          CODEANY_SPARKLE_PRIVATE_KEY: ${{ secrets.CODEANY_SPARKLE_PRIVATE_KEY }}
+        run: |
+          for name in THINKANY_CERTIFICATE THINKANY_CERTIFICATE_PASSWORD THINKANY_API_KEY THINKANY_API_KEY_ID THINKANY_API_ISSUER CODEANY_SPARKLE_PRIVATE_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing macos-release secret $name"
+              exit 1
+            fi
+          done
+
+          umask 077
+          signing_dir=$(mktemp -d "$RUNNER_TEMP/codeany-signing.XXXXXX")
+          keychain="$signing_dir/signing.keychain-db"
+          trap 'security delete-keychain "$keychain" 2>/dev/null || true; rm -rf "$signing_dir"' EXIT
+          keychain_password=$(openssl rand -hex 32)
+          printf '%s' "$THINKANY_CERTIFICATE" | base64 -D > "$signing_dir/developer-id.p12"
+          printf '%s\n' "$THINKANY_API_KEY" > "$signing_dir/AuthKey.p8"
+          printf '%s' "$CODEANY_SPARKLE_PRIVATE_KEY" > "$signing_dir/sparkle.key"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security import "$signing_dir/developer-id.p12" -k "$keychain" \
+            -P "$THINKANY_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          xcrun notarytool store-credentials codeany-thinkany --keychain "$keychain" \
+            --key "$signing_dir/AuthKey.p8" --key-id "$THINKANY_API_KEY_ID" --issuer "$THINKANY_API_ISSUER"
+          rm "$signing_dir/developer-id.p12" "$signing_dir/AuthKey.p8"
+          unset THINKANY_CERTIFICATE THINKANY_CERTIFICATE_PASSWORD THINKANY_API_KEY THINKANY_API_KEY_ID THINKANY_API_ISSUER CODEANY_SPARKLE_PRIVATE_KEY
+
+          umask 022
+          CODEANY_NOTARY_KEYCHAIN="$keychain" CODEANY_SPARKLE_KEY_FILE="$signing_dir/sparkle.key" make release-package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codeany-macos-${{ steps.version.outputs.version }}
+          path: target/distribution/${{ steps.version.outputs.version }}/*
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: macos-15
+    environment: macos-release
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select release version
+        run: |
+          git fetch --no-tags origin "refs/tags/v$VERSION:refs/tags/v$VERSION"
+          git restore --source "refs/tags/v$VERSION" -- Cargo.toml Cargo.lock
+      - uses: actions/download-artifact@v4
+        with:
+          name: codeany-macos-${{ needs.package.outputs.version }}
+          path: target/distribution/${{ needs.package.outputs.version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Publish signed update to R2
+        env:
+          CODEANY_SPARKLE_PRIVATE_KEY: ${{ secrets.CODEANY_SPARKLE_PRIVATE_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          for name in CODEANY_SPARKLE_PRIVATE_KEY CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing macos-release secret $name"
+              exit 1
+            fi
+          done
+          umask 077
+          sparkle_key=$(mktemp "$RUNNER_TEMP/codeany-sparkle.XXXXXX")
+          trap 'rm -f "$sparkle_key"' EXIT
+          printf '%s' "$CODEANY_SPARKLE_PRIVATE_KEY" > "$sparkle_key"
+          unset CODEANY_SPARKLE_PRIVATE_KEY
+          CODEANY_SPARKLE_KEY_FILE="$sparkle_key" make release-publish
+      - name: Attach macOS installer to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$VERSION"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --verify-tag --draft --title "CodeAny $VERSION" --notes "" || \
+            gh release view "$tag" >/dev/null
+          gh release upload "$tag" "target/distribution/$VERSION/CodeAny_${VERSION}_arm64.dmg" --clobber
