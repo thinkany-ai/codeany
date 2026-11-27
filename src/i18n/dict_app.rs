@@ -3,6 +3,10 @@
 //! The app shell: menus, the workspace window and Settings.
 
 pub const ZH_CN: &[(&str, &str)] = &[
+    ("QR code", "二维码"),
+    ("Scan to connect", "扫码连接"),
+    ("Scan it with the device that should connect. It works for 10 minutes and replaces the code copied before.", "用要接入的设备扫描此二维码。10 分钟内有效，之前复制的授权码随之失效。"),
+    ("The authorization code is too long for a QR code.", "授权码太长，无法生成二维码。"),
     ("Rename", "重命名"),
     ("Close Other Tabs", "关闭其他标签"),
     ("Close Tabs to the Right", "关闭右侧标签"),
@@ -294,6 +298,10 @@ pub const ZH_CN: &[(&str, &str)] = &[
 ];
 
 pub const ZH_TW: &[(&str, &str)] = &[
+    ("QR code", "QR 碼"),
+    ("Scan to connect", "掃碼連線"),
+    ("Scan it with the device that should connect. It works for 10 minutes and replaces the code copied before.", "用要連線的裝置掃描此 QR 碼。10 分鐘內有效，先前複製的授權碼隨之失效。"),
+    ("The authorization code is too long for a QR code.", "授權碼太長，無法產生 QR 碼。"),
     ("Rename", "重新命名"),
     ("Close Other Tabs", "關閉其他標籤"),
     ("Close Tabs to the Right", "關閉右側標籤"),
@@ -585,6 +593,10 @@ pub const ZH_TW: &[(&str, &str)] = &[
 ];
 
 pub const JA: &[(&str, &str)] = &[
+    ("QR code", "QR コード"),
+    ("Scan to connect", "スキャンして接続"),
+    ("Scan it with the device that should connect. It works for 10 minutes and replaces the code copied before.", "接続するデバイスでこの QR コードをスキャンしてください。10 分間有効で、以前コピーしたコードは無効になります。"),
+    ("The authorization code is too long for a QR code.", "認証コードが長すぎて QR コードにできません。"),
     ("Rename", "名前を変更"),
     ("Close Other Tabs", "他のタブを閉じる"),
     ("Close Tabs to the Right", "右側のタブを閉じる"),
@@ -876,6 +888,10 @@ pub const JA: &[(&str, &str)] = &[
 ];
 
 pub const KO: &[(&str, &str)] = &[
+    ("QR code", "QR 코드"),
+    ("Scan to connect", "스캔하여 연결"),
+    ("Scan it with the device that should connect. It works for 10 minutes and replaces the code copied before.", "연결할 기기로 이 QR 코드를 스캔하세요. 10분 동안 유효하며 이전에 복사한 코드는 더 이상 쓸 수 없습니다."),
+    ("The authorization code is too long for a QR code.", "인증 코드가 너무 길어 QR 코드로 만들 수 없습니다."),
     ("Rename", "이름 변경"),
     ("Close Other Tabs", "다른 탭 닫기"),
     ("Close Tabs to the Right", "오른쪽 탭 닫기"),

@@ -10,3 +10,7 @@ pub fn sidebar() -> Icon {
 pub fn search() -> Icon {
     Icon::default().data(include_bytes!("../assets/icons/search.svg"))
 }
+
+pub fn qr_code() -> Icon {
+    Icon::default().data(include_bytes!("../assets/icons/qr-code.svg"))
+}

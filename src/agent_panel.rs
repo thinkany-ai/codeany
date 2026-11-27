@@ -306,6 +306,8 @@ impl AgentPanel {
         for set in &mut store.tabs {
             set.retain_threads(|id| live.contains(&id));
         }
+        // And tabs that strayed into another workspace's row go too.
+        store.drop_foreign_tabs();
         crate::style::set_typography(store.typography.clone(), cx);
         if let Some(theme) = store.theme.clone() {
             crate::style::set_choice(theme, window, cx);
@@ -570,8 +572,10 @@ impl AgentPanel {
         let Some(thread) = self.store.threads.iter().find(|t| t.id == id) else {
             return;
         };
-        // Another project's thread gets its tab when `select_thread` moves there.
-        if thread.machine.is_some() || thread.project == self.project {
+        // Another project's or workspace's thread gets its tab when
+        // `select_thread` moves there.
+        let elsewhere = self.store.workspace_of(thread).map(|w| &w.id) != self.store.active_workspace.as_ref();
+        if !elsewhere && (thread.machine.is_some() || thread.project == self.project) {
             self.tab_set_mut().open(id);
         }
         self.select_thread(id, window, cx);
@@ -2172,7 +2176,11 @@ impl AgentPanel {
         self.store.active_workspace = Some(id);
         self.shown_project = None;
         self.set_machine(ws.device.clone(), cx);
-        // Each workspace keeps its own tabs: show the one last active there.
+        // Each workspace keeps its own tabs, of its own threads only (a
+        // thread's workspace can change as devices sync): show the one last
+        // active there.
+        self.tab_set_mut();
+        self.store.drop_foreign_tabs();
         self.active = self.tab_set_mut().current();
         if self.active_thread().is_some_and(|t| !self.in_active_workspace(t)) {
             self.new_thread(window, cx);
@@ -2308,7 +2316,7 @@ impl AgentPanel {
                             .items_center()
                             .gap(layout::SPACE_2)
                             .text_size(TEXT)
-                            .child(crate::workspace_switcher::avatar(icon.as_deref(), &title, px(22.), cx))
+                            .child(crate::workspace_switcher::avatar(icon.as_deref(), &title, px(18.), cx))
                             .child(
                                 div()
                                     .min_w_0()

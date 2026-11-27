@@ -1,6 +1,6 @@
 [package]
 name = "codeany"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 description = "A local-first coding agent"
 license = "AGPL-3.0-only"
@@ -66,6 +66,7 @@ snow = "0.9"
 hkdf = "0.12"
 sha2 = "0.10"
 local-ip-address = "0.6"
+qrcode = { version = "0.15.0", default-features = false, features = ["svg"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

@@ -92,7 +92,7 @@ pub fn avatar(icon: Option<&str>, title: &str, size: Pixels, cx: &App) -> AnyEle
             .flex()
             .items_center()
             .justify_center()
-            .text_size(size * 0.82)
+            .text_size(size * 0.78)
             .child(emoji.to_string())
             .into_any_element(),
         None => div()
@@ -240,7 +240,7 @@ impl WorkspaceMenu {
                     .cursor_pointer()
                     .text_size(TEXT)
                     .hover(|this| this.bg(theme.list_hover))
-                    .child(avatar(w.icon.as_deref(), &w.title, px(20.), cx))
+                    .child(avatar(w.icon.as_deref(), &w.title, px(18.), cx))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(w.title.clone()))
                     .when_some(device, |this, (name, online)| {
                         this.child(
@@ -503,7 +503,7 @@ impl WorkspaceMenu {
                             .text_size(TEXT)
                             .when(!mounted, |this| this.cursor_pointer().hover(|this| this.bg(theme.list_hover)))
                             .when(mounted, |this| this.text_color(theme.muted_foreground))
-                            .child(avatar(w.icon.as_deref(), &w.title, px(20.), cx))
+                            .child(avatar(w.icon.as_deref(), &w.title, px(18.), cx))
                             .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(w.title.clone()))
                             .when(mounted, |this| this.child(div().text_size(TEXT * 0.85).child(t("Added"))))
                             .on_click(cx.listener(move |this, _, _, cx| {

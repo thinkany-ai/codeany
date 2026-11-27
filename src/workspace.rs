@@ -1195,12 +1195,20 @@ impl Workspace {
             )
             .child(div().flex_1())
             .when_some(update, |this, version| {
-                // Like the other chrome icons, in the accent color so a
-                // waiting update is noticed.
+                // The settings icon's size, filled so a waiting update is noticed.
+                let size = crate::style::size::icon_pixels(cx);
                 this.child(
                     chrome_button("install-update")
-                        .child(Icon::new(IconName::Download).size(ICON))
-                        .text_color(theme.primary)
+                        .child(
+                            div()
+                                .size(size)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(theme.foreground)
+                                .child(Icon::new(IconName::Download).size(size * 0.62).text_color(theme.background)),
+                        )
                         .on_click(|_, _, _| {
                             #[cfg(target_os = "macos")]
                             crate::updater::check();
@@ -1302,7 +1310,8 @@ impl Workspace {
                 } else {
                     match &tab.agent {
                         Some(agent) => crate::agent_icons::agent_icon(agent, icon_size, cx),
-                        None => Icon::new(IconName::MessageCirclePlus).size(ICON).into_any_element(),
+                        // Its glyph fills the box, so a size down matches the other icons.
+                        None => Icon::new(IconName::MessageCirclePlus).size(crate::style::size::TAB_ACTION_ICON).into_any_element(),
                     }
                 };
                 div()

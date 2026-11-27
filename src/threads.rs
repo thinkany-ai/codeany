@@ -764,6 +764,18 @@ impl Store {
         self.workspaces.iter().find(|w| &w.id == id)
     }
 
+    /// Close the tabs showing a thread of another workspace: each workspace's
+    /// row of tabs holds its own threads only.
+    pub fn drop_foreign_tabs(&mut self) {
+        let homes: std::collections::HashMap<u64, Option<String>> =
+            self.threads.iter().map(|t| (t.id, self.workspace_of(t).map(|w| w.id.clone()))).collect();
+        for set in &mut self.tabs {
+            let Some(workspace) = set.workspace.clone() else { continue };
+            // A thread not known (yet) is left to the sweep of gone threads.
+            set.retain_threads(|id| homes.get(&id).is_none_or(|home| home.as_ref() == Some(&workspace)));
+        }
+    }
+
     /// The workspace `thread` shows in: the one it names when that is one
     /// of its device's here, else its device's first.
     pub fn workspace_of(&self, thread: &Thread) -> Option<&Workspace> {
@@ -1254,5 +1266,26 @@ mod workspace_tests {
         // An unknown id falls back to its device's first workspace.
         assert_eq!(store.workspace_of(&thread(Some("mini"), Some("gone"))).unwrap().id, mounted_id);
         assert!(store.workspace_of(&thread(Some("other"), None)).is_none());
+    }
+
+    #[test]
+    fn a_workspaces_tabs_hold_its_own_threads_only() {
+        let mut store = Store::default();
+        store.ensure_workspaces("mini");
+        let here = store.workspaces[0].id.clone();
+        let mbp = Workspace::new("mbp".into(), None, Some("mbp".into()), None);
+        let mbp_id = mbp.id.clone();
+        store.workspaces.push(mbp);
+        let (mut mine, mut theirs) = (thread(None, None), thread(Some("mbp"), None));
+        (mine.id, theirs.id) = (1, 2);
+        store.threads = vec![mine, theirs];
+        // A tab of mbp's thread strayed into this machine's row; 3 is not synced yet.
+        store.tabs = vec![
+            crate::chat_tabs::TabSet { project: None, workspace: Some(here), tabs: vec![Some(1), Some(2), None], active: 2 },
+            crate::chat_tabs::TabSet { project: None, workspace: Some(mbp_id), tabs: vec![Some(2), Some(3)], active: 0 },
+        ];
+        store.drop_foreign_tabs();
+        assert_eq!((store.tabs[0].tabs.clone(), store.tabs[0].active), (vec![Some(1), None], 1));
+        assert_eq!(store.tabs[1].tabs, [Some(2), Some(3)]);
     }
 }

@@ -32,34 +32,44 @@ impl Asset for ProjectLogo {
 }
 
 fn load_logo(path: &Path, format: ImageFormat) -> Option<Arc<RenderImage>> {
-    let file = fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(MAX_LOGO_BYTES + 1).read_to_end(&mut bytes).ok()?;
-    if bytes.len() as u64 > MAX_LOGO_BYTES {
-        return None;
-    }
-    let mut pixels = if format == ImageFormat::Svg {
-        render_svg(&bytes)?
-    } else {
-        let format = image::ImageFormat::from_extension(format.extension())?;
-        let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(4096);
-        limits.max_image_height = Some(4096);
-        limits.max_alloc = Some(96 * 1024 * 1024);
-        reader.limits(limits);
-        reader
-            .decode()
-            .ok()?
-            .thumbnail(THUMBNAIL_SIZE, THUMBNAIL_SIZE)
-            .into_rgba8()
-    };
+    let mut pixels = decode_logo(path, format)?;
     // GPUI textures use BGRA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
     let frames = smallvec::SmallVec::from_buf([image::Frame::new(pixels)]);
     Some(Arc::new(RenderImage::new(frames)))
+}
+
+/// The project's logo as the sidebar shows it, encoded as a PNG: what another
+/// device (the phone) shows for this project (`sync`'s `projects.logo`).
+pub fn logo_png(project: &Path) -> Option<Vec<u8>> {
+    let pixels = logo_candidates(project)
+        .into_iter()
+        .find_map(|(path, format)| decode_logo(&path, format))?;
+    let mut png = Vec::new();
+    pixels.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    Some(png)
+}
+
+fn decode_logo(path: &Path, format: ImageFormat) -> Option<image::RgbaImage> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOGO_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_LOGO_BYTES {
+        return None;
+    }
+    if format == ImageFormat::Svg {
+        return render_svg(&bytes);
+    }
+    let format = image::ImageFormat::from_extension(format.extension())?;
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(96 * 1024 * 1024);
+    reader.limits(limits);
+    Some(reader.decode().ok()?.thumbnail(THUMBNAIL_SIZE, THUMBNAIL_SIZE).into_rgba8())
 }
 
 fn render_svg(bytes: &[u8]) -> Option<image::RgbaImage> {

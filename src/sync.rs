@@ -10,7 +10,8 @@
 //! - `threads.get {id}`: one thread in full;
 //! - `threads.put {thread}`: a thread another device started or continued
 //!   here, written back;
-//! - `threads.delete {id}`.
+//! - `threads.delete {id}`;
+//! - `projects.logo {path}`: a project's logo, as the sidebar shows it.
 //!
 //! The other devices poll the list, fetch what changed, and show those
 //! threads under the device's name in their sidebar. Continuing one there
@@ -269,7 +270,15 @@ async fn serve(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
             continue;
         };
         let Ok(WireMsg::Request { id, method, params }) = serde_json::from_str::<WireMsg>(&text) else { continue };
-        let (result, error) = match handle(&method, params) {
+        let handled = if method == "projects.logo" {
+            // It walks the project's folder: off the socket's thread.
+            tokio::task::spawn_blocking(move || project_logo(params))
+                .await
+                .unwrap_or_else(|err| Err(anyhow!("{err}")))
+        } else {
+            handle(&method, params)
+        };
+        let (result, error) = match handled {
             Ok(value) => (Some(value), None),
             Err(err) => (None, Some(format!("{err:#}"))),
         };
@@ -278,6 +287,21 @@ async fn serve(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
             break;
         }
     }
+}
+
+/// `projects.logo {path}`: the logo the sidebar shows for a project here, a
+/// PNG in base64 (`{png}`), or null when it has none.
+fn project_logo(params: Value) -> Result<Value> {
+    use base64::Engine as _;
+    let path = params["path"].as_str().ok_or_else(|| anyhow!("path is required"))?;
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() || !path.is_dir() {
+        return Ok(Value::Null);
+    }
+    Ok(match crate::project_avatar::logo_png(path) {
+        Some(png) => json!({ "png": base64::engine::general_purpose::STANDARD.encode(png) }),
+        None => Value::Null,
+    })
 }
 
 fn handle(method: &str, params: Value) -> Result<Value> {

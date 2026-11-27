@@ -58,16 +58,14 @@ impl TabSet {
         }
     }
 
-    /// Open a tab for a new thread after the active one; an empty tab
+    /// Open the tab for a new thread, always the last one; an empty tab
     /// already open is reused.
     pub fn open_new(&mut self) {
         self.normalize();
-        if let Some(ix) = self.tabs.iter().position(Option::is_none) {
-            self.active = ix;
-        } else {
-            self.active += 1;
-            self.tabs.insert(self.active, None);
+        if self.tabs.last() != Some(&None) {
+            self.tabs.push(None);
         }
+        self.active = self.tabs.len() - 1;
     }
 
     /// Close tab `ix`; the thread it showed. The last tab closed leaves an
@@ -138,6 +136,18 @@ impl TabSet {
     }
 
     fn normalize(&mut self) {
+        // The new thread's tab, if open, is the last one, and the only one.
+        if let Some(ix) = self.tabs.iter().position(Option::is_none) {
+            if ix + 1 != self.tabs.len() || self.tabs.iter().filter(|t| t.is_none()).count() > 1 {
+                let active = self.tabs.get(self.active).copied();
+                self.tabs.retain(Option::is_some);
+                self.tabs.push(None);
+                self.active = match active {
+                    Some(Some(id)) => self.tabs.iter().position(|t| *t == Some(id)).unwrap_or(0),
+                    _ => self.tabs.len() - 1,
+                };
+            }
+        }
         if self.tabs.is_empty() {
             self.tabs.push(None);
         }
@@ -177,6 +187,18 @@ mod tests {
         assert_eq!((set.tabs.clone(), set.active), (vec![Some(2)], 0));
         set.close(0);
         assert_eq!((set.tabs.clone(), set.active), (vec![None], 0));
+    }
+
+    #[test]
+    fn the_new_tab_is_always_last() {
+        let mut set = TabSet { project: None, workspace: None, tabs: vec![Some(1), None, Some(2)], active: 0 };
+        set.open_new();
+        assert_eq!((set.tabs.clone(), set.active), (vec![Some(1), Some(2), None], 2));
+        set.select(0);
+        set.open(3);
+        assert_eq!((set.tabs.clone(), set.active), (vec![Some(1), Some(3), Some(2), None], 1));
+        set.open_new();
+        assert_eq!(set.active, 3);
     }
 
     #[test]

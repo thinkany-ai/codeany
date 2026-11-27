@@ -1582,16 +1582,7 @@ impl Settings {
     fn copy_invite(&mut self, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(peer::new_invite()));
         self.copied = true;
-        cx.spawn(async move |this, cx| {
-            while peer::invite_expires_in().is_some() {
-                cx.background_executor().timer(std::time::Duration::from_secs(15)).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    return;
-                }
-            }
-            this.update(cx, |_, cx| cx.notify()).ok();
-        })
-        .detach();
+        self.watch_invite(cx);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_millis(1500)).await;
             this.update(cx, |this, cx| {
@@ -1602,6 +1593,61 @@ impl Settings {
         })
         .detach();
         cx.notify();
+    }
+
+    /// A fresh authorization code as a QR code, in a dialog over Settings,
+    /// for a phone to scan.
+    fn show_invite_qr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(image) = qr_image(&peer::new_invite()) else {
+            self.device_error = Some(t("The authorization code is too long for a QR code.").into());
+            cx.notify();
+            return;
+        };
+        self.watch_invite(cx);
+        cx.notify();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            dialog
+                .w(px(360.))
+                .title(t("Scan to connect"))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            // Always dark on white: scanners need the contrast,
+                            // in a dark theme too.
+                            div()
+                                .p_3()
+                                .rounded_lg()
+                                .bg(gpui_kit::white())
+                                .child(img(image.clone()).size(px(240.)).object_fit(ObjectFit::Contain)),
+                        )
+                        .child(
+                            div()
+                                .text_size(TEXT)
+                                .text_color(theme.muted_foreground)
+                                .text_center()
+                                .child(t("Scan it with the device that should connect. It works for 10 minutes and replaces the code copied before.")),
+                        ),
+                )
+        });
+    }
+
+    /// Keep the code's time left fresh in the hint until it runs out.
+    fn watch_invite(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            while peer::invite_expires_in().is_some() {
+                cx.background_executor().timer(std::time::Duration::from_secs(15)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
     }
 
     // ---- Connecting devices
@@ -2021,11 +2067,24 @@ impl Settings {
         access = access.child(Self::row(
             "Authorization code",
             Some(hint),
-            Button::new("copy-invite")
-                .outline()
-                .app_icon(if self.copied { IconName::Check } else { IconName::Copy })
-                .app_label(if self.copied { t("Copied") } else { t("Copy") })
-                .on_click(cx.listener(|this, _, _, cx| this.copy_invite(cx)))
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("invite-qr")
+                        .outline()
+                        .app_icon(crate::icons::qr_code())
+                        .app_label(t("QR code"))
+                        .on_click(cx.listener(|this, _, window, cx| this.show_invite_qr(window, cx))),
+                )
+                .child(
+                    Button::new("copy-invite")
+                        .outline()
+                        .app_icon(if self.copied { IconName::Check } else { IconName::Copy })
+                        .app_label(if self.copied { t("Copied") } else { t("Copy") })
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_invite(cx))),
+                )
                 .into_any_element(),
             cx,
         ));
@@ -2755,5 +2814,28 @@ mod env_tests {
         assert_eq!(super::env_text(&saved), "B=2\nMY_KEY");
         assert!(super::parse_env("1BAD").is_err());
         assert_eq!(super::parse_env("EMPTY=").unwrap(), vec![("EMPTY".into(), String::new())]);
+    }
+}
+
+/// `text` as a QR code image (dark modules on white, with a quiet zone).
+fn qr_image(text: &str) -> Option<Arc<Image>> {
+    use qrcode::{EcLevel, QrCode, render::svg};
+    let code = QrCode::with_error_correction_level(text.as_bytes(), EcLevel::L).ok()?;
+    let svg = code
+        .render::<svg::Color>()
+        .min_dimensions(480, 480)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    Some(Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())))
+}
+
+#[cfg(test)]
+mod qr_tests {
+    #[test]
+    fn a_long_authorization_code_fits_a_qr_code() {
+        // Several endpoints make the code long; it must still render.
+        let code = format!("codeany1.{}", "A".repeat(1500));
+        assert!(super::qr_image(&code).is_some());
     }
 }
