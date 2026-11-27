@@ -275,6 +275,10 @@ async fn serve(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
             tokio::task::spawn_blocking(move || project_logo(params))
                 .await
                 .unwrap_or_else(|err| Err(anyhow!("{err}")))
+        } else if method == "files.put" {
+            tokio::task::spawn_blocking(move || put_file(params))
+                .await
+                .unwrap_or_else(|err| Err(anyhow!("{err}")))
         } else {
             handle(&method, params)
         };
@@ -302,6 +306,23 @@ fn project_logo(params: Value) -> Result<Value> {
         Some(png) => json!({ "png": base64::engine::general_purpose::STANDARD.encode(png) }),
         None => Value::Null,
     })
+}
+
+/// `files.put {name, data}`: save a file another device attached to a
+/// message for an agent here (`data` is base64); answers with its `{path}`.
+fn put_file(params: Value) -> Result<Value> {
+    use base64::Engine as _;
+    let name = params["name"].as_str().ok_or_else(|| anyhow!("name is required"))?;
+    // Only the file's own name: nothing that climbs out of the folder.
+    let name = name.rsplit(['/', '\\', ':']).next().unwrap_or("").trim();
+    let name = if name.is_empty() || name == "." || name == ".." { "file" } else { name };
+    let data = params["data"].as_str().ok_or_else(|| anyhow!("data is required"))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+    let dir = crate::paths::images().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(name);
+    std::fs::write(&path, bytes)?;
+    Ok(json!({ "path": path }))
 }
 
 fn handle(method: &str, params: Value) -> Result<Value> {

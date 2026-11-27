@@ -6,9 +6,11 @@ mod agent_panel;
 mod agl_bridge;
 mod chat_tabs;
 mod db;
+mod device_cli;
 mod file_tree;
 mod git;
 mod git_panel;
+mod hub;
 mod i18n;
 mod icons;
 mod keymap;
@@ -45,12 +47,13 @@ use std::path::PathBuf;
 
 use gpui_kit::*;
 
-use crate::workspace::Workspace;
 
 actions!(
     codeany,
     [
         Quit,
+        NewWindow,
+        Minimize,
         OpenFolder,
         Save,
         CloseTab,
@@ -111,6 +114,12 @@ pub fn set_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action(t("Refresh"), RefreshProject),
         ]),
+        // As Termany's: windows have a menu of their own.
+        Menu::new(t("Window")).items([
+            MenuItem::action(t("New Window"), NewWindow),
+            MenuItem::separator(),
+            MenuItem::action(t("Minimize"), Minimize),
+        ]),
     ]);
 }
 
@@ -132,6 +141,10 @@ fn main() {
         libc::setsid();
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `codeany devices|send|fetch`: an agent reaching the other devices.
+    if args.first().is_some_and(|a| device_cli::is_command(a)) {
+        std::process::exit(device_cli::run_cli(&args));
+    }
     if matches!(args.first().map(String::as_str), Some("serve" | "link")) {
         agl_bridge::set_home();
         std::process::exit(remote::serve_cli(&args));
@@ -156,17 +169,24 @@ fn main() {
         .with_assets(style::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            style::init_window_themes(cx);
 
             terminal::init(cx);
             model_picker::init(cx);
             // Last: it keeps the bindings above and adds the rebindable ones.
             keymap::init(cx);
 
+            device_cli::start(cx);
+
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.on_app_quit(|_| async {
-                // The last save may still be on its way to the disk.
-                db::flush();
-                agl_bridge::shutdown();
+            cx.on_app_quit(|_| {
+                // The windows closing now are the ones to open next time.
+                hub::quitting();
+                async {
+                    // The last save may still be on its way to the disk.
+                    db::flush();
+                    agl_bridge::shutdown();
+                }
             })
             .detach();
             #[cfg(target_os = "macos")]
@@ -176,21 +196,21 @@ fn main() {
             }
             set_app_menus(cx);
 
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
-                window_min_size: Some(workspace::minimum_window_size()),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("CodeAny".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(14.), px(13.))),
-                }),
-                ..Default::default()
-            };
-            gpui_kit::open_window(options, cx, |window, cx| {
-                style::apply(window, cx);
-                cx.new(|cx| Workspace::new(initial_root.clone(), window, cx))
-            })
-            .expect("failed to open window");
+            cx.on_action(|_: &NewWindow, cx| workspace::open_new_window(cx));
+            cx.on_action(|_: &Minimize, cx| {
+                if let Some(window) = cx.active_window() {
+                    window.update(cx, |_, window, _| window.minimize_window()).ok();
+                }
+            });
+
+            // The windows open when CodeAny quit, each on its workspace; the
+            // folder asked for opens in the first.
+            let restore = hub::hub(cx).read(cx).shared().borrow().windows_to_restore();
+            let mut restore = restore.into_iter();
+            workspace::open_main_window(initial_root.clone(), restore.next(), cx);
+            for id in restore {
+                workspace::open_main_window(None, Some(id), cx);
+            }
             cx.activate(true);
         });
 }

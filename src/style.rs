@@ -47,8 +47,8 @@ pub mod layout {
     pub const BUBBLE_RADIUS: Pixels = px(12.);
     pub const SIDEBAR_INSET: Pixels = SPACE_2;
     pub const ROW_INSET: Pixels = SPACE_2;
-    pub const SIDEBAR_ROW: Pixels = px(28.);
-    pub const SIDEBAR_ROW_INSET: Pixels = SPACE_2;
+    pub const SIDEBAR_ROW: Pixels = px(30.);
+    pub const SIDEBAR_ROW_INSET: Pixels = px(10.);
     pub const SIDEBAR_NAV_ROW: Pixels = px(32.);
     pub const CONTENT_MAX: Pixels = px(720.);
 }
@@ -101,6 +101,104 @@ pub fn typography(cx: &App) -> Typography {
 pub fn set_typography(value: Typography, cx: &mut App) {
     cx.set_global(value.clone());
     Theme::update(cx, |theme| value.apply(theme));
+    changed(cx);
+}
+
+// ---- A theme per window -----------------------------------------------------
+//
+// The component library keeps one theme for the whole app, and changing it
+// through its API repaints every window. Each window here shows its
+// workspace's theme, so before a window draws, the theme it needs goes in
+// place from a snapshot taken when that theme was first applied: no repaint
+// of the others, which would then switch it back for themselves, and so on.
+
+/// Bumped when what the themes look like changes (one picked, the text
+/// size, the system's light or dark), not when another window draws. Views
+/// that measure or cache what they draw observe this, not the theme.
+#[derive(Default)]
+pub struct ThemeEpoch(pub u64);
+
+impl Global for ThemeEpoch {}
+
+/// Tell every window that the themes look different now.
+pub fn changed(cx: &mut App) {
+    let next = cx.try_global::<ThemeEpoch>().map_or(0, |e| e.0) + 1;
+    cx.set_global(ThemeEpoch(next));
+    DRAWN.with(|d| *d.borrow_mut() = None);
+}
+
+/// A theme as applied: which, under which system appearance, at which epoch.
+type ThemeKey = (String, bool, u64);
+type Snapshot = (Theme, Option<[(u8, u8, u8); 16]>);
+
+thread_local! {
+    static SNAPSHOTS: std::cell::RefCell<std::collections::HashMap<ThemeKey, Snapshot>> = Default::default();
+    /// The theme in place now.
+    static DRAWN: std::cell::RefCell<Option<ThemeKey>> = const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// Each window's theme, as it last drew.
+    static WINDOW_THEMES: std::cell::RefCell<std::collections::HashMap<WindowId, String>> = Default::default();
+}
+
+/// Put the window's theme in place before its root draws: the root (and the
+/// dialogs it hosts) passes the theme's colors down before the workspace's
+/// own `render` gets to [`use_theme`].
+pub struct WindowTheme;
+
+impl Render for WindowTheme {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+impl gpui_kit::base::RootPlugin for WindowTheme {
+    fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let choice = WINDOW_THEMES.with(|t| t.borrow().get(&window.window_handle().window_id()).cloned());
+        if let Some(choice) = choice {
+            use_theme(&choice, window, cx);
+        }
+    }
+}
+
+/// Call after `gpui_kit::init`, so it prepares after the library's own plugin.
+pub fn init_window_themes(cx: &mut App) {
+    gpui_kit::base::Root::register_plugin::<WindowTheme>(cx, |_, _| WindowTheme);
+}
+
+/// Put theme `choice` in place for the window about to draw.
+pub fn use_theme(choice: &str, window: &mut Window, cx: &mut App) {
+    WINDOW_THEMES.with(|t| {
+        let id = window.window_handle().window_id();
+        if t.borrow().get(&id).map(String::as_str) != Some(choice) {
+            t.borrow_mut().insert(id, choice.to_string());
+        }
+    });
+    let dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+    let key: ThemeKey = (choice.to_string(), dark, cx.try_global::<ThemeEpoch>().map_or(0, |e| e.0));
+    if DRAWN.with(|d| d.borrow().as_ref() == Some(&key)) {
+        return;
+    }
+    match SNAPSHOTS.with(|s| s.borrow().get(&key).cloned()) {
+        Some((theme, ansi)) => {
+            cx.set_global(theme);
+            Theme::sync_base(cx);
+            *ANSI.write().unwrap() = ansi;
+        }
+        None => {
+            // First use: apply it the library's way (this once repaints the
+            // windows), then keep what it made.
+            apply_choice(choice, window, cx);
+            let snapshot = (Theme::global(cx).clone(), *ANSI.read().unwrap());
+            SNAPSHOTS.with(|s| {
+                let mut s = s.borrow_mut();
+                s.retain(|k, _| k.2 == key.2);
+                s.insert(key.clone(), snapshot);
+            });
+        }
+    }
+    DRAWN.with(|d| *d.borrow_mut() = Some(key));
 }
 
 /// App labels and icons use the same scale across button sizes.
@@ -337,10 +435,11 @@ pub fn choice(cx: &App) -> String {
         .unwrap_or_else(|| "system".into())
 }
 
-/// Switch themes and repaint.
+/// Switch the theme new workspaces start with, and repaint.
 pub fn set_choice(id: String, window: &mut Window, cx: &mut App) {
     cx.set_global(ThemeChoice(id));
     apply(window, cx);
+    changed(cx);
 }
 
 fn color(text: &str) -> Hsla {
@@ -361,9 +460,16 @@ fn overlay(dark: bool) -> Hsla {
     if dark { hexa(0x00000099) } else { hexa(0x00000059) }
 }
 
-/// Apply the chosen theme on top of the component library's defaults.
+/// Apply the app's theme (what new workspaces start with) on top of the
+/// component library's defaults; a window puts its own in place as it draws.
 pub fn apply(window: &mut Window, cx: &mut App) {
-    if let Some(palette) = themes::find(&choice(cx)) {
+    apply_choice(&choice(cx), window, cx);
+    DRAWN.with(|d| *d.borrow_mut() = None);
+}
+
+/// Apply theme `choice`: `"system"` or a [`themes::THEMES`] id.
+fn apply_choice(choice: &str, window: &mut Window, cx: &mut App) {
+    if let Some(palette) = themes::find(choice) {
         apply_palette(palette, window, cx);
         return;
     }

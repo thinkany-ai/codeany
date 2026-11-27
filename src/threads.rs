@@ -70,7 +70,8 @@ pub struct PlanEntry {
     pub status: String,
 }
 
-/// What the user sent: text, and images pasted with it.
+/// What the user sent: text, and the files attached to it (`images`: pasted
+/// images at first, any file since; the name stays for saved threads).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UserMessage {
     pub text: String,
@@ -99,10 +100,12 @@ impl UserMessage {
             if !prompt.is_empty() {
                 prompt.push_str("\n\n");
             }
-            prompt.push_str(if self.images.len() == 1 {
-                "The user attached an image. Open it with your image-viewing or file-reading tool:"
-            } else {
-                "The user attached images. Open them with your image-viewing or file-reading tool:"
+            let all_images = self.images.iter().all(|p| is_image_path(p));
+            prompt.push_str(match (all_images, self.images.len() == 1) {
+                (true, true) => "The user attached an image. Open it with your image-viewing or file-reading tool:",
+                (true, false) => "The user attached images. Open them with your image-viewing or file-reading tool:",
+                (false, true) => "The user attached a file. Open it with your file-reading tool:",
+                (false, false) => "The user attached files. Open them with your file-reading tool:",
             });
             for path in &self.images {
                 prompt.push_str(&format!("\n- {}", path.display()));
@@ -710,9 +713,16 @@ pub struct Store {
     /// Workspaces, each on one device, as Termany has them.
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
-    /// The workspace the window shows.
+    /// The workspace a new window shows: the one used last.
     #[serde(default)]
     pub active_workspace: Option<String>,
+    /// The workspaces open in windows when CodeAny last quit, to open again.
+    #[serde(default)]
+    pub windows: Vec<String>,
+    /// Each workspace's theme, by workspace id, kept on this device; one with
+    /// none shows `theme`.
+    #[serde(default)]
+    pub workspace_themes: HashMap<String, String>,
     #[serde(skip)]
     db: Option<Db>,
 }
@@ -853,6 +863,8 @@ impl Default for Store {
             remote_dirs: Default::default(),
             workspaces: Vec::new(),
             active_workspace: None,
+            windows: Vec::new(),
+            workspace_themes: HashMap::new(),
             db: None,
         }
     }
@@ -969,6 +981,8 @@ impl Store {
                 remote_dirs: db.setting("remote_dirs").unwrap_or_default(),
                 workspaces: db.setting("workspaces").unwrap_or_default(),
                 active_workspace: db.setting("active_workspace").flatten(),
+                windows: db.setting("windows").unwrap_or_default(),
+                workspace_themes: db.setting("workspace_themes").unwrap_or_default(),
                 db: Some(db),
             },
             Err(err) => {
@@ -1004,6 +1018,8 @@ impl Store {
         db.set_setting("remote_dirs", &self.remote_dirs);
         db.set_setting("workspaces", &self.workspaces);
         db.set_setting("active_workspace", &self.active_workspace);
+        db.set_setting("windows", &self.windows);
+        db.set_setting("workspace_themes", &self.workspace_themes);
         // A copy is cheap next to serializing every item to see what changed;
         // that happens on the writer's thread.
         if !crate::db::save_in_background(self.threads.clone()) {

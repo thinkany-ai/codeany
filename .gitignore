@@ -1,2 +1,6 @@
 target/
 .cargo/config.toml
+
+# Generated images and design drafts, kept locally
+output/
+assets/logo-concepts/

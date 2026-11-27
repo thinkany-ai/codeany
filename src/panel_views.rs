@@ -6,7 +6,6 @@
 //! rebuild the whole workspace every frame while an agent works.
 
 use gpui_kit::*;
-use gpui_kit::component::Theme;
 
 use crate::agent_panel::AgentPanel;
 
@@ -20,7 +19,7 @@ impl ChatView {
         let _observe = [
             cx.observe(&panel, |_, _, cx| cx.notify()),
             // Text sizes change row heights too.
-            cx.observe_global::<Theme>(|this: &mut Self, cx| {
+            cx.observe_global::<crate::style::ThemeEpoch>(|this: &mut Self, cx| {
                 this.panel.read(cx).remeasure_chat();
                 cx.notify();
             }),
@@ -34,7 +33,7 @@ impl ChatView {
 fn observe<V: 'static>(panel: &Entity<AgentPanel>, cx: &mut Context<V>) -> [Subscription; 2] {
     [
         cx.observe(panel, |_, _, cx| cx.notify()),
-        cx.observe_global::<Theme>(|_, cx| cx.notify()),
+        cx.observe_global::<crate::style::ThemeEpoch>(|_, cx| cx.notify()),
     ]
 }
 

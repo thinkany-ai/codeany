@@ -51,6 +51,54 @@ pub fn minimum_window_size() -> Size<Pixels> {
     size(SIDEBAR_MIN + CONVERSATION_MIN + SURFACES_MIN, px(0.))
 }
 
+/// Open a main window on folder `root` and workspace `workspace` (each
+/// picked by the window when `None`), offset from the window in front.
+pub fn open_main_window(root: Option<PathBuf>, workspace: Option<String>, cx: &mut App) {
+    let mut bounds = WindowBounds::centered(size(px(1280.), px(820.)), cx);
+    if let Some(front) = cx.active_window().and_then(|w| w.update(cx, |_, window, _| window.bounds()).ok()) {
+        let mut moved = front;
+        moved.origin = moved.origin + point(px(28.), px(28.));
+        bounds = WindowBounds::Windowed(moved);
+    }
+    let options = WindowOptions {
+        window_bounds: Some(bounds),
+        window_min_size: Some(minimum_window_size()),
+        titlebar: Some(TitlebarOptions {
+            title: Some("CodeAny".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(14.), px(13.))),
+        }),
+        ..Default::default()
+    };
+    if let Err(err) = gpui_kit::open_window(options, cx, move |window, cx| {
+        crate::style::apply(window, cx);
+        cx.new(|cx| Workspace::new(root, workspace, window, cx))
+    }) {
+        eprintln!("codeany: cannot open a window: {err:#}");
+    }
+}
+
+/// ⌘⇧N: a window on a workspace no window shows yet; with none left, the
+/// window showing the one used last comes to the front.
+pub fn open_new_window(cx: &mut App) {
+    let hub = crate::hub::hub(cx);
+    let shared = hub.read(cx).shared();
+    shared.borrow_mut().prune(cx);
+    let free = shared.borrow().free_workspace();
+    match free {
+        Some(id) => open_main_window(None, Some(id), cx),
+        None => {
+            let last = {
+                let s = shared.borrow();
+                s.store.active_workspace.as_deref().and_then(|id| s.view_of(id, EntityId::from(u64::MAX)))
+            };
+            if let Some(view) = last {
+                view.window.update(cx, |_, window, _| window.activate_window()).ok();
+            }
+        }
+    }
+}
+
 enum TabContent {
     Editor(Entity<EditorState>),
     Message(SharedString),
@@ -171,11 +219,12 @@ fn load_text(path: &Path) -> Result<String, SharedString> {
 
 impl Workspace {
     /// The main window, showing the agent.
-    pub fn new(root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let agent_panel = cx.new(|cx| AgentPanel::new(window, cx));
+    pub fn new(root: Option<PathBuf>, workspace: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let agent_panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
         // Launched without a folder (from Finder or the Dock): pick up where
-        // the last run left off. The very first run opens nothing.
-        let root = root.or_else(|| agent_panel.read(cx).last_project());
+        // the last run left off, in the workspace shown. The very first run
+        // opens nothing.
+        let root = root.or_else(|| agent_panel.read(cx).default_root());
         let this = Self::build(root, Mode::Agent, agent_panel, None, window, cx);
         let handle = this.agent_panel.read(cx).composer_focus_handle(cx);
         handle.focus(window, cx);
@@ -219,7 +268,8 @@ impl Workspace {
                 SurfaceHostEvent::OpenFile(path) => this.show_file(path.clone(), window, cx),
             }),
             cx.observe(&surfaces, |_, _, cx| cx.notify()),
-            cx.observe_window_appearance(window, |_, window, cx| crate::style::apply(window, cx)),
+            // The system went light or dark: each window redraws in its theme.
+            cx.observe_window_appearance(window, |_, _, cx| crate::style::changed(cx)),
         ];
         if mode == Mode::Agent {
             #[cfg(target_os = "macos")]
@@ -1660,6 +1710,9 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // This window's workspace's theme, before anything reads it.
+        let choice = self.agent_panel.read(cx).theme_choice();
+        crate::style::use_theme(&choice, window, cx);
         let theme = cx.theme().clone();
 
         let content = match self.mode {

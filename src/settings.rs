@@ -153,6 +153,8 @@ pub struct Settings {
     busy: bool,
     /// The last device action's failure.
     device_error: Option<String>,
+    /// A device that just connected by scanning the QR code.
+    scanned_in: Option<String>,
     /// A code that adds a device to the account.
     pairing: Option<PairingCode>,
     code_input: Option<Entity<InputState>>,
@@ -218,6 +220,7 @@ impl Settings {
             devices: None,
             busy: false,
             device_error: None,
+            scanned_in: None,
             pairing: None,
             code_input: None,
             name_input: None,
@@ -448,7 +451,8 @@ impl Settings {
             (((grid_width + column_gap) / (THEME_CARD_MIN_WIDTH + column_gap)) as u16).clamp(1, 3);
         let card_radius = theme.radius_lg;
         let preview_radius = (card_radius - CARD_BORDER).max(px(0.));
-        let current = style::choice(cx);
+        // The theme of the workspace this window shows.
+        let current = self.agent_panel.upgrade().map(|p| p.read(cx).theme_choice()).unwrap_or_else(|| style::choice(cx));
         let weak = self.agent_panel.clone();
         let card = |id: &'static str, name: &'static str, preview: AnyElement, selected: bool| {
             let weak = weak.clone();
@@ -525,6 +529,13 @@ impl Settings {
             .child(Self::heading("Appearance", cx))
             .child(self.render_typography(cx))
             .child(Self::subheading("Theme", cx))
+            .child(
+                div()
+                    .mb_2()
+                    .text_size(TEXT)
+                    .text_color(theme.muted_foreground)
+                    .child(t("For the workspace this window shows; each keeps its own.")),
+            )
             .child(Self::card(grid, cx))
             .into_any_element()
     }
@@ -1356,6 +1367,10 @@ impl Render for Settings {
             .h(px(HEIGHT))
             .max_h(max_height)
             .flex()
+            // Its own text color: the window's root, which hosts dialogs, is
+            // drawn before the window puts its workspace's theme in place, so
+            // what it passes down may be another window's theme.
+            .text_color(theme.foreground)
             // The dialog around it is bare, so this is the only frame.
             .rounded(theme.radius_lg)
             .border(FRAME_BORDER)
@@ -1598,7 +1613,8 @@ impl Settings {
     /// A fresh authorization code as a QR code, in a dialog over Settings,
     /// for a phone to scan.
     fn show_invite_qr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(image) = qr_image(&peer::new_invite()) else {
+        self.scanned_in = None;
+        let Some(image) = qr_image(&peer::new_scan_invite()) else {
             self.device_error = Some(t("The authorization code is too long for a QR code.").into());
             cx.notify();
             return;
@@ -1630,10 +1646,27 @@ impl Settings {
                                 .text_size(TEXT)
                                 .text_color(theme.muted_foreground)
                                 .text_center()
-                                .child(t("Scan it with the device that should connect. It works for 10 minutes and replaces the code copied before.")),
+                                .child(t("Scan it with the device that should connect: it connects right away. The code works once, for 10 minutes, and replaces the code copied before.")),
                         ),
                 )
         });
+        // The phone that scans it is connected without a connection code:
+        // close the dialog and say so.
+        cx.spawn_in(window, async move |this, cx| {
+            while peer::invite_expires_in().is_some() {
+                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                if let Some(name) = peer::take_scanned_in().pop() {
+                    this.update_in(cx, |this, window, cx| {
+                        window.close_dialog(cx);
+                        this.scanned_in = Some(name);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Keep the code's time left fresh in the hint until it runs out.
@@ -1818,6 +1851,18 @@ impl Settings {
         });
         if let Some(error) = error {
             page = page.child(Self::error_banner(error, cx));
+        }
+        if let Some(name) = &self.scanned_in {
+            page = page.child(
+                div()
+                    .my_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(theme.success.opacity(0.1))
+                    .text_size(TEXT)
+                    .text_color(theme.success)
+                    .child(tf("{name} connected by scanning the QR code.", &[("name", name.clone())])),
+            );
         }
         page.child(self.render_this_device(window, cx))
             .child(self.render_other_devices(window, cx))

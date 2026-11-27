@@ -219,6 +219,11 @@ struct State {
     /// The secret of the last authorization code copied, and when it stops
     /// working. Kept in memory only: a restart voids it too.
     offer: Option<(Vec<u8>, Instant)>,
+    /// Whether that code was shown as a QR code: then the first device to
+    /// ask with it is connected at once, and the code is used up.
+    offer_scanned: bool,
+    /// Devices a QR code connected, not yet announced.
+    scanned_in: Vec<String>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
@@ -229,6 +234,8 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         tailscale_name: None,
         direct: HashMap::new(),
         offer: None,
+        offer_scanned: false,
+        scanned_in: Vec::new(),
     })
 });
 
@@ -440,9 +447,29 @@ struct InviteBody {
 /// A fresh authorization code, good for `INVITE_TTL`. It replaces the last
 /// one: only the newest code lets a device ask to connect.
 pub fn new_invite() -> String {
+    offer_invite(false)
+}
+
+/// A fresh authorization code to show as a QR code. Only someone in front of
+/// this screen can read it, so the first device to ask with it is connected
+/// without typing a connection code; it then stops working.
+pub fn new_scan_invite() -> String {
+    offer_invite(true)
+}
+
+fn offer_invite(scanned: bool) -> String {
     let secret: Vec<u8> = uuid::Uuid::new_v4().as_bytes().to_vec();
-    STATE.lock().unwrap().offer = Some((secret.clone(), Instant::now() + INVITE_TTL));
+    {
+        let mut state = STATE.lock().unwrap();
+        state.offer = Some((secret.clone(), Instant::now() + INVITE_TTL));
+        state.offer_scanned = scanned;
+    }
     invite_with(Some(secret))
+}
+
+/// The names of devices a QR code connected since the last call.
+pub fn take_scanned_in() -> Vec<String> {
+    std::mem::take(&mut STATE.lock().unwrap().scanned_in)
 }
 
 /// This device as other devices should know it (name, key, addresses),
@@ -912,16 +939,16 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
     let _ = socket.set_nodelay(true);
     let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mode = socket.read_u8().await?;
-        let (pattern, psk) = match mode {
-            MODE_PAIRED => (PATTERN_PAIRED, None),
+        let (pattern, psk, secret) = match mode {
+            MODE_PAIRED => (PATTERN_PAIRED, None, None),
             // Asking to connect needs the secret of a code still in force.
             MODE_REQUEST => match pair_secret() {
-                Some(secret) => (PATTERN_REQUEST, Some(pairing_psk(&secret))),
+                Some(secret) => (PATTERN_REQUEST, Some(pairing_psk(&secret)), Some(secret)),
                 None => bail!("no authorization code is in force"),
             },
             // The authorization code only goes to the relay's streams: those
             // reach this port from loopback; LAN neighbours do not.
-            MODE_INVITE if from.ip().is_loopback() => (PATTERN_INVITE, None),
+            MODE_INVITE if from.ip().is_loopback() => (PATTERN_INVITE, None, None),
             _ => bail!("unexpected greeting"),
         };
         let private = IDENTITY.private();
@@ -940,11 +967,11 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
         let remote = hs.get_remote_static().map(key_text);
         let n = hs.write_message(&[], &mut buf)?;
         write_frame(&mut socket, &buf[..n]).await?;
-        anyhow::Ok((mode, remote, hs.into_stateless_transport_mode()?))
+        anyhow::Ok((mode, remote, secret, hs.into_stateless_transport_mode()?))
     })
     .await
     .map_err(|_| anyhow!("handshake timed out"))??;
-    let (mode, remote, transport) = accepted;
+    let (mode, remote, secret, transport) = accepted;
     let mut stream = spawn_transport(socket, transport);
     let line = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_line(&mut stream))
         .await
@@ -956,7 +983,13 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
         MODE_REQUEST => {
             let remote = remote.ok_or_else(|| anyhow!("no key"))?;
             let answer = match accept_request(&remote, &request["pair"]) {
-                Ok(()) => json!({ "ok": true }),
+                Ok(()) => {
+                    // A QR code's secret: connected at once, and used up.
+                    if secret.is_some_and(|s| take_scanned_offer(&s)) {
+                        trust_request(&remote);
+                    }
+                    json!({ "ok": true })
+                }
                 Err(err) => json!({ "error": format!("{err:#}") }),
             };
             reply(&mut stream, answer).await
@@ -1441,6 +1474,32 @@ pub fn verify(code: &str) -> Result<String> {
         state.requests.iter().find(|r| pairing_code(&mine, &r.public_key) == code).cloned()
     };
     let request = request.ok_or_else(|| anyhow!(t("that code does not match; check it on the device that is connecting")))?;
+    Ok(trust(request))
+}
+
+/// Whether `secret` is that of the QR code in force; it then stops working,
+/// so one QR code connects one device.
+fn take_scanned_offer(secret: &[u8]) -> bool {
+    let mut state = STATE.lock().unwrap();
+    let scanned = state.offer_scanned && state.offer.as_ref().is_some_and(|(s, _)| s == secret);
+    if scanned {
+        state.offer = None;
+        state.offer_scanned = false;
+    }
+    scanned
+}
+
+/// Connect the device whose request just came in with a QR code's secret.
+fn trust_request(public_key: &str) {
+    let request = STATE.lock().unwrap().requests.iter().find(|r| r.public_key == public_key).cloned();
+    if let Some(request) = request {
+        let name = trust(request);
+        STATE.lock().unwrap().scanned_in.push(name);
+    }
+}
+
+/// Trust a device that asked to connect; its name.
+fn trust(request: Request) -> String {
     let invite = request.invite.clone();
     with_file(|file| {
         let existing = file.peers.iter().find(|p| p.public_key == invite.public_key).cloned();
@@ -1457,7 +1516,7 @@ pub fn verify(code: &str) -> Result<String> {
     });
     STATE.lock().unwrap().requests.retain(|r| r.public_key != request.public_key);
     crate::remote::restart_host();
-    Ok(request.name)
+    request.name
 }
 
 pub fn decline(public_key: &str) {
@@ -1491,6 +1550,20 @@ mod tests {
         assert_ne!(code, pairing_code(&a, &a));
         assert_eq!(fingerprint(&a).len(), 24);
         assert!(peer_id(&a).starts_with("peer:"));
+    }
+
+    #[test]
+    fn a_scanned_code_connects_one_device_only() {
+        let secret = |invite: &str| parse_invite(invite).unwrap().pair_secret.unwrap();
+        // A copied code still needs the connection code.
+        let copied = secret(&new_invite());
+        assert!(!take_scanned_offer(&copied));
+        // A QR code's secret works once, and only while it is the newest.
+        let scanned = secret(&new_scan_invite());
+        assert!(!take_scanned_offer(&copied));
+        assert!(take_scanned_offer(&scanned));
+        assert!(!take_scanned_offer(&scanned));
+        assert!(pair_secret().is_none());
     }
 
     #[test]

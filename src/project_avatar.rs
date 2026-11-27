@@ -11,7 +11,6 @@ use gpui_kit::*;
 use gpui_kit::component::ActiveTheme as _;
 use resvg::{tiny_skia, usvg};
 
-use crate::style::size::TEXT;
 const MAX_LOGO_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIRECTORY_DEPTH: usize = 5;
 const THUMBNAIL_SIZE: u32 = 72;
@@ -109,7 +108,8 @@ fn logo_candidates(project: &Path) -> Vec<(PathBuf, ImageFormat)> {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     let project_name = project_name.to_lowercase().replace('_', "-");
-    let base_name = ["-desktop", "-web", "-app"]
+    // "codeany-mobile" may keep its logo as codeany.png.
+    let base_name = ["-desktop", "-mobile", "-web", "-app", "-ios", "-android", "-cli"]
         .into_iter()
         .find_map(|suffix| project_name.strip_suffix(suffix))
         .unwrap_or(&project_name);
@@ -268,8 +268,10 @@ fn render_initials(name: &str, size: Pixels) -> AnyElement {
         .flex()
         .items_center()
         .justify_center()
-        .text_size(TEXT)
-        .font_weight(FontWeight::BOLD)
+        // Small enough to leave room around two letters.
+        .text_size(size * 0.42)
+        .line_height(size)
+        .font_weight(FontWeight::SEMIBOLD)
         .text_color(fg)
         .child(initials)
         .into_any_element()

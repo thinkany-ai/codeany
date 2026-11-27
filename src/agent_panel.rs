@@ -7,14 +7,13 @@ use std::{
     path::PathBuf,
 };
 
-use agl::protocol::{AgentEvent, AgentInfo};
-use futures::StreamExt as _;
+use agl::protocol::AgentInfo;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{InputEvent, Textarea, TextareaState},
-    menu::{ContextMenuExt as _, DropdownMenu as _},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu},
     popover::Popover,
     Disableable as _,
     shimmer::ShimmerText,
@@ -23,11 +22,14 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use std::{cell::{Ref, RefCell, RefMut}, rc::Rc};
+
+use crate::hub::{Hub, HubEvent, PromptState, Shared};
+
 use crate::{
     agent_icons::{agent_color, agent_icon},
-    agl_bridge::{self, SessionOptions},
+    agl_bridge,
     chat_tabs::TabSet,
-    git,
     i18n::{t, tf},
     model_picker::{ModelPicker, ModelPickerEvent, model_display_name},
     project_avatar::{ProjectAvatar, avatar_size},
@@ -36,8 +38,8 @@ use crate::{
     remote,
     remote_folders::{RemoteFolders, RemoteFoldersEvent},
     threads::{
-        ACCESS_LEVELS, ChatItem, Store, Thread, ToolStatus, access_name, agent_name,
-        UserMessage, clock_time, delete_thread_files, display_title, is_image_path, relative_time,
+        ACCESS_LEVELS, ChatItem, Thread, ToolStatus, access_name, agent_name,
+        UserMessage, clock_time, display_title, is_image_path,
         Worktree, save_pasted_image,
     },
 };
@@ -53,8 +55,6 @@ enum SidebarSection {
     Archived,
 }
 
-/// How often the account's other machines are looked up while signed in.
-const HOSTS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Threads listed per project before "Show more".
 const THREADS_PER_PROJECT: usize = 8;
 
@@ -94,49 +94,22 @@ pub enum AgentPanelEvent {
     OpenSettings,
 }
 
-/// A thread's live agl session, for its current agent.
-struct Session {
-    id: String,
-    agent: String,
-    /// The nex device the session runs on; `None` is this machine.
-    machine: Option<String>,
-    features: Vec<String>,
-    _events: Task<()>,
-}
-
-enum PromptState {
-    Waiting,
-    Sending,
-    Accepted { queued: bool },
-    Failed(String),
-}
-
-struct PendingPrompt {
-    turn_id: String,
-    message: UserMessage,
-    state: PromptState,
-}
-
-impl PendingPrompt {
-    fn is_submitted(&self) -> bool {
-        matches!(self.state, PromptState::Sending | PromptState::Accepted { .. })
-    }
-}
-
 pub struct AgentPanel {
-    store: Store,
+    /// What every window shares (`crate::hub`), and the same state to read
+    /// without going through the app context.
+    hub: Entity<Hub>,
+    shared: Rc<RefCell<Shared>>,
+    /// The workspace this window shows.
+    workspace: Option<String>,
+    entity_id: EntityId,
     project: Option<PathBuf>,
     active: Option<u64>,
     /// The agents of `agents_machine`: the open thread's machine, or the
     /// next new thread's.
     agents: Option<Result<Vec<AgentInfo>, String>>,
     agents_machine: Option<String>,
-    /// Detected agents, by machine.
-    agents_cache: HashMap<Option<String>, Result<Vec<AgentInfo>, String>>,
     /// The machine the next new thread runs on; `None` is this one.
     machine: Option<String>,
-    /// The account's other machines that share their agents.
-    hosts: Vec<remote::Device>,
     folders: Entity<RemoteFolders>,
     folders_open: bool,
     /// The workspace menu at the top of the sidebar, and whether it is open.
@@ -169,15 +142,6 @@ pub struct AgentPanel {
     expanded_projects: HashSet<PathBuf>,
     /// Projects showing all their threads, not only the latest few.
     long_projects: HashSet<Option<PathBuf>>,
-    sessions: HashMap<u64, Session>,
-    running: HashSet<u64>,
-    /// Only the first pending prompt can be submitted to agl. The others
-    /// wait here so they can be removed or explicitly steered.
-    pending_prompts: HashMap<u64, VecDeque<PendingPrompt>>,
-    /// Threads that finished a turn while not shown, until opened.
-    unread: HashSet<u64>,
-    /// A transient note on the "Working…" line: retries, stalls.
-    notes: HashMap<u64, String>,
     expanded: HashSet<(u64, usize)>,
     /// Tool groups the user opened (true) or closed (false), by first item.
     groups: HashMap<(u64, usize), bool>,
@@ -208,7 +172,9 @@ pub struct AgentPanel {
 impl EventEmitter<AgentPanelEvent> for AgentPanel {}
 
 impl AgentPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// A window's panel, on `workspace`; else on the one used last, or one
+    /// no other window shows.
+    pub fn new(workspace: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 12)
@@ -219,7 +185,7 @@ impl AgentPanel {
         let folders = cx.new(|_| RemoteFolders::new());
         let project_filter = cx.new(|cx| ProjectFilter::new(window, cx));
         let workspace_menu = cx.new(|cx| WorkspaceMenu::new(window, cx));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(&workspace_menu, window, Self::on_workspace_menu),
             cx.subscribe(&project_filter, |this, _, event: &ProjectFilterEvent, cx| {
                 match event {
@@ -250,8 +216,8 @@ impl AgentPanel {
             cx.subscribe(&folders, |this, _, event: &RemoteFoldersEvent, cx| match event {
                 RemoteFoldersEvent::Pick(dir) => {
                     if let Some(machine) = this.machine.clone() {
-                        this.store.remote_dirs.insert(machine, dir.clone());
-                        this.store.save();
+                        this.sm().store.remote_dirs.insert(machine, dir.clone());
+                        this.s().store.save();
                     }
                     this.folders_open = false;
                     cx.notify();
@@ -269,45 +235,23 @@ impl AgentPanel {
             this.detect_agents(machine, cx);
         });
 
-        // The account's other machines come online and go.
-        cx.spawn(async move |this, cx| {
-            loop {
-                // The account's devices and the paired ones.
-                let hosts = remote::devices().await.ok();
-                let alive = this.update(cx, |this, cx| {
-                    if let Some(hosts) = hosts {
-                        this.set_hosts(hosts, cx);
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-                cx.background_executor().timer(HOSTS_INTERVAL).await;
+        let hub = crate::hub::hub(cx);
+        let shared = hub.read(cx).shared();
+        subscriptions.push(cx.subscribe_in(&hub, window, Self::on_hub_event));
+        subscriptions.push(cx.observe(&hub, |_, _, cx| cx.notify()));
+        let window_handle = window.window_handle();
+        cx.on_release({
+            let shared = shared.clone();
+            move |this, _| {
+                let mut s = shared.borrow_mut();
+                s.views.remove(&this.entity_id);
+                s.save_windows();
             }
         })
         .detach();
-
-        let mut store = Store::load();
-        // Everything from before workspaces lands in one.
-        store.ensure_workspaces(&remote::this_name());
-        store.machine = store.active_workspace().and_then(|w| w.device.clone());
-        // Threads written here by other devices, and theirs to mirror.
-        let mut inbox = crate::sync::start(&store.threads);
-        cx.spawn(async move |this, cx| {
-            while let Some(incoming) = inbox.next().await {
-                if this.update(cx, |this, cx| this.apply_incoming(incoming, cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-        // Tabs of threads deleted or settled since are gone.
-        let live: HashSet<u64> = store.threads.iter().filter(|t| !t.settled).map(|t| t.id).collect();
-        for set in &mut store.tabs {
-            set.retain_threads(|id| live.contains(&id));
-        }
-        // And tabs that strayed into another workspace's row go too.
-        store.drop_foreign_tabs();
+        shared.borrow_mut().prune(cx);
+        let borrowed = shared.borrow();
+        let store = &borrowed.store;
         crate::style::set_typography(store.typography.clone(), cx);
         if let Some(theme) = store.theme.clone() {
             crate::style::set_choice(theme, window, cx);
@@ -330,11 +274,30 @@ impl AgentPanel {
                     .ok();
             });
         }
+        let workspace = {
+            let free = |id: &String| !borrowed.views.values().any(|v| v.workspace.as_ref() == Some(id));
+            workspace
+                .filter(|id| store.workspaces.iter().any(|w| &w.id == id))
+                .or_else(|| store.active_workspace.clone().filter(free))
+                .or_else(|| store.workspaces.iter().map(|w| w.id.clone()).find(free))
+                .or_else(|| store.active_workspace.clone())
+        };
+        let machine = store.workspaces.iter().find(|w| Some(&w.id) == workspace.as_ref()).and_then(|w| w.device.clone());
+        let (agent, model, effort, access) = (store.agent.clone(), store.model.clone(), store.effort.clone(), store.access.clone());
+        drop(borrowed);
+        let entity_id = cx.entity_id();
+        {
+            let mut s = shared.borrow_mut();
+            s.views.insert(entity_id, crate::hub::View::new(window_handle, cx.weak_entity(), workspace.clone()));
+            s.save_windows();
+        }
         Self {
-            machine: store.machine.clone(),
-            agents_machine: store.machine.clone(),
-            agents_cache: HashMap::new(),
-            hosts: Vec::new(),
+            hub,
+            shared,
+            workspace,
+            entity_id,
+            machine: machine.clone(),
+            agents_machine: machine,
             folders,
             folders_open: false,
             workspace_menu,
@@ -342,15 +305,14 @@ impl AgentPanel {
             project_filter,
             project_filter_open: false,
             shown_project: None,
-            agent: store.agent.clone(),
-            model: store.model.clone(),
-            effort: store.effort.clone(),
-            access: store.access.clone(),
+            agent,
+            model,
+            effort,
+            access,
             use_worktree: false,
             picker,
             picker_open: false,
             closed_tabs: Vec::new(),
-            unread: HashSet::new(),
             projects_expanded: true,
             recent_expanded: true,
             archived_expanded: false,
@@ -360,14 +322,9 @@ impl AgentPanel {
             all_projects: false,
             expanded_projects: HashSet::new(),
             long_projects: HashSet::new(),
-            store,
             project: None,
             active: None,
             agents: None,
-            sessions: HashMap::new(),
-            running: HashSet::new(),
-            pending_prompts: HashMap::new(),
-            notes: HashMap::new(),
             expanded: HashSet::new(),
             groups: HashMap::new(),
             worked: HashSet::new(),
@@ -390,19 +347,19 @@ impl AgentPanel {
             if self.project.is_none() && self.expanded_projects.is_empty() {
                 self.expanded_projects.insert(project.clone());
             }
-            self.store.projects.retain(|p| p != project);
-            self.store.projects.insert(0, project.clone());
+            self.sm().store.projects.retain(|p| p != project);
+            self.sm().store.projects.insert(0, project.clone());
             // A folder opened here joins the workspace shown, when it is this device's.
-            let active = self.store.active_workspace.clone();
-            if let Some(ws) = self.store.workspaces.iter_mut().find(|w| Some(&w.id) == active.as_ref() && w.device.is_none()) {
+            let active = self.workspace.clone();
+            if let Some(ws) = self.sm().store.workspaces.iter_mut().find(|w| Some(&w.id) == active.as_ref() && w.device.is_none()) {
                 if !ws.projects.contains(project) {
                     ws.projects.insert(0, project.clone());
                 }
             }
         }
-        if self.store.last_project != project || project.is_some() {
-            self.store.last_project = project.clone();
-            self.store.save();
+        if self.s().store.last_project != project || project.is_some() {
+            self.sm().store.last_project = project.clone();
+            self.s().store.save();
         }
         if self.project == project {
             return;
@@ -410,7 +367,8 @@ impl AgentPanel {
         self.project = project;
         self.branch = None;
         // Each project has its own tabs; show the one last active there.
-        self.active = self.tab_set_mut().current();
+        let current = self.tab_set_mut().current();
+        self.active = current;
         self.sync_machine(cx);
         cx.notify();
     }
@@ -431,29 +389,45 @@ impl AgentPanel {
     // ---- Tabs ---------------------------------------------------------------
 
     /// The open project's tabs in the workspace shown, if any yet.
-    fn tab_set(&self) -> Option<&TabSet> {
-        let workspace = &self.store.active_workspace;
-        self.store.tabs.iter().find(|s| s.project == self.project && &s.workspace == workspace)
+    fn tab_set(&self) -> Option<Ref<'_, TabSet>> {
+        let workspace = &self.workspace;
+        let project = &self.project;
+        Ref::filter_map(self.s(), |s| s.store.tabs.iter().find(|t| &t.project == project && &t.workspace == workspace)).ok()
     }
 
     /// The open project's tabs in the workspace shown, created on first use.
-    fn tab_set_mut(&mut self) -> &mut TabSet {
-        let workspace = self.store.active_workspace.clone();
-        let ix = match self.store.tabs.iter().position(|s| s.project == self.project && s.workspace == workspace) {
-            Some(ix) => ix,
-            None => match self.store.tabs.iter().position(|s| s.project == self.project && s.workspace.is_none()) {
-                // Tabs from before workspaces join the first one to open them.
-                Some(ix) => {
-                    self.store.tabs[ix].workspace = workspace;
-                    ix
-                }
-                None => {
-                    self.store.tabs.push(TabSet::new(self.project.clone(), workspace));
-                    self.store.tabs.len() - 1
-                }
-            },
-        };
-        &mut self.store.tabs[ix]
+    fn tab_set_mut(&mut self) -> RefMut<'_, TabSet> {
+        let workspace = self.workspace.clone();
+        let project = self.project.clone();
+        RefMut::map(self.sm(), |s| {
+            let tabs = &mut s.store.tabs;
+            let ix = match tabs.iter().position(|t| t.project == project && t.workspace == workspace) {
+                Some(ix) => ix,
+                None => match tabs.iter().position(|t| t.project == project && t.workspace.is_none()) {
+                    // Tabs from before workspaces join the first one to open them.
+                    Some(ix) => {
+                        tabs[ix].workspace = workspace;
+                        ix
+                    }
+                    None => {
+                        tabs.push(TabSet::new(project, workspace));
+                        tabs.len() - 1
+                    }
+                },
+            };
+            &mut tabs[ix]
+        })
+    }
+
+    /// Tell the other windows what this one shows.
+    fn report(&self) {
+        let mut s = self.sm();
+        let Some(view) = s.views.get_mut(&self.entity_id) else { return };
+        view.active = self.active;
+        if view.workspace != self.workspace {
+            view.workspace = self.workspace.clone();
+            s.save_windows();
+        }
     }
 
     /// Whether any tab shows a thread; a lone new tab cannot be closed.
@@ -467,15 +441,16 @@ impl AgentPanel {
             Some(set) => (set.tabs.clone(), set.active),
             None => (vec![self.active], 0),
         };
+        let s = self.s();
         let items = tabs
             .into_iter()
             .map(|id| {
-                let thread = id.and_then(|id| self.store.threads.iter().find(|t| t.id == id));
+                let thread = id.and_then(|id| s.thread(id));
                 ChatTab {
                     id,
                     title: thread.map(|t| display_title(&t.title)).unwrap_or_else(|| t("New thread").into()),
                     agent: thread.map(|t| t.agent.clone()),
-                    running: id.is_some_and(|id| self.is_busy(id)),
+                    running: id.is_some_and(|id| s.is_busy(id)),
                 }
             })
             .collect();
@@ -488,10 +463,10 @@ impl AgentPanel {
         if title.is_empty() {
             return;
         }
-        if let Some(thread) = self.thread_mut(id) {
+        if let Some(mut thread) = self.thread_mut(id) {
             thread.title = title;
         }
-        self.store.save();
+        self.s().store.save();
         cx.notify();
     }
 
@@ -511,7 +486,8 @@ impl AgentPanel {
 
     /// Show what the active tab holds.
     fn show_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.tab_set_mut().current() {
+        let current = self.tab_set_mut().current();
+        match current {
             Some(id) => self.select_thread(id, window, cx),
             None => {
                 self.active = None;
@@ -519,7 +495,7 @@ impl AgentPanel {
                 self.focus_composer(window, cx);
             }
         }
-        self.store.save();
+        self.s().store.save();
         cx.notify();
     }
 
@@ -530,9 +506,12 @@ impl AgentPanel {
 
     /// Close tab `ix`, or the active one. The thread stays in the sidebar.
     pub fn close_tab(&mut self, ix: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
-        let set = self.tab_set_mut();
-        let ix = ix.unwrap_or(set.active);
-        if let Some(id) = set.close(ix) {
+        let closed = {
+            let mut set = self.tab_set_mut();
+            let ix = ix.unwrap_or(set.active);
+            set.close(ix)
+        };
+        if let Some(id) = closed {
             self.closed_tabs.push(id);
         }
         self.show_active_tab(window, cx);
@@ -541,7 +520,7 @@ impl AgentPanel {
     /// Reopen the tab closed last whose thread still exists.
     pub fn reopen_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         while let Some(id) = self.closed_tabs.pop() {
-            if self.store.threads.iter().any(|t| t.id == id) {
+            if self.s().store.threads.iter().any(|t| t.id == id) {
                 self.tab_set_mut().open(id);
                 self.show_active_tab(window, cx);
                 return;
@@ -555,9 +534,11 @@ impl AgentPanel {
     }
 
     pub fn select_last_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let set = self.tab_set_mut();
-        let last = set.tabs.len().saturating_sub(1);
-        set.select(last);
+        {
+            let mut set = self.tab_set_mut();
+            let last = set.tabs.len().saturating_sub(1);
+            set.select(last);
+        }
         self.show_active_tab(window, cx);
     }
 
@@ -569,49 +550,52 @@ impl AgentPanel {
     /// Open `id` in a tab of its own (⌘-click, middle-click), or switch to
     /// the tab already showing it.
     fn open_in_new_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.store.threads.iter().find(|t| t.id == id) else {
+        let s = self.s();
+        let Some(thread) = s.thread(id) else {
             return;
         };
         // Another project's or workspace's thread gets its tab when
         // `select_thread` moves there.
-        let elsewhere = self.store.workspace_of(thread).map(|w| &w.id) != self.store.active_workspace.as_ref();
-        if !elsewhere && (thread.machine.is_some() || thread.project == self.project) {
+        let elsewhere = s.store.workspace_of(thread).map(|w| &w.id) != self.workspace.as_ref();
+        let here = !elsewhere && (thread.machine.is_some() || thread.project == self.project);
+        drop(s);
+        if here {
             self.tab_set_mut().open(id);
         }
         self.select_thread(id, window, cx);
-        self.store.save();
+        self.s().store.save();
     }
 
     /// Whether a tab of its project shows `id`.
     fn is_open_in_tab(&self, thread: &Thread) -> bool {
         let project = if thread.machine.is_some() { &self.project } else { &thread.project };
-        let workspace = self.store.workspace_of(thread).map(|w| w.id.clone());
-        self.store
+        let s = self.s();
+        let workspace = s.store.workspace_of(thread).map(|w| w.id.clone());
+        s.store
             .tabs
             .iter()
             .find(|s| &s.project == project && s.workspace == workspace)
             .is_some_and(|s| s.tabs.contains(&Some(thread.id)))
     }
 
-    /// Close the tabs showing `id`, in every project, and show whatever
-    /// takes the active tab's place.
-    fn drop_thread_tabs(&mut self, id: u64, cx: &mut Context<Self>) {
-        for set in &mut self.store.tabs {
-            set.retain_threads(|t| t != id);
-        }
-        if self.active == Some(id) {
-            self.active = self.tab_set_mut().current();
-            self.sync_machine(cx);
-        }
-    }
 
-    fn active_thread(&self) -> Option<&Thread> {
+    fn active_thread(&self) -> Option<Ref<'_, Thread>> {
         let id = self.active?;
-        self.store.threads.iter().find(|t| t.id == id)
+        Ref::filter_map(self.s(), |s| s.thread(id)).ok()
     }
 
-    fn thread_mut(&mut self, id: u64) -> Option<&mut Thread> {
-        self.store.threads.iter_mut().find(|t| t.id == id)
+    /// The shared state, to read; never held across a change to it.
+    fn s(&self) -> Ref<'_, Shared> {
+        self.shared.borrow()
+    }
+
+    /// The shared state, to change.
+    fn sm(&self) -> RefMut<'_, Shared> {
+        self.shared.borrow_mut()
+    }
+
+    fn thread_mut(&mut self, id: u64) -> Option<RefMut<'_, Thread>> {
+        RefMut::filter_map(self.sm(), |s| s.thread_mut(id)).ok()
     }
 
     fn agent_display_name(&self, id: &str) -> String {
@@ -626,24 +610,51 @@ impl AgentPanel {
     }
 
     /// Every thread, for the search palette.
-    pub fn threads(&self) -> &[Thread] {
-        &self.store.threads
+    pub fn threads(&self) -> Ref<'_, [Thread]> {
+        Ref::map(self.s(), |s| s.store.threads.as_slice())
     }
 
     /// Projects opened, most recent first.
-    pub fn recent_projects(&self) -> &[PathBuf] {
-        &self.store.projects
+    pub fn recent_projects(&self) -> Ref<'_, [PathBuf]> {
+        Ref::map(self.s(), |s| s.store.projects.as_slice())
     }
 
-    /// The project open when CodeAny last ran, if its folder still exists.
-    pub fn last_project(&self) -> Option<PathBuf> {
-        self.store.last_project.clone().filter(|p| p.is_dir())
+    /// The folder a window opens on when it is given none: the last one
+    /// opened, if this window's workspace is this device's and has it (or
+    /// has no folders yet); else that workspace's first folder still here.
+    /// None for a workspace on another device: its folders are there.
+    pub fn default_root(&self) -> Option<PathBuf> {
+        let s = self.s();
+        let ws = s.store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref());
+        let last = s.store.last_project.clone().filter(|p| p.is_dir());
+        match ws {
+            Some(ws) if ws.device.is_some() => None,
+            Some(ws) if !ws.projects.is_empty() && !last.as_ref().is_some_and(|p| ws.projects.contains(p)) => {
+                ws.projects.iter().find(|p| p.is_dir()).cloned().or(last)
+            }
+            _ => last,
+        }
     }
 
     pub fn select_thread(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.store.threads.iter().find(|t| t.id == id) else {
-            return;
+        let (project, remote, machine, home) = {
+            let s = self.s();
+            let Some(thread) = s.thread(id) else {
+                return;
+            };
+            (
+                thread.project.clone(),
+                thread.machine.is_some(),
+                thread.machine.clone(),
+                s.store.workspace_of(thread).map(|w| w.id.clone()),
+            )
         };
+        // Another window shows the thread's workspace: it opens it there.
+        if let Some(home) = home.as_deref().filter(|home| Some(*home) != self.workspace.as_deref()) {
+            if self.hand_off(home, move |panel, window, cx| panel.select_thread(id, window, cx), cx) {
+                return;
+            }
+        }
         if self.navigation_history.get(self.navigation_index) != Some(&id) {
             if !self.navigation_history.is_empty() {
                 self.navigation_history.truncate(self.navigation_index + 1);
@@ -651,20 +662,16 @@ impl AgentPanel {
             self.navigation_history.push(id);
             self.navigation_index = self.navigation_history.len() - 1;
         }
-        let project = thread.project.clone();
-        let remote = thread.machine.is_some();
         // The sidebar shows the workspace the thread is in.
-        let home = self.store.workspace_of(thread).map(|w| w.id.clone());
-        let switched = home.is_some() && home != self.store.active_workspace;
+        let switched = home.is_some() && home != self.workspace;
         if switched {
-            self.store.active_workspace = home;
+            self.workspace = home;
             self.shown_project = None;
-            self.machine = thread.machine.clone();
-            self.store.machine = self.machine.clone();
-            self.store.save();
+            self.machine = machine;
+            self.remember_workspace();
         }
         self.active = Some(id);
-        self.unread.remove(&id);
+        self.sm().unread.remove(&id);
         // A folder on another machine is not one to open here.
         if !remote && project != self.project {
             cx.emit(AgentPanelEvent::SwitchProject(project.clone()));
@@ -678,10 +685,42 @@ impl AgentPanel {
             // Like following a link: the active tab shows it.
             self.tab_set_mut().navigate(id);
         }
+        self.report();
         self.sync_machine(cx);
         self.pin_to_bottom(cx);
         self.focus_composer(window, cx);
         cx.notify();
+    }
+
+    /// Do `f` in the window that shows workspace `id`, if another one does,
+    /// bringing it to the front; `false` when none does.
+    fn hand_off(
+        &self,
+        workspace: &str,
+        f: impl FnOnce(&mut AgentPanel, &mut Window, &mut Context<AgentPanel>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.sm().prune(cx);
+        let Some(view) = self.s().view_of(workspace, self.entity_id) else {
+            return false;
+        };
+        cx.defer(move |cx| {
+            view.window
+                .update(cx, |_, window, cx| {
+                    window.activate_window();
+                    view.panel.update(cx, |panel, cx| f(panel, window, cx)).ok();
+                })
+                .ok();
+        });
+        true
+    }
+
+    /// New windows open on the workspace and device used last.
+    fn remember_workspace(&mut self) {
+        let mut s = self.sm();
+        s.store.active_workspace = self.workspace.clone();
+        s.store.machine = self.machine.clone();
+        s.store.save();
     }
 
     pub fn can_navigate(&self, forward: bool) -> bool {
@@ -726,8 +765,8 @@ impl AgentPanel {
 
     /// Delete after asking: unlike archiving, it cannot be undone.
     fn confirm_delete(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.store.threads.iter().find(|t| t.id == id) else { return };
-        let message = tf("Delete “{title}”?", &[("title", thread.title.clone())]);
+        let Some(title) = self.s().thread(id).map(|t| t.title.clone()) else { return };
+        let message = tf("Delete “{title}”?", &[("title", title)]);
         let answer = window.prompt(
             PromptLevel::Warning,
             &message,
@@ -745,136 +784,14 @@ impl AgentPanel {
 
     /// Drop a thread; `propagate` also deletes it on the device it runs on.
     fn remove_thread(&mut self, id: u64, propagate: bool, cx: &mut Context<Self>) {
-        if let Some(session) = self.sessions.remove(&id) {
-            agl_bridge::backend(session.machine.as_deref()).close(session.id);
-        }
-        self.running.remove(&id);
-        if let Some(prompts) = self.pending_prompts.remove(&id) {
-            for prompt in prompts {
-                Self::delete_pasted_images(&prompt.message.images);
-            }
-        }
-        if let Some(thread) = self.store.threads.iter().find(|t| t.id == id) {
-            if let Some(machine) = thread.machine.as_deref().filter(|_| propagate) {
-                crate::sync::deleted(machine, id);
-            }
-            delete_thread_files(thread);
-            // Another machine's worktree is that machine's to remove.
-            if let Some(worktree) = thread.worktree.clone().filter(|_| thread.machine.is_none()) {
-                cx.background_executor()
-                    .spawn(async move {
-                        if let Err(err) = git::remove_worktree(&worktree.repo, &worktree.path, &worktree.branch) {
-                            eprintln!("codeany: kept worktree {} ({}): {err}", worktree.path.display(), worktree.branch);
-                        }
-                    })
-                    .detach();
-            }
-        }
-        self.store.threads.retain(|t| t.id != id);
-        let current = self.navigation_history.get(self.navigation_index).copied();
-        self.navigation_history.retain(|visited| *visited != id);
-        self.navigation_index = current.and_then(|current| self.navigation_history.iter().position(|visited| *visited == current))
-            .unwrap_or_else(|| self.navigation_history.len().saturating_sub(1));
-        self.drop_thread_tabs(id, cx);
-        self.store.save();
-        cx.notify();
+        self.hub.update(cx, |hub, cx| hub.remove_thread(id, propagate, cx));
     }
 
-    /// The thread's live agl session for its current agent, if open.
-    fn live_agl_session(&self, id: u64) -> Option<&Session> {
-        let thread = self.store.threads.iter().find(|t| t.id == id)?;
-        self.sessions
-            .get(&id)
-            .filter(|s| s.agent == thread.agent && s.machine == thread.machine)
-    }
 
-    /// Open the thread's agl session and subscribe to it; the session id.
-    fn open_session(&mut self, id: u64, cx: &mut Context<Self>) -> Task<Result<String, String>> {
-        let Some(thread) = self.store.threads.iter().find(|t| t.id == id) else {
-            return Task::ready(Err("thread is gone".into()));
-        };
-        let machine = thread.machine.clone();
-        let agent = thread.agent.clone();
-        let name = thread.session_name();
-        // Another device's thread with no project works in a folder of its own
-        // there, as one here does; a device too old to make one uses its home.
-        let remote_dir = (thread.machine.is_some() && thread.project.is_none()).then(|| {
-            let backend = agl_bridge::backend_for(thread.machine.as_deref(), "codeany");
-            async move { backend.call("threads.dir", serde_json::json!({ "id": id })).await }
-        });
-        let mut opts = SessionOptions {
-            agent: thread.agent.clone(),
-            cwd: thread.cwd(),
-            model: thread.model.clone(),
-            effort: thread.effort.clone(),
-            access: thread.access.clone(),
-            resume: thread.native_ids.get(&thread.agent).cloned(),
-            // Only this machine's agents take the arguments set here.
-            extra_args: if thread.machine.is_none() {
-                self.store.agent_args.get(&thread.agent).cloned().unwrap_or_default()
-            } else {
-                Vec::new()
-            },
-        };
-        // A worktree is checked out on first use, and again if its folder went away.
-        let checkout = thread.worktree.clone().filter(|w| thread.machine.is_none() && !w.path.exists());
-        cx.spawn(async move |this, cx| {
-            if let Some(worktree) = checkout {
-                cx.background_executor()
-                    .spawn(async move { git::add_worktree(&worktree.repo, &worktree.path, &worktree.branch) })
-                    .await
-                    .map_err(|err| format!("Cannot create the worktree: {err}"))?;
-                // The workspace shows the worktree now that it exists.
-                this.update(cx, |_, cx| cx.notify()).ok();
-            }
-            if let Some(dir) = remote_dir {
-                if let Ok(reply) = dir.await {
-                    opts.cwd = reply["path"].as_str().map(PathBuf::from);
-                }
-            }
-            let meta = agl_bridge::backend(machine.as_deref())
-                .open_session(name, opts)
-                .await
-                .map_err(|err| format!("{err:#}"))?;
-            this.update(cx, |this, cx| {
-                if !this.store.threads.iter().any(|thread| thread.id == id) {
-                    agl_bridge::backend(machine.as_deref()).close(meta.id);
-                    return Err("thread is gone".into());
-                }
-                let mut events = agl_bridge::backend(machine.as_deref()).subscribe(meta.id.clone());
-                let task = cx.spawn(async move |this, cx| {
-                    while let Some(event) = events.next().await {
-                        if this
-                            .update(cx, |this, cx| this.apply_event(id, event, cx))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
-                this.sessions.insert(
-                    id,
-                    Session {
-                        id: meta.id.clone(),
-                        agent,
-                        machine,
-                        features: meta.features,
-                        _events: task,
-                    },
-                );
-                Ok(meta.id)
-            })
-            .map_err(|_| "the window closed".to_string())?
-        })
-    }
 
     /// Take the images in a paste; `true` when there were any, so the
     /// textarea leaves the rest of the paste alone.
     fn paste(&mut self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
-        // The agent on another machine cannot open files from this one.
-        if self.context_machine().is_some() {
-            return false;
-        }
         let mut pasted = false;
         for entry in item.entries() {
             match entry {
@@ -910,7 +827,7 @@ impl AgentPanel {
         }
     }
 
-    /// Pick image files to attach.
+    /// Pick files to attach: images show as pictures, other files by name.
     fn attach_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -921,7 +838,7 @@ impl AgentPanel {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else { return };
             this.update(cx, |this, cx| {
-                for path in paths.into_iter().filter(|p| is_image_path(p)) {
+                for path in paths {
                     if !this.attachments.contains(&path) {
                         this.attachments.push(path);
                     }
@@ -936,19 +853,11 @@ impl AgentPanel {
     fn remove_attachment(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.attachments.len() {
             let path = self.attachments.remove(ix);
-            Self::delete_pasted_images(&[path]);
+            crate::hub::delete_pasted_images(&[path]);
             cx.notify();
         }
     }
 
-    fn delete_pasted_images(images: &[PathBuf]) {
-        let dir = crate::paths::images();
-        for path in images {
-            if path.starts_with(&dir) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_string();
@@ -965,7 +874,7 @@ impl AgentPanel {
                 let mut thread = match self.machine.clone() {
                     Some(machine) => {
                         let mut thread = Thread::new(
-                            self.store.remote_dirs.get(&machine).cloned(),
+                            self.s().store.remote_dirs.get(&machine).cloned(),
                             agent,
                             self.access.clone(),
                         );
@@ -975,7 +884,7 @@ impl AgentPanel {
                     }
                     None => Thread::new(self.project.clone(), agent, self.access.clone()),
                 };
-                thread.workspace = self.store.active_workspace.clone();
+                thread.workspace = self.workspace.clone();
                 thread.model = self.model.clone();
                 thread.effort = self.effort.clone();
                 thread.title = if text.is_empty() {
@@ -990,140 +899,51 @@ impl AgentPanel {
                         .and_then(|project| Worktree::plan(project, thread.id, &thread.title));
                 }
                 let id = thread.id;
-                self.store.threads.insert(0, thread);
+                self.sm().store.threads.insert(0, thread);
                 self.active = Some(id);
                 self.tab_set_mut().navigate(id);
                 id
             }
         };
 
-        self.pending_prompts.entry(id).or_default().push_back(PendingPrompt {
-            turn_id: uuid::Uuid::new_v4().to_string(),
-            message: UserMessage {
-                text,
-                images: std::mem::take(&mut self.attachments),
-            },
-            state: PromptState::Waiting,
-        });
-        self.dispatch_prompt(id, false, cx);
+        let message = UserMessage { text, images: std::mem::take(&mut self.attachments) };
+        self.hub.update(cx, |hub, cx| hub.enqueue(id, message, cx));
         self.composer
             .update(cx, |composer, cx| composer.set_value("", window, cx));
         self.follow = true;
         self.chat_list.set_follow_mode(FollowMode::Tail);
-        self.store.save();
         cx.notify();
     }
 
     fn can_steer(&self, id: u64) -> bool {
-        self.running.contains(&id)
-            && self.live_agl_session(id).is_some_and(|s| s.features.iter().any(|f| f == "steer"))
+        self.s().can_steer(id)
     }
 
     fn is_busy(&self, id: u64) -> bool {
-        self.running.contains(&id)
-            || self.pending_prompts.get(&id).and_then(VecDeque::front).is_some_and(PendingPrompt::is_submitted)
+        self.s().is_busy(id)
     }
 
     fn dispatch_prompt(&mut self, id: u64, steer: bool, cx: &mut Context<Self>) {
-        let running = self.running.contains(&id);
-        if running && !(steer && self.can_steer(id)) {
-            return;
-        }
-        let Some(pending) = self.pending_prompts.get_mut(&id).and_then(VecDeque::front_mut) else {
-            return;
-        };
-        if !matches!(pending.state, PromptState::Waiting) {
-            return;
-        }
-        let Some(thread) = self.store.threads.iter().find(|thread| thread.id == id) else {
-            return;
-        };
-        let turn_id = pending.turn_id.clone();
-        let context = if running {
-            String::new()
-        } else {
-            thread.handoff_context().unwrap_or_default()
-        };
-        let prompt = context + &pending.message.prompt();
-        let machine = thread.machine.clone();
-        pending.state = PromptState::Sending;
-        let session = self.live_agl_session(id).map(|s| s.id.clone());
-        let open = session.map_or_else(|| self.open_session(id, cx), |session| Task::ready(Ok(session)));
-        let mode = if running { "steer" } else { "queue" };
-        cx.spawn(async move |this, cx| {
-            let result = match open.await {
-                Ok(session_id) => agl_bridge::backend(machine.as_deref())
-                    .prompt(&session_id, &turn_id, prompt, mode)
-                    .await
-                    .map_err(|err| format!("{err:#}")),
-                Err(err) => Err(err),
-            };
-            if let Err(err) = result {
-                this.update(cx, |this, cx| {
-                    if let Some(pending) = this.pending_prompt_mut(id, &turn_id)
-                        && matches!(pending.state, PromptState::Sending)
-                    {
-                        pending.state = PromptState::Failed(err);
-                        cx.notify();
-                    }
-                })
-                .ok();
-            }
-        })
-        .detach();
-        cx.notify();
+        self.hub.update(cx, |hub, cx| hub.dispatch_prompt(id, steer, cx));
     }
 
-    fn pending_prompt_mut(&mut self, id: u64, turn_id: &str) -> Option<&mut PendingPrompt> {
-        self.pending_prompts.get_mut(&id)?.front_mut().filter(|p| p.turn_id == turn_id)
-    }
 
-    fn take_pending_prompt(&mut self, id: u64, turn_id: &str) -> Option<PendingPrompt> {
-        let prompts = self.pending_prompts.get_mut(&id)?;
-        prompts.front().filter(|prompt| prompt.turn_id == turn_id)?;
-        let pending = prompts.pop_front();
-        if prompts.is_empty() {
-            self.pending_prompts.remove(&id);
-        }
-        pending
-    }
 
     fn remove_pending_prompt(&mut self, id: u64, turn_id: &str, cx: &mut Context<Self>) {
-        let Some(prompts) = self.pending_prompts.get_mut(&id) else { return };
-        let Some(index) = prompts.iter().position(|p| p.turn_id == turn_id && !p.is_submitted()) else { return };
-        if let Some(prompt) = prompts.remove(index) {
-            Self::delete_pasted_images(&prompt.message.images);
-        }
-        if prompts.is_empty() {
-            self.pending_prompts.remove(&id);
-        }
-        self.dispatch_prompt(id, false, cx);
-        cx.notify();
+        self.hub.update(cx, |hub, cx| hub.remove_pending_prompt(id, turn_id, cx));
     }
 
     fn retry_pending_prompt(&mut self, id: u64, turn_id: &str, cx: &mut Context<Self>) {
-        if let Some(prompt) = self.pending_prompt_mut(id, turn_id)
-            && matches!(prompt.state, PromptState::Failed(_))
-        {
-            prompt.state = PromptState::Waiting;
-            self.dispatch_prompt(id, false, cx);
-            cx.notify();
-        }
+        self.hub.update(cx, |hub, cx| hub.retry_pending_prompt(id, turn_id, cx));
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.active else { return };
-        if let Some(session) = self.sessions.get(&id) {
-            agl_bridge::backend(session.machine.as_deref()).abort(&session.id);
-        }
-        cx.notify();
+        self.hub.update(cx, |hub, cx| hub.stop(id, cx));
     }
 
     fn answer(&mut self, thread_id: u64, request_id: String, decision: &str, cx: &mut Context<Self>) {
-        if let Some(session) = self.sessions.get(&thread_id) {
-            agl_bridge::backend(session.machine.as_deref()).approve(session.id.clone(), request_id, decision.to_string());
-        }
-        cx.notify();
+        self.hub.update(cx, |hub, cx| hub.answer(thread_id, request_id, decision, cx));
     }
 
     // ---- Machines ---------------------------------------------------------
@@ -1137,53 +957,18 @@ impl AgentPanel {
         }
     }
 
-    /// Whether `machine` can run a conversation now: its connection is up,
-    /// or the device list says it is reachable.
     fn machine_online(&self, machine: &str) -> bool {
-        agl_bridge::is_connected(machine)
-            || self.hosts.iter().any(|h| h.id == machine && h.usable())
+        self.s().machine_online(machine)
     }
 
-    /// A machine's name: as the relay lists it, else as it was when a
-    /// thread started there.
     fn machine_name(&self, id: &str, fallback: Option<&str>) -> String {
-        self.hosts
-            .iter()
-            .find(|h| h.id == id)
-            .map(|h| h.name.clone())
-            .or_else(|| fallback.map(str::to_string))
-            .or_else(|| Some(remote::name_of(id)).filter(|name| name != id))
-            .unwrap_or_else(|| "another machine".into())
+        self.s().machine_name(id, fallback)
     }
 
-    fn set_hosts(&mut self, hosts: Vec<remote::Device>, cx: &mut Context<Self>) {
-        let hosts: Vec<_> = hosts.into_iter().filter(|d| !d.is_self && d.shares).collect();
-        let ids = |list: &[remote::Device]| {
-            list.iter().map(|h| (h.id.clone(), h.name.clone(), h.usable())).collect::<Vec<_>>()
-        };
-        if ids(&hosts) != ids(&self.hosts) {
-            // A machine that came back may list its agents now.
-            for host in hosts.iter().filter(|h| h.usable()) {
-                if matches!(self.agents_cache.get(&Some(host.id.clone())), Some(Err(_))) {
-                    self.agents_cache.remove(&Some(host.id.clone()));
-                    if self.agents_machine.as_deref() == Some(host.id.as_str()) {
-                        self.agents = None;
-                        self.detect_agents(Some(host.id.clone()), cx);
-                    }
-                }
-            }
-            self.hosts = hosts;
-            cx.notify();
-        }
-    }
 
     /// Look the account's machines up now, e.g. right after signing in.
     pub fn refresh_hosts(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let hosts = remote::devices().await.unwrap_or_default();
-            this.update(cx, |this, cx| this.set_hosts(hosts, cx)).ok();
-        })
-        .detach();
+        self.hub.update(cx, |hub, cx| hub.refresh_hosts(cx));
     }
 
     /// Run the next new thread on `machine`; `None` is this one.
@@ -1193,8 +978,8 @@ impl AgentPanel {
             self.shown_project = None;
         }
         self.machine = machine.clone();
-        self.store.machine = machine;
-        self.store.save();
+        self.sm().store.machine = machine;
+        self.s().store.save();
         self.folders_open = false;
         self.sync_machine(cx);
         cx.notify();
@@ -1208,36 +993,47 @@ impl AgentPanel {
         }
         self.agents_machine = machine.clone();
         self.picker.update(cx, |picker, cx| picker.set_machine(machine.clone(), cx));
-        match self.agents_cache.get(&machine) {
-            Some(Ok(_)) => self.show_agents(cx),
-            _ => {
-                self.agents = None;
-                self.detect_agents(machine, cx);
-            }
+        let cached = matches!(self.s().agents_cache.get(&machine), Some(Ok(_)));
+        if cached {
+            self.show_agents(cx);
+        } else {
+            self.agents = None;
+            self.detect_agents(machine, cx);
         }
         cx.notify();
     }
 
     /// Whether an agent is offered for threads (Settings → Agents).
     pub fn agent_enabled(&self, agent: &str) -> bool {
-        self.store.enabled_agents.iter().any(|a| a == agent)
+        self.s().store.enabled_agents.iter().any(|a| a == agent)
     }
 
     pub fn set_agent_enabled(&mut self, agent: &str, enabled: bool, cx: &mut Context<Self>) {
-        self.store.enabled_agents.retain(|a| a != agent);
+        self.sm().store.enabled_agents.retain(|a| a != agent);
         if enabled {
-            self.store.enabled_agents.push(agent.to_string());
+            self.sm().store.enabled_agents.push(agent.to_string());
         }
-        self.store.save();
-        self.show_agents(cx);
+        self.s().store.save();
+        // Every window's picker offers what is on now.
+        self.hub.update(cx, |hub, cx| hub.announce(HubEvent::AgentsChanged, cx));
     }
 
     /// This machine's agents, once detected (Settings → Agents).
-    pub fn local_agents(&self) -> Option<&[AgentInfo]> {
-        match self.agents_cache.get(&None) {
-            Some(Ok(agents)) => Some(agents),
+    pub fn local_agents(&self) -> Option<Vec<AgentInfo>> {
+        match self.s().agents_cache.get(&None) {
+            Some(Ok(agents)) => Some(agents.clone()),
             _ => None,
         }
+    }
+
+    /// Look for the agents of the machine the composer talks to again, after
+    /// they could not be listed.
+    fn retry_agents(&mut self, cx: &mut Context<Self>) {
+        let machine = self.agents_machine.clone();
+        self.sm().agents_cache.remove(&machine);
+        self.agents = None;
+        self.detect_agents(machine, cx);
+        cx.notify();
     }
 
     /// Look for this machine's agents again, after their settings changed.
@@ -1247,40 +1043,29 @@ impl AgentPanel {
 
     /// The arguments appended to an agent's launch arguments here.
     pub fn agent_args(&self, agent: &str) -> Vec<String> {
-        self.store.agent_args.get(agent).cloned().unwrap_or_default()
+        self.s().store.agent_args.get(agent).cloned().unwrap_or_default()
     }
 
     pub fn set_agent_args(&mut self, agent: &str, args: Vec<String>, cx: &mut Context<Self>) {
         if args.is_empty() {
-            self.store.agent_args.remove(agent);
+            self.sm().store.agent_args.remove(agent);
         } else {
-            self.store.agent_args.insert(agent.to_string(), args);
+            self.sm().store.agent_args.insert(agent.to_string(), args);
         }
-        self.store.save();
+        self.s().store.save();
         cx.notify();
     }
 
     fn detect_agents(&mut self, machine: Option<String>, cx: &mut Context<Self>) {
-        let detect = agl_bridge::backend(machine.as_deref()).detect();
-        cx.spawn(async move |this, cx| {
-            let agents = detect.await.map_err(|err| format!("{err:#}"));
-            this.update(cx, |this, cx| {
-                this.agents_cache.insert(machine.clone(), agents);
-                if this.agents_machine == machine {
-                    this.show_agents(cx);
-                }
-            })
-            .ok();
-        })
-        .detach();
+        self.hub.update(cx, |hub, cx| hub.detect_agents(machine, cx));
     }
 
     /// Hand `agents_machine`'s detected agents to the composer and picker.
     fn show_agents(&mut self, cx: &mut Context<Self>) {
         let machine = self.agents_machine.clone();
-        let agents = self.agents_cache.get(&machine).cloned();
+        let agents = self.s().agents_cache.get(&machine).cloned();
         if let Some(Ok(agents)) = &agents {
-            let enabled = &self.store.enabled_agents;
+            let enabled = self.s().store.enabled_agents.clone();
             let usable = |a: &AgentInfo| a.available && enabled.contains(&a.id);
             // The next new thread's agent must be one installed and enabled there.
             if machine == self.machine && self.agent.as_deref().is_none_or(|id| !agents.iter().any(|a| a.id == id && usable(a))) {
@@ -1289,7 +1074,7 @@ impl AgentPanel {
             }
             // Starred models of agents turned off stay starred, out of sight.
             let favorites: Vec<(String, String)> =
-                self.store.favorites.iter().filter(|(a, _)| enabled.contains(a)).cloned().collect();
+                self.s().store.favorites.iter().filter(|(a, _)| enabled.contains(a)).cloned().collect();
             let agent = match self.active_thread() {
                 Some(thread) => Some(thread.agent.clone()),
                 None => self.agent.clone(),
@@ -1314,161 +1099,36 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// A thread another device wrote, deleted or has newer.
-    fn apply_incoming(&mut self, incoming: crate::sync::Incoming, cx: &mut Context<Self>) {
-        use crate::sync::Incoming;
-        match incoming {
-            Incoming::Put(thread) | Incoming::Mirror(thread) => {
-                let id = thread.id;
-                // A turn under way here owns the thread until it ends.
-                if self.is_busy(id) {
-                    return;
-                }
-                match self.store.threads.iter_mut().find(|t| t.id == id) {
-                    // Another thread that happens to share the id: leave it.
-                    Some(existing) if existing.machine != thread.machine => return,
-                    Some(existing) => {
-                        let grew = thread.items.len() > existing.items.len();
-                        *existing = thread;
-                        if grew && self.active != Some(id) {
-                            self.unread.insert(id);
-                        }
-                    }
-                    None => self.store.threads.push(thread),
-                }
-                // A device seen for the first time gets a workspace to show it in.
-                self.store.ensure_workspaces(&remote::this_name());
-                if self.active == Some(id) {
+
+    /// What changed in the shared state, for this window.
+    fn on_hub_event(&mut self, _: &Entity<Hub>, event: &HubEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            HubEvent::TurnFinished => cx.emit(AgentPanelEvent::TurnFinished),
+            HubEvent::ThreadChanged(id) => {
+                if self.active == Some(*id) {
                     self.follow_to_bottom();
                 }
-                self.store.save();
-                cx.notify();
             }
-            Incoming::PutWorkspace(ws) => {
-                match self.store.workspaces.iter_mut().find(|w| w.id == ws.id) {
-                    Some(existing) => *existing = ws,
-                    None => self.store.workspaces.push(ws),
-                }
-                self.store.save();
-                cx.notify();
-            }
-            Incoming::Workspaces { machine, list } => {
-                let mut changed = false;
-                for ws in self.store.workspaces.iter_mut().filter(|w| w.device.as_deref() == Some(machine.as_str())) {
-                    if let Some(theirs) = list.iter().find(|r| r.id == ws.id) {
-                        if (&ws.title, &ws.icon, &ws.projects) != (&theirs.title, &theirs.icon, &theirs.projects) {
-                            ws.title = theirs.title.clone();
-                            ws.icon = theirs.icon.clone();
-                            ws.projects = theirs.projects.clone();
-                            changed = true;
-                        }
-                    }
-                }
-                if changed {
-                    self.store.save();
-                    cx.notify();
+            HubEvent::ThreadRemoved(id) => {
+                let id = *id;
+                let current = self.navigation_history.get(self.navigation_index).copied();
+                self.navigation_history.retain(|visited| *visited != id);
+                self.navigation_index = current
+                    .and_then(|current| self.navigation_history.iter().position(|visited| *visited == current))
+                    .unwrap_or_else(|| self.navigation_history.len().saturating_sub(1));
+                if self.active == Some(id) {
+                    let current = self.tab_set_mut().current();
+                    self.active = current;
+                    self.sync_machine(cx);
                 }
             }
-            Incoming::Delete(id) => {
-                if self.store.threads.iter().any(|t| t.id == id && t.machine.is_none()) {
-                    self.remove_thread(id, false, cx);
+            HubEvent::AgentsDetected(machine) => {
+                if &self.agents_machine == machine {
+                    self.show_agents(cx);
                 }
             }
-            Incoming::Resend { machine, listed } => {
-                let missing: Vec<Thread> = self
-                    .store
-                    .threads
-                    .iter()
-                    .filter(|t| t.machine.as_deref() == Some(machine.as_str()) && !listed.contains(&t.id))
-                    .cloned()
-                    .collect();
-                crate::sync::resend(&missing);
-            }
-            Incoming::Gone { machine, id } => {
-                if self.store.threads.iter().any(|t| t.id == id && t.machine.as_deref() == Some(machine.as_str())) {
-                    self.remove_thread(id, false, cx);
-                }
-            }
-        }
-    }
-
-    fn apply_event(&mut self, id: u64, event: AgentEvent, cx: &mut Context<Self>) {
-        let mut sent = None;
-        let mut idle = false;
-        match &event {
-            AgentEvent::Status { status } => {
-                // starting, running and waiting (on an approval) are all busy.
-                idle = matches!(status.as_str(), "idle" | "suspended" | "closed");
-                if idle {
-                    if self.running.remove(&id) && !self.is_busy(id) && self.active != Some(id) {
-                        self.unread.insert(id);
-                    }
-                    if status == "closed" {
-                        self.sessions.remove(&id);
-                    }
-                } else {
-                    self.running.insert(id);
-                }
-            }
-            AgentEvent::UserMessage { turn_id, .. } | AgentEvent::Queued { turn_id, .. } => {
-                if let Some(pending) = self.pending_prompt_mut(id, turn_id) {
-                    pending.state = PromptState::Accepted {
-                        queued: matches!(event, AgentEvent::Queued { .. }),
-                    };
-                }
-            }
-            AgentEvent::TurnStarted { turn_id } => {
-                self.running.insert(id);
-                sent = self.take_pending_prompt(id, turn_id);
-            }
-            AgentEvent::Steered { turn_id, .. } => {
-                sent = self.take_pending_prompt(id, turn_id);
-            }
-            AgentEvent::TurnEnded { turn_id, error, .. } => {
-                if let Some(pending) = self.pending_prompt_mut(id, turn_id) {
-                    // The agent could not launch this turn. Keep the message
-                    // and its attachments available for retry.
-                    pending.state = PromptState::Failed(
-                        error.clone().unwrap_or_else(|| t("The turn did not start").into()),
-                    );
-                    cx.notify();
-                    return;
-                }
-            }
-            AgentEvent::Retrying { message } => {
-                self.notes.insert(id, tf("Retrying… {message}", &[("message", message.clone())]));
-            }
-            AgentEvent::Heartbeat { stalled: true, idle_ms, .. } => {
-                self.notes
-                    .insert(id, tf("No output for {n}s", &[("n", (idle_ms / 1000).to_string())]));
-            }
-            AgentEvent::TextDelta { .. } | AgentEvent::ToolStart { .. } => {
-                self.notes.remove(&id);
-            }
-            _ => {}
-        }
-        let turn_ended = matches!(event, AgentEvent::TurnEnded { .. });
-
-        let Some(thread) = self.thread_mut(id) else {
-            return;
-        };
-        let sent_message = sent.is_some();
-        if let Some(pending) = sent {
-            thread.items.push(ChatItem::User(pending.message));
-        }
-        thread.apply(event);
-        if sent_message || turn_ended {
-            self.store.save();
-        }
-        if turn_ended {
-            self.notes.remove(&id);
-            cx.emit(AgentPanelEvent::TurnFinished);
-        }
-        if idle {
-            self.dispatch_prompt(id, false, cx);
-        }
-        if self.active == Some(id) {
-            self.follow_to_bottom();
+            HubEvent::AgentsChanged => self.show_agents(cx),
+            HubEvent::WorkspacesChanged => self.leave_gone_workspace(window, cx),
         }
         cx.notify();
     }
@@ -1495,15 +1155,15 @@ impl AgentPanel {
             }
             ModelPickerEvent::ToggleFavorite { agent, model } => {
                 let key = (agent.clone(), model.clone());
-                if let Some(ix) = self.store.favorites.iter().position(|f| *f == key) {
-                    self.store.favorites.remove(ix);
+                if let Some(ix) = self.s().store.favorites.iter().position(|f| *f == key) {
+                    self.sm().store.favorites.remove(ix);
                 } else {
-                    self.store.favorites.push(key);
+                    self.sm().store.favorites.push(key);
                 }
-                let favorites = self.store.favorites.clone();
+                let favorites = self.s().store.favorites.clone();
                 self.picker
                     .update(cx, |picker, cx| picker.set_favorites(favorites, cx));
-                self.store.save();
+                self.s().store.save();
             }
         }
         cx.notify();
@@ -1539,22 +1199,23 @@ impl AgentPanel {
     fn choose_model(&mut self, agent: String, model: Option<String>, cx: &mut Context<Self>) {
         // The default model is the one with no explicit choice.
         let model = model.filter(|m| m != "default");
-        let active = self.active.filter(|id| {
-            self.store.threads.iter().any(|t| t.id == *id && (!t.items.is_empty() || self.pending_prompts.contains_key(id)))
-        });
+        let active = {
+            let s = self.s();
+            self.active.filter(|id| s.thread(*id).is_some_and(|t| !t.items.is_empty() || s.pending_prompts.contains_key(id)))
+        };
         if let Some(id) = active {
-            let Some(thread) = self.store.threads.iter().find(|t| t.id == id) else {
+            let Some((from_agent, from_model)) = self.s().thread(id).map(|t| (t.agent.clone(), t.model.clone())) else {
                 return;
             };
-            let from_label = self.model_label(&thread.agent, thread.model.as_deref(), cx);
+            let from_label = self.model_label(&from_agent, from_model.as_deref(), cx);
             let to_label = self.model_label(&agent, model.as_deref(), cx);
-            let same_agent = thread.agent == agent;
-            if let Some(thread) = self.thread_mut(id) {
+            let same_agent = from_agent == agent;
+            if let Some(mut thread) = self.thread_mut(id) {
                 thread.switch(agent.clone(), model.clone(), from_label, to_label);
             }
             // Same agent: change the model in place; agl keeps the conversation.
             if same_agent {
-                if let Some(session) = self.sessions.get(&id) {
+                if let Some(session) = self.s().sessions.get(&id) {
                     agl_bridge::backend(session.machine.as_deref()).configure(&session.id, None, Some(model.clone().unwrap_or_else(|| "default".into())), None);
                 }
             }
@@ -1562,25 +1223,25 @@ impl AgentPanel {
         }
         self.agent = Some(agent.clone());
         self.model = model.clone();
-        self.store.agent = Some(agent.clone());
-        self.store.model = model;
+        self.sm().store.agent = Some(agent.clone());
+        self.sm().store.model = model;
         self.picker.update(cx, |picker, cx| picker.ensure_models(&agent, cx));
-        self.store.save();
+        self.s().store.save();
         cx.notify();
     }
 
     fn set_effort(&mut self, effort: Option<String>, cx: &mut Context<Self>) {
         self.effort = effort.clone();
-        self.store.effort = effort.clone();
+        self.sm().store.effort = effort.clone();
         if let Some(id) = self.active {
-            if let Some(thread) = self.thread_mut(id) {
+            if let Some(mut thread) = self.thread_mut(id) {
                 thread.effort = effort.clone();
             }
-            if let Some(session) = self.sessions.get(&id) {
+            if let Some(session) = self.s().sessions.get(&id) {
                 agl_bridge::backend(session.machine.as_deref()).configure(&session.id, None, None, effort);
             }
         }
-        self.store.save();
+        self.s().store.save();
         cx.notify();
     }
 
@@ -1601,17 +1262,17 @@ impl AgentPanel {
 
     fn set_access(&mut self, access: &str, cx: &mut Context<Self>) {
         self.access = access.to_string();
-        self.store.access = access.to_string();
+        self.sm().store.access = access.to_string();
         // The open thread changes too; agl keeps the conversation.
         if let Some(id) = self.active {
-            if let Some(thread) = self.thread_mut(id) {
+            if let Some(mut thread) = self.thread_mut(id) {
                 thread.access = access.to_string();
             }
-            if let Some(session) = self.sessions.get(&id) {
+            if let Some(session) = self.s().sessions.get(&id) {
                 agl_bridge::backend(session.machine.as_deref()).configure(&session.id, Some(access.to_string()), None, None);
             }
         }
-        self.store.save();
+        self.s().store.save();
         cx.notify();
     }
 
@@ -1822,13 +1483,20 @@ impl AgentPanel {
     // ---- Sidebar ------------------------------------------------------------
 
     fn set_settled(&mut self, id: u64, settled: bool, cx: &mut Context<Self>) {
-        if let Some(thread) = self.thread_mut(id) {
+        if let Some(mut thread) = self.thread_mut(id) {
             thread.settled = settled;
         }
         if settled {
-            self.drop_thread_tabs(id, cx);
+            for set in &mut self.sm().store.tabs {
+                set.retain_threads(|t| t != id);
+            }
+            if self.active == Some(id) {
+                let current = self.tab_set_mut().current();
+                self.active = current;
+                self.sync_machine(cx);
+            }
         }
-        self.store.save();
+        self.s().store.save();
         cx.notify();
     }
 
@@ -1844,28 +1512,52 @@ impl AgentPanel {
 
     /// The interface language: `None` follows the system.
     pub fn language_preference(&self) -> Option<crate::i18n::Language> {
-        crate::i18n::preference_from_setting(self.store.language.clone())
+        crate::i18n::preference_from_setting(self.s().store.language.clone())
     }
 
     pub fn set_language(&mut self, preference: Option<crate::i18n::Language>, cx: &mut Context<Self>) {
-        self.store.language = crate::i18n::preference_to_setting(preference);
-        self.store.save();
+        self.sm().store.language = crate::i18n::preference_to_setting(preference);
+        self.s().store.save();
         crate::i18n::apply(preference);
         crate::set_app_menus(cx);
         cx.refresh_windows();
         cx.notify();
     }
 
+    /// The theme this window shows: its workspace's, else the app's.
+    pub fn theme_choice(&self) -> String {
+        let s = self.s();
+        self.workspace
+            .as_ref()
+            .and_then(|id| s.store.workspace_themes.get(id).cloned())
+            .or_else(|| s.store.theme.clone())
+            .unwrap_or_else(|| "system".into())
+    }
+
+    /// Give this window's workspace `theme`. It is also what workspaces
+    /// without one start with from now on; those other windows show keep
+    /// what they show.
     pub fn set_theme(&mut self, theme: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.store.theme = Some(theme.clone());
-        self.store.save();
+        {
+            let mut s = self.sm();
+            let current = s.store.theme.clone().unwrap_or_else(|| "system".into());
+            let shown: Vec<String> = s.views.values().filter_map(|v| v.workspace.clone()).collect();
+            for id in shown {
+                s.store.workspace_themes.entry(id).or_insert_with(|| current.clone());
+            }
+            if let Some(id) = self.workspace.clone() {
+                s.store.workspace_themes.insert(id, theme.clone());
+            }
+            s.store.theme = Some(theme.clone());
+            s.store.save();
+        }
         crate::style::set_choice(theme, window, cx);
         cx.notify();
     }
 
     pub fn set_typography(&mut self, value: crate::style::Typography, cx: &mut Context<Self>) {
-        self.store.typography = value.clone();
-        self.store.save();
+        self.sm().store.typography = value.clone();
+        self.s().store.save();
         crate::style::set_typography(value, cx);
     }
 
@@ -1874,18 +1566,18 @@ impl AgentPanel {
         // in it on that device; this window's project stays as it is.
         if let Some(machine) = self.machine.clone() {
             if let Some(dir) = &project {
-                let active = self.store.active_workspace.clone();
-                if let Some(ws) = self.store.workspaces.iter_mut().find(|w| Some(&w.id) == active.as_ref()) {
+                let active = self.workspace.clone();
+                if let Some(ws) = self.sm().store.workspaces.iter_mut().find(|w| Some(&w.id) == active.as_ref()) {
                     if !ws.projects.contains(dir) {
                         ws.projects.insert(0, dir.clone());
                     }
                 }
             }
             match project {
-                Some(dir) => self.store.remote_dirs.insert(machine, dir),
-                None => self.store.remote_dirs.remove(&machine),
+                Some(dir) => self.sm().store.remote_dirs.insert(machine, dir),
+                None => self.sm().store.remote_dirs.remove(&machine),
             };
-            self.store.save();
+            self.s().store.save();
             self.new_thread(window, cx);
             return;
         }
@@ -1900,7 +1592,7 @@ impl AgentPanel {
     /// A conversation with its current agent and trailing activity.
     /// Where a thread stands, for its dot in the sidebar.
     fn thread_status(&self, thread: &Thread) -> ThreadStatus {
-        let running = self.running.contains(&thread.id);
+        let running = self.s().running.contains(&thread.id);
         // Only what happened since the last turn ended counts.
         let last_turn = thread
             .items
@@ -1915,7 +1607,7 @@ impl AgentPanel {
             return ThreadStatus::Working;
         }
         // The last thing said was an error, with no turn ended cleanly since.
-        let send_failed = self.pending_prompts.get(&thread.id)
+        let send_failed = self.s().pending_prompts.get(&thread.id)
             .and_then(VecDeque::front)
             .is_some_and(|prompt| matches!(prompt.state, PromptState::Failed(_)));
         let turn_failed = thread
@@ -1926,7 +1618,7 @@ impl AgentPanel {
             .is_some_and(|item| matches!(item, ChatItem::Error(_)));
         if send_failed || turn_failed {
             ThreadStatus::Failed
-        } else if self.unread.contains(&thread.id) {
+        } else if self.s().unread.contains(&thread.id) {
             ThreadStatus::Done
         } else {
             ThreadStatus::Idle
@@ -1937,7 +1629,7 @@ impl AgentPanel {
         let theme = cx.theme().clone();
         let id = thread.id;
         let active = self.active == Some(id);
-        let running = self.running.contains(&id);
+        let running = self.s().running.contains(&id);
         let settled = thread.settled;
         let open = self.is_open_in_tab(thread);
         div()
@@ -1950,7 +1642,8 @@ impl AgentPanel {
             .flex()
             .items_center()
             .gap(layout::SPACE_2)
-            .rounded(layout::RADIUS)
+            // Rounder than buttons, as Codex's rows: the highlight is a pill-ish tile.
+            .rounded(px(10.))
             .cursor_pointer()
             .text_size(TEXT)
             .when(active, |this| this.bg(theme.list_active))
@@ -1979,6 +1672,8 @@ impl AgentPanel {
             )
             .child(
                 div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap()
+                    // Room for the menu button that hovering shows at the end.
+                    .group_hover("thread", |this| this.pr(layout::CONTROL))
                     .text_color(if active || open { theme.foreground } else { theme.foreground.opacity(0.8) })
                     // Threads open in a tab stand out from the rest.
                     .when(open, |this| this.font_weight(FontWeight::MEDIUM))
@@ -1996,13 +1691,50 @@ impl AgentPanel {
                         .child(name),
                 )
             })
-            .child(if running {
-                render_working(cx)
-            } else {
-                div().flex_none().min_w(px(30.)).text_right().text_size(TEXT)
-                    .text_color(theme.muted_foreground).child(relative_time(thread.updated_at))
-                    .into_any_element()
-            })
+            // No time: a running thread shows it is working, and hovering a
+            // row shows its menu over the end of it, the title making room.
+            .child(
+                div()
+                    .flex_none()
+                    .relative()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .when(running, |this| {
+                        this.child(div().group_hover("thread", |this| this.invisible()).child(render_working(cx)))
+                    })
+                    .child({
+                        let panel = cx.entity().downgrade();
+                        div()
+                            .id(("thread-actions", id))
+                            .absolute()
+                            // Under the section's icons: indented rows pad
+                            // their end more than the header does.
+                            .right(if indent { layout::SIDEBAR_ROW_INSET - layout::SPACE_3 } else { px(0.) })
+                            .top_0()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .invisible()
+                            .group_hover("thread", |this| this.visible())
+                            .child(
+                                crate::style::chrome_button("thread-menu")
+                                    // Bare on the row's own highlight, no backdrop of its own.
+                                    .custom(
+                                        gpui_kit::component::button::ButtonCustomVariant::new(cx)
+                                            .color(gpui_kit::transparent_black())
+                                            .hover(gpui_kit::transparent_black())
+                                            .active(gpui_kit::transparent_black())
+                                            .foreground(theme.muted_foreground)
+                                            .shadow(false),
+                                    )
+                                    .child(Icon::new(IconName::Ellipsis).size(ICON))
+                                    .text_color(theme.muted_foreground)
+                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    .dropdown_menu(thread_menu(panel, id, settled)),
+                            )
+                    }),
+            )
             // A click shows the thread in the active tab; ⌘-click or a
             // middle-click opens it in a new one, as links do in a browser.
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -2015,25 +1747,7 @@ impl AgentPanel {
             .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, window, cx| {
                 this.open_in_new_tab(id, window, cx);
             }))
-            .context_menu({
-                let panel = cx.entity().downgrade();
-                move |menu, _, _| {
-                    let (new_tab, settle, delete) = (panel.clone(), panel.clone(), panel.clone());
-                    menu.item(crate::style::menu_item(t("Open in New Tab")).on_click(move |_, window, cx| {
-                        new_tab.update(cx, |this, cx| this.open_in_new_tab(id, window, cx)).ok();
-                    }))
-                    .separator()
-                    .item(
-                        crate::style::menu_item(t(if settled { "Unarchive" } else { "Archive" })).on_click(move |_, _, cx| {
-                            settle.update(cx, |this, cx| this.set_settled(id, !settled, cx)).ok();
-                        }),
-                    )
-                    .separator()
-                    .item(crate::style::menu_item(t("Delete…")).on_click(move |_, window, cx| {
-                        delete.update(cx, |this, cx| this.confirm_delete(id, window, cx)).ok();
-                    }))
-                }
-            })
+            .context_menu(thread_menu(cx.entity().downgrade(), id, settled))
             .into_any_element()
     }
 
@@ -2104,9 +1818,11 @@ impl AgentPanel {
     /// first: this one's opened folders, another's last picked folder, and
     /// the folders their threads work in.
     fn device_projects(&self) -> Vec<PathBuf> {
-        let mut projects: Vec<PathBuf> = self.store.active_workspace().map(|w| w.projects.clone()).unwrap_or_default();
+        let mut projects: Vec<PathBuf> = self.s().store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref()).map(|w| w.projects.clone()).unwrap_or_default();
         let mut latest: HashMap<PathBuf, u64> = HashMap::new();
-        for thread in self.store.threads.iter().filter(|t| !t.settled && self.in_active_workspace(t)) {
+        let shared = self.shared.clone();
+        let shared = shared.borrow();
+        for thread in shared.store.threads.iter().filter(|t| !t.settled && self.in_active_workspace(t)) {
             if let Some(project) = &thread.project {
                 let at = latest.entry(project.clone()).or_default();
                 *at = (*at).max(thread.updated_at);
@@ -2121,18 +1837,18 @@ impl AgentPanel {
 
     /// Whether `thread` is in the workspace the window shows.
     fn in_active_workspace(&self, thread: &Thread) -> bool {
-        let active = self.store.active_workspace.as_ref();
-        active.is_some() && self.store.workspace_of(thread).map(|w| &w.id) == active
+        let active = self.workspace.as_ref();
+        active.is_some() && self.s().store.workspace_of(thread).map(|w| &w.id) == active
     }
 
     /// The other devices a workspace can live on, for the workspace menu.
     fn menu_devices(&self) -> Vec<MenuDevice> {
-        let mut devices: Vec<MenuDevice> = self
-            .hosts
+        let hosts = self.s().hosts.clone();
+        let mut devices: Vec<MenuDevice> = hosts
             .iter()
             .map(|h| MenuDevice { id: h.id.clone(), name: h.name.clone(), online: self.machine_online(&h.id) })
             .collect();
-        for w in &self.store.workspaces {
+        for w in &self.s().store.workspaces {
             if let Some(id) = &w.device {
                 if !devices.iter().any(|d| &d.id == id) {
                     let name = self.machine_name(id, w.device_name.as_deref());
@@ -2146,8 +1862,8 @@ impl AgentPanel {
     /// Show workspace `id`: its projects and chats, its device for new threads.
     /// Run new threads on `device`: show its workspace, made if it has none.
     fn switch_device(&mut self, device: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.store.active_workspace().filter(|w| w.device == device).map(|w| w.id.clone());
-        let id = current.or_else(|| self.store.workspaces.iter().find(|w| w.device == device).map(|w| w.id.clone()));
+        let current = self.s().store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref()).filter(|w| w.device == device).map(|w| w.id.clone());
+        let id = current.or_else(|| self.s().store.workspaces.iter().find(|w| w.device == device).map(|w| w.id.clone()));
         let id = match id {
             Some(id) => id,
             None => {
@@ -2164,30 +1880,51 @@ impl AgentPanel {
                         }
                     })
                     .detach();
-                self.store.workspaces.push(ws);
+                self.sm().store.workspaces.push(ws);
                 id
             }
         };
         self.activate_workspace(id, window, cx);
     }
 
+    /// This window's workspace was deleted: show one no window shows, or
+    /// close the window when every other is shown already.
+    fn leave_gone_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let gone = self.workspace.as_ref().is_some_and(|id| !self.s().store.workspaces.iter().any(|w| &w.id == id));
+        if !gone {
+            return;
+        }
+        let next = self.s().free_workspace();
+        match next {
+            Some(id) => self.activate_workspace(id, window, cx),
+            None => window.remove_window(),
+        }
+    }
+
     fn activate_workspace(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.store.workspaces.iter().find(|w| w.id == id).cloned() else { return };
-        self.store.active_workspace = Some(id);
+        // A workspace shows in one window at a time: go to the one showing it.
+        if self.workspace.as_deref() != Some(id.as_str()) && self.hand_off(&id, |_, _, _| {}, cx) {
+            return;
+        }
+        let Some(ws) = self.s().store.workspaces.iter().find(|w| w.id == id).cloned() else { return };
+        self.workspace = Some(id);
         self.shown_project = None;
         self.set_machine(ws.device.clone(), cx);
+        self.remember_workspace();
+        self.report();
         // Each workspace keeps its own tabs, of its own threads only (a
         // thread's workspace can change as devices sync): show the one last
         // active there.
         self.tab_set_mut();
-        self.store.drop_foreign_tabs();
-        self.active = self.tab_set_mut().current();
-        if self.active_thread().is_some_and(|t| !self.in_active_workspace(t)) {
+        self.sm().store.drop_foreign_tabs();
+        let current = self.tab_set_mut().current();
+        self.active = current;
+        if self.active_thread().is_some_and(|t| !self.in_active_workspace(&t)) {
             self.new_thread(window, cx);
         }
         self.sync_machine(cx);
         self.pin_to_bottom(cx);
-        self.store.save();
+        self.s().store.save();
         cx.notify();
     }
 
@@ -2202,6 +1939,14 @@ impl AgentPanel {
             WorkspaceMenuEvent::Activate(id) => {
                 self.workspace_menu_open = false;
                 self.activate_workspace(id.clone(), window, cx);
+            }
+            WorkspaceMenuEvent::OpenInNewWindow(id) => {
+                self.workspace_menu_open = false;
+                if !self.hand_off(id, |_, _, _| {}, cx) {
+                    let id = id.clone();
+                    cx.defer(move |cx| crate::workspace::open_main_window(None, Some(id), cx));
+                }
+                cx.notify();
             }
             WorkspaceMenuEvent::Create { title, icon, device } => {
                 let (device, device_name) = match device {
@@ -2221,12 +1966,12 @@ impl AgentPanel {
                         .detach();
                 }
                 let id = ws.id.clone();
-                self.store.workspaces.push(ws);
+                self.sm().store.workspaces.push(ws);
                 self.workspace_menu_open = false;
                 self.activate_workspace(id, window, cx);
             }
             WorkspaceMenuEvent::Edit { id, title, icon } => {
-                if let Some(ws) = self.store.workspaces.iter_mut().find(|w| &w.id == id) {
+                if let Some(ws) = self.sm().store.workspaces.iter_mut().find(|w| &w.id == id) {
                     ws.title = title.clone();
                     ws.icon = icon.clone();
                     if let Some(machine) = ws.device.clone() {
@@ -2234,21 +1979,21 @@ impl AgentPanel {
                         cx.background_executor().spawn(async move { put.await.ok() }).detach();
                     }
                 }
-                self.store.save();
+                self.s().store.save();
                 cx.notify();
             }
             WorkspaceMenuEvent::Delete(id) => {
-                if !crate::threads::Workspace::deletable(&self.store.workspaces, id) {
+                if !crate::threads::Workspace::deletable(&self.s().store.workspaces, id) {
                     return;
                 }
-                let Some(ws) = self.store.workspaces.iter().find(|w| &w.id == id).cloned() else { return };
+                let Some(ws) = self.s().store.workspaces.iter().find(|w| &w.id == id).cloned() else { return };
                 if ws.device.is_none() {
                     // Its threads and projects go to the first workspace left here.
-                    for thread in self.store.threads.iter_mut().filter(|t| t.workspace.as_ref() == Some(id)) {
+                    for thread in self.sm().store.threads.iter_mut().filter(|t| t.workspace.as_ref() == Some(id)) {
                         thread.workspace = None;
                     }
                     let projects = ws.projects.clone();
-                    if let Some(first) = self.store.workspaces.iter_mut().find(|w| w.device.is_none() && &w.id != id) {
+                    if let Some(first) = self.sm().store.workspaces.iter_mut().find(|w| w.device.is_none() && &w.id != id) {
                         for p in projects {
                             if !first.projects.contains(&p) {
                                 first.projects.push(p);
@@ -2256,20 +2001,17 @@ impl AgentPanel {
                         }
                     }
                 }
-                self.store.workspaces.retain(|w| &w.id != id);
-                self.store.ensure_workspaces(&remote::this_name());
-                if self.store.active_workspace.as_ref() == Some(id) {
-                    if let Some(first) = self.store.workspaces.first().map(|w| w.id.clone()) {
-                        self.activate_workspace(first, window, cx);
-                    }
-                }
-                self.store.save();
+                self.sm().store.workspaces.retain(|w| &w.id != id);
+                self.sm().store.ensure_workspaces(&remote::this_name());
+                self.s().store.save();
+                // This window and any other showing it move on.
+                self.hub.update(cx, |hub, cx| hub.announce(HubEvent::WorkspacesChanged, cx));
                 cx.notify();
             }
             WorkspaceMenuEvent::Mount(ws) => {
                 let id = ws.id.clone();
-                if !self.store.workspaces.iter().any(|w| w.id == id) {
-                    self.store.workspaces.push(ws.clone());
+                if !self.s().store.workspaces.iter().any(|w| w.id == id) {
+                    self.sm().store.workspaces.push(ws.clone());
                 }
                 self.workspace_menu_open = false;
                 self.activate_workspace(id, window, cx);
@@ -2286,7 +2028,7 @@ impl AgentPanel {
     /// is another one.
     pub fn render_workspace_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let ws = self.store.active_workspace().cloned();
+        let ws = self.s().store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref()).cloned();
         let title = ws.as_ref().map(|w| w.title.clone()).unwrap_or_else(remote::this_name);
         let icon = ws.as_ref().and_then(|w| w.icon.clone());
         let menu = self.workspace_menu.clone();
@@ -2296,9 +2038,16 @@ impl AgentPanel {
             .on_open_change(cx.listener(|this, open: &bool, _, cx| {
                 this.workspace_menu_open = *open;
                 if *open {
-                    let (workspaces, active, devices) =
-                        (this.store.workspaces.clone(), this.store.active_workspace.clone(), this.menu_devices());
-                    this.workspace_menu.update(cx, |menu, cx| menu.open(workspaces, active, devices, cx));
+                    this.sm().prune(cx);
+                    let (workspaces, active, devices) = (this.s().store.workspaces.clone(), this.workspace.clone(), this.menu_devices());
+                    let elsewhere: Vec<String> = this
+                        .s()
+                        .views
+                        .iter()
+                        .filter(|(panel, _)| **panel != this.entity_id)
+                        .filter_map(|(_, v)| v.workspace.clone())
+                        .collect();
+                    this.workspace_menu.update(cx, |menu, cx| menu.open(workspaces, active, elsewhere, devices, cx));
                 }
                 cx.notify();
             }))
@@ -2335,6 +2084,7 @@ impl AgentPanel {
     }
 
     pub fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.report();
         let theme = cx.theme().clone();
 
         // Threads, as one list per project.
@@ -2351,7 +2101,9 @@ impl AgentPanel {
         // Ordered, so equal timestamps never reshuffle from one frame to the next.
         let mut groups: std::collections::BTreeMap<Option<PathBuf>, Vec<Entry>> = Default::default();
         // One workspace at a time, picked at the top: its projects and chats.
-        for thread in self.store.threads.iter().filter(|t| !t.settled && self.in_active_workspace(t)) {
+        let shared = self.shared.clone();
+        let shared = shared.borrow();
+        for thread in shared.store.threads.iter().filter(|t| !t.settled && self.in_active_workspace(t)) {
             groups.entry(thread.project.clone()).or_default().push(Entry::Thread(thread));
         }
         for entries in groups.values_mut() {
@@ -2370,7 +2122,7 @@ impl AgentPanel {
 
         // ---- Projects, most recently active first; the open one leads.
         // The workspace's own, and the folders its threads work in.
-        let mut projects: Vec<PathBuf> = self.store.active_workspace().map(|w| w.projects.clone()).unwrap_or_default();
+        let mut projects: Vec<PathBuf> = self.s().store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref()).map(|w| w.projects.clone()).unwrap_or_default();
         for project in groups.keys().flatten() {
             if !projects.contains(project) {
                 projects.push(project.clone());
@@ -2386,7 +2138,7 @@ impl AgentPanel {
         // By last activity, so opening a project never moves it. The path
         // breaks ties: without it the list reorders on every hover.
         projects.sort_by(|a, b| {
-            let rank = |p: &PathBuf| std::cmp::Reverse(activity(p).max(u64::from(self.store.projects.contains(p))));
+            let rank = |p: &PathBuf| std::cmp::Reverse(activity(p).max(u64::from(self.s().store.projects.contains(p))));
             if self.sort_repositories_by_name {
                 a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b))
             } else {
@@ -2434,7 +2186,8 @@ impl AgentPanel {
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
+                    // Highlights nearly touch, as in Codex.
+                    .gap(px(1.))
                     .children(entries[..shown].iter().map(|entry| match entry {
                         Entry::Thread(t) => this.render_thread_row(t, indent, cx),
                     })),
@@ -2471,7 +2224,7 @@ impl AgentPanel {
                         // A folder on that device: pick it for a new thread.
                         Some(machine) => {
                             this.new_thread(window, cx);
-                            let dir = this.store.remote_dirs.get(&machine).cloned();
+                            let dir = this.s().store.remote_dirs.get(&machine).cloned();
                             this.folders.update(cx, |folders, cx| folders.open(machine, dir, cx));
                             this.folders_open = true;
                             cx.notify();
@@ -2503,7 +2256,7 @@ impl AgentPanel {
                     let expanded = filtered.is_some() || self.expanded_projects.contains(project);
                     let current = self.project.as_ref() == Some(project);
                     let live = entries.iter().any(|e| match e {
-                        Entry::Thread(t) => self.running.contains(&t.id),
+                        Entry::Thread(t) => self.s().running.contains(&t.id),
                     });
                     let count = entries.len();
                     let path = project.clone();
@@ -2642,7 +2395,7 @@ impl AgentPanel {
 
         // ---- Archived threads: out of the lists above, kept until deleted.
         let mut archived: Vec<Entry> =
-            self.store
+            shared.store
                 .threads
                 .iter()
                 .filter(|t| t.settled && self.in_active_workspace(t))
@@ -2673,10 +2426,11 @@ impl AgentPanel {
     // ---- Conversation -------------------------------------------------------
 
     pub fn render_chat(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.report();
         let theme = cx.theme().clone();
         let Some(id) = self
             .active_thread()
-            .filter(|t| !t.items.is_empty() || self.pending_prompts.contains_key(&t.id))
+            .filter(|t| !t.items.is_empty() || self.s().pending_prompts.contains_key(&t.id))
             .map(|t| t.id)
         else {
             return self.render_empty(cx);
@@ -2738,7 +2492,7 @@ impl AgentPanel {
                     .px(layout::SPACE_6)
                     .pb(layout::SPACE_4)
                     .flex_none()
-                    .child(self.render_composer(self.active_thread(), cx)),
+                    .child(self.render_composer(self.active_thread().as_deref(), cx)),
             )
             .into_any_element()
     }
@@ -2771,8 +2525,9 @@ impl AgentPanel {
 
     fn chat_rows(&self, id: u64) -> Option<(Vec<Turn>, Vec<u64>)> {
         use std::hash::{Hash as _, Hasher as _};
-        let thread = self.store.threads.iter().find(|t| t.id == id)?;
-        let running = self.running.contains(&id);
+        let s = self.s();
+        let thread = s.thread(id)?;
+        let running = s.running.contains(&id);
         let turns = split_turns(&thread.items);
         let last = turns.len().saturating_sub(1);
         let mut sigs: Vec<u64> = turns
@@ -2817,7 +2572,7 @@ impl AgentPanel {
             .flex()
             .flex_col();
         let Some(thread) = self.active_thread() else { return row.into_any_element() };
-        let running = self.running.contains(&thread.id);
+        let running = self.s().running.contains(&thread.id);
         let Some(turn) = self.chat_turns.get(n) else {
             if running && n == self.chat_turns.len() {
                 return row
@@ -2828,7 +2583,7 @@ impl AgentPanel {
                             .text_color(theme.muted_foreground)
                             .child(
                                 ShimmerText::new(
-                                    self.notes
+                                    self.s().notes
                                         .get(&thread.id)
                                         .cloned()
                                         .unwrap_or_else(|| t("Working…").into()),
@@ -2955,7 +2710,14 @@ impl AgentPanel {
                                     .border_1()
                                     .border_color(theme.border)
                                     .cursor_pointer()
-                                    .child(img(path.clone()).max_w(px(240.)).max_h(px(180.)))
+                                    .map(|this| {
+                                        if is_image_path(path) {
+                                            this.child(img(path.clone()).max_w(px(240.)).max_h(px(180.)))
+                                        } else {
+                                            this.h(px(32.)).max_w(px(260.)).px(px(10.)).bg(theme.secondary)
+                                                .child(file_label(path, &theme))
+                                        }
+                                    })
                                     .on_click(move |_, _, cx| cx.open_with_system(&open_path))
                             })),
                     )
@@ -3053,7 +2815,8 @@ impl AgentPanel {
                 ..
             } => {
                 let running = *status == ToolStatus::Running;
-                let on = self.store.threads.iter().find(|t| t.id == thread_id);
+                let shared = self.s();
+                let on = shared.thread(thread_id);
                 // Files on another machine are not ones to open here.
                 let remote = on.is_some_and(|t| t.machine.is_some());
                 let base = match on {
@@ -3471,20 +3234,20 @@ impl AgentPanel {
         };
         // The workspace decides the device: pick another workspace to run
         // somewhere else.
-        if !self.store.workspaces.is_empty() {
+        if !self.s().store.workspaces.is_empty() {
             let label = match &current {
                 Some(id) if !self.machine_online(id) => tf("{name} · offline", &[("name", label.clone())]),
                 _ => label,
             };
             // Another device is another workspace: picking one switches to it.
             let mut devices: Vec<(Option<String>, String, bool)> = vec![(None, remote::this_name(), true)];
-            for w in self.store.workspaces.iter().filter(|w| w.device.is_some()) {
+            for w in self.s().store.workspaces.iter().filter(|w| w.device.is_some()) {
                 let id = w.device.clone().unwrap();
                 if !devices.iter().any(|(d, _, _)| d.as_deref() == Some(id.as_str())) {
                     devices.push((Some(id.clone()), self.machine_name(&id, w.device_name.as_deref()), self.machine_online(&id)));
                 }
             }
-            for h in &self.hosts {
+            for h in &self.s().hosts {
                 if !devices.iter().any(|(d, _, _)| d.as_deref() == Some(h.id.as_str())) {
                     devices.push((Some(h.id.clone()), h.name.clone(), h.usable()));
                 }
@@ -3522,12 +3285,12 @@ impl AgentPanel {
                 })
                 .into_any_element();
         }
-        if self.hosts.is_empty() && current.is_none() {
+        if self.s().hosts.is_empty() && current.is_none() {
             let tip = t("Connect your other devices in Settings → Devices to run agents there").to_string();
             return self.context_label("machine", icon, label, Some(tip), cx);
         }
         let hosts: Vec<(String, String, bool)> =
-            self.hosts.iter().map(|h| (h.id.clone(), h.name.clone(), h.usable())).collect();
+            self.s().hosts.iter().map(|h| (h.id.clone(), h.name.clone(), h.usable())).collect();
         let entity = cx.entity().downgrade();
         Self::context_button("machine-picker", icon, label, cx)
             .dropdown_menu(move |mut menu, _, _| {
@@ -3575,7 +3338,7 @@ impl AgentPanel {
             let tip = current.as_ref().map(|p| p.display().to_string());
             return self.context_label("project", IconName::Folder, label, tip, cx);
         }
-        let recent: Vec<PathBuf> = self.store.projects.iter().take(8).cloned().collect();
+        let recent: Vec<PathBuf> = self.s().store.projects.iter().take(8).cloned().collect();
         let entity = cx.entity().downgrade();
         Self::context_button("project-picker", IconName::Folder, label, cx)
             .dropdown_menu(move |mut menu, _, _| {
@@ -3668,7 +3431,7 @@ impl AgentPanel {
             Some(thread) => (thread.machine.clone()?, thread.project.clone()),
             None => {
                 let machine = self.machine.clone()?;
-                let dir = self.store.remote_dirs.get(&machine).cloned();
+                let dir = self.s().store.remote_dirs.get(&machine).cloned();
                 (machine, dir)
             }
         };
@@ -3701,7 +3464,7 @@ impl AgentPanel {
                 .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
                     this.folders_open = *open;
                     if *open {
-                        let dir = this.store.remote_dirs.get(&machine).cloned();
+                        let dir = this.s().store.remote_dirs.get(&machine).cloned();
                         let machine = machine.clone();
                         this.folders.update(cx, |folders, cx| folders.open(machine, dir, cx));
                     }
@@ -3726,8 +3489,8 @@ impl AgentPanel {
 
     fn render_composer(&self, thread: Option<&Thread>, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let running = thread.is_some_and(|t| self.running.contains(&t.id));
-        let will_queue = thread.is_some_and(|t| self.is_busy(t.id) || self.pending_prompts.contains_key(&t.id));
+        let running = thread.is_some_and(|t| self.s().running.contains(&t.id));
+        let will_queue = thread.is_some_and(|t| self.is_busy(t.id) || self.s().pending_prompts.contains_key(&t.id));
         let has_text = !self.composer.read(cx).value().trim().is_empty()
             || !self.attachments.is_empty();
         let can_send = has_text && (thread.is_some() || self.agent.is_some());
@@ -3745,12 +3508,61 @@ impl AgentPanel {
                 .text_color(theme.muted_foreground)
                 .child(t("Detecting agents…"))
                 .into_any_element(),
-            (Some(Err(err)), _) => div()
-                .px_2()
-                .text_size(TEXT)
-                .text_color(theme.danger)
-                .child(tf("Agents unavailable: {error}", &[("error", err.to_string())]))
-                .into_any_element(),
+            // Short where the agent goes; the reason, and a retry, on click.
+            (Some(Err(err)), _) => {
+                let error: SharedString = display_error(err).into();
+                let retry = entity.clone();
+                Popover::new("agents-error")
+                    .anchor(Anchor::BottomLeft)
+                    .trigger(
+                        Button::new("agents-error-button")
+                            .ghost()
+                            .small()
+                            .h(layout::CONTROL)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(layout::SPACE_2)
+                                    .text_size(TEXT)
+                                    .text_color(theme.danger)
+                                    .child(Icon::new(IconName::CircleAlert).size(ICON))
+                                    .child(t("Agents unavailable")),
+                            ),
+                    )
+                    .content(move |_, _, cx| {
+                        let retry = retry.clone();
+                        div()
+                            .w(px(360.))
+                            .p(layout::SPACE_3)
+                            .flex()
+                            .flex_col()
+                            .gap(layout::SPACE_2)
+                            .child(
+                                div()
+                                    .text_size(TEXT)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(t("Agents unavailable")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(TEXT)
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(error.clone()),
+                            )
+                            .child(
+                                div().flex().justify_end().child(
+                                    Button::new("agents-retry")
+                                        .small()
+                                        .app_label(t("Try again"))
+                                        .on_click(move |_, _, cx| {
+                                            retry.update(cx, |panel, cx| panel.retry_agents(cx)).ok();
+                                        }),
+                                ),
+                            )
+                    })
+                    .into_any_element()
+            }
             (Some(Ok(_)), None) => div()
                 .px_2()
                 .text_size(TEXT)
@@ -3820,7 +3632,6 @@ impl AgentPanel {
         let branch = branch.map(|branch| {
             self.context_label("branch", IconName::GitBranch, branch, Some(t("Current branch").into()), cx)
         });
-        let can_attach = !remote;
 
         let access = self.access.clone();
         let access_picker = Button::new("access-picker")
@@ -3898,6 +3709,46 @@ impl AgentPanel {
                         .gap(layout::SPACE_2)
                         .children(self.attachments.iter().enumerate().map(|(ix, path)| {
                             let open_path = path.clone();
+                            let remove = cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.remove_attachment(ix, cx)
+                            });
+                            // A file that is not an image: a compact chip,
+                            // its name and an × always there.
+                            if !is_image_path(path) {
+                                return div()
+                                    .id(("attachment", ix))
+                                    .h(px(32.))
+                                    .max_w(px(240.))
+                                    .pl(layout::SPACE_2)
+                                    .pr(px(4.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .rounded(layout::RADIUS)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.secondary)
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(theme.secondary_hover))
+                                    .child(file_label(path, &theme))
+                                    .child(
+                                        div()
+                                            .id(("remove-attachment", ix))
+                                            .flex_none()
+                                            .size(px(20.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(4.))
+                                            .text_color(theme.muted_foreground)
+                                            .hover(|this| this.bg(theme.foreground.opacity(0.08)).text_color(theme.foreground))
+                                            .child(Icon::new(IconName::X).size(px(12.)))
+                                            .on_click(remove),
+                                    )
+                                    .on_click(move |_, _, cx| cx.open_with_system(&open_path))
+                                    .into_any_element();
+                            }
                             div()
                                 .id(("attachment", ix))
                                 .group("attachment")
@@ -3929,11 +3780,9 @@ impl AgentPanel {
                                                 .size(ICON)
                                                 .text_color(theme.background),
                                         )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.remove_attachment(ix, cx)
-                                        })),
+                                        .on_click(remove),
                                 )
+                                .into_any_element()
                         })),
                 )
             })
@@ -3966,14 +3815,23 @@ impl AgentPanel {
                     // (Not down: the round send button on the right is drawn
                     // to its edge and already keeps the box's padding.)
                     .ml(px(-5.))
-                    .when(can_attach, |this| {
-                        this.child(
-                            crate::style::chrome_button("attach")
-                                .app_icon(IconName::Paperclip)
-                                .text_color(theme.muted_foreground)
-                                .on_click(cx.listener(|this, _, window, cx| this.attach_images(window, cx)))
-                                .app_tooltip(t("Attach images")),
-                        )
+                    // One "+" in every composer; what it adds is in its menu.
+                    // Files for an agent on another machine are copied there
+                    // when the message is sent.
+                    .child({
+                        let panel = cx.entity().downgrade();
+                        crate::style::chrome_button("composer-add")
+                            .app_icon(IconName::Plus)
+                            .text_color(theme.muted_foreground)
+                            .dropdown_menu(move |menu, _, _| {
+                                let panel = panel.clone();
+                                menu.item(
+                                    crate::style::menu_item_with_icon(t("Upload attachment"), IconName::Paperclip)
+                                        .on_click(move |_, window, cx| {
+                                            panel.update(cx, |this, cx| this.attach_images(window, cx)).ok();
+                                        }),
+                                )
+                            })
                     })
                     .child(div().flex_1())
                     .when(will_queue && can_send, |this| {
@@ -4017,7 +3875,8 @@ impl AgentPanel {
     }
 
     fn render_pending_prompts(&self, id: u64, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let prompts = self.pending_prompts.get(&id)?;
+        let shared = self.s();
+        let prompts = shared.pending_prompts.get(&id)?;
         let theme = cx.theme().clone();
         let can_steer = self.can_steer(id);
         Some(
@@ -4050,11 +3909,17 @@ impl AgentPanel {
                         .when(index > 0, |row| row.border_t_1().border_color(theme.border))
                         .text_size(TEXT)
                         .children(prompt.message.images.iter().take(3).map(|path| {
-                            img(path.clone())
-                                .size(px(24.))
-                                .flex_none()
-                                .rounded(layout::RADIUS)
-                                .object_fit(ObjectFit::Cover)
+                            if is_image_path(path) {
+                                img(path.clone())
+                                    .size(px(24.))
+                                    .flex_none()
+                                    .rounded(layout::RADIUS)
+                                    .object_fit(ObjectFit::Cover)
+                                    .into_any_element()
+                            } else {
+                                Icon::new(IconName::FileText).size(ICON).flex_none()
+                                    .text_color(theme.muted_foreground).into_any_element()
+                            }
                         }))
                         .when(prompt.message.images.len() > 3, |row| {
                             row.child(div().flex_none().child(format!("+{}", prompt.message.images.len() - 3)))
@@ -4084,7 +3949,7 @@ impl AgentPanel {
                                 .on_click(cx.listener({
                                     let turn_id = turn_id.clone();
                                     move |this, _, _, cx| {
-                                        if this.pending_prompt_mut(id, &turn_id).is_some() {
+                                        if this.sm().pending_prompt_mut(id, &turn_id).is_some() {
                                             this.dispatch_prompt(id, true, cx);
                                         }
                                     }
@@ -4522,4 +4387,60 @@ fn render_working(cx: &App) -> AnyElement {
         .child(Spinner::new().with_size(crate::style::size::icon_pixels(cx)).color(theme.primary))
         .child(t("Working"))
         .into_any_element()
+}
+
+/// A thread's menu: its row's right-click, and the "…" its row shows on hover.
+fn thread_menu(
+    panel: WeakEntity<AgentPanel>,
+    id: u64,
+    settled: bool,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, _, _| {
+        let (new_tab, settle, delete) = (panel.clone(), panel.clone(), panel.clone());
+        menu.item(crate::style::menu_item(t("Open in New Tab")).on_click(move |_, window, cx| {
+            new_tab.update(cx, |this, cx| this.open_in_new_tab(id, window, cx)).ok();
+        }))
+        .separator()
+        .item(
+            crate::style::menu_item(t(if settled { "Unarchive" } else { "Archive" })).on_click(move |_, _, cx| {
+                settle.update(cx, |this, cx| this.set_settled(id, !settled, cx)).ok();
+            }),
+        )
+        .separator()
+        .item(crate::style::menu_item(t("Delete…")).on_click(move |_, window, cx| {
+            delete.update(cx, |this, cx| this.confirm_delete(id, window, cx)).ok();
+        }))
+    }
+}
+
+/// An attached file that is not an image: its icon and name.
+fn file_label(path: &std::path::Path, theme: &gpui_kit::component::Theme) -> Div {
+    let name = attachment_name(path);
+    div()
+        .h_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(layout::SPACE_2)
+        .text_size(TEXT)
+        .text_color(theme.foreground)
+        .child(Icon::new(IconName::FileText).size(ICON).flex_none().text_color(theme.muted_foreground))
+        .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(name))
+}
+
+/// A file's name, short: a name that holds a path (a `:` in it is a `/` in
+/// Finder, "/Users/…/BIR_FORM_USA.docx") shows its last part, and a long one
+/// is shortened in the middle so its end and extension still show.
+fn attachment_name(path: &std::path::Path) -> String {
+    const HEAD: usize = 8;
+    const TAIL: usize = 18;
+    let full = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = full.rsplit(':').find(|part| !part.is_empty()).unwrap_or(&full).to_string();
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= HEAD + TAIL + 1 {
+        return name;
+    }
+    let head: String = chars[..HEAD].iter().collect();
+    let tail: String = chars[chars.len() - TAIL..].iter().collect();
+    format!("{head}…{tail}")
 }

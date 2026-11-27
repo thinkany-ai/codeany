@@ -46,6 +46,8 @@ fn friendly_error(device: &str, raw: &str) -> String {
 
 pub enum WorkspaceMenuEvent {
     Activate(String),
+    /// Show the workspace in a window of its own.
+    OpenInNewWindow(String),
     Create { title: String, icon: Option<String>, device: Option<(String, String)> },
     Edit { id: String, title: String, icon: Option<String> },
     Delete(String),
@@ -73,6 +75,8 @@ enum Mode {
 pub struct WorkspaceMenu {
     workspaces: Vec<Workspace>,
     active: Option<String>,
+    /// The workspaces other windows show.
+    elsewhere: Vec<String>,
     devices: Vec<MenuDevice>,
     mode: Mode,
     name: Entity<InputState>,
@@ -121,6 +125,7 @@ impl WorkspaceMenu {
         Self {
             workspaces: Vec::new(),
             active: None,
+            elsewhere: Vec::new(),
             devices: Vec::new(),
             mode: Mode::List,
             name,
@@ -130,9 +135,18 @@ impl WorkspaceMenu {
     }
 
     /// What to show as the menu opens.
-    pub fn open(&mut self, workspaces: Vec<Workspace>, active: Option<String>, devices: Vec<MenuDevice>, cx: &mut Context<Self>) {
+    /// `elsewhere`: the workspaces other windows show.
+    pub fn open(
+        &mut self,
+        workspaces: Vec<Workspace>,
+        active: Option<String>,
+        elsewhere: Vec<String>,
+        devices: Vec<MenuDevice>,
+        cx: &mut Context<Self>,
+    ) {
         self.workspaces = workspaces;
         self.active = active;
+        self.elsewhere = elsewhere;
         self.devices = devices;
         self.mode = Mode::List;
         cx.notify();
@@ -221,12 +235,13 @@ impl WorkspaceMenu {
         for (ix, w) in self.workspaces.iter().enumerate() {
             let deletable = Workspace::deletable(&self.workspaces, &w.id);
             let active = self.active.as_ref() == Some(&w.id);
+            let elsewhere = self.elsewhere.contains(&w.id);
             let device = w.device.as_ref().map(|id| {
                 let found = self.devices.iter().find(|d| &d.id == id);
                 let name = found.map(|d| d.name.clone()).or(w.device_name.clone()).unwrap_or_else(|| id.clone());
                 (name, found.is_some_and(|d| d.online))
             });
-            let (pick, edit, delete) = (w.id.clone(), w.id.clone(), w.id.clone());
+            let (pick, edit, delete, detach) = (w.id.clone(), w.id.clone(), w.id.clone(), w.id.clone());
             list = list.child(
                 div()
                     .id(("workspace", ix))
@@ -264,6 +279,19 @@ impl WorkspaceMenu {
                             .items_center()
                             .invisible()
                             .group_hover("workspace-row", |this| this.visible())
+                            .when(!active && !elsewhere, |this| {
+                                this.child(
+                                    Button::new(("window-workspace", ix))
+                                        .ghost()
+                                        .xsmall()
+                                        .app_icon(IconName::ExternalLink)
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(WorkspaceMenuEvent::OpenInNewWindow(detach.clone()));
+                                        }))
+                                        .app_tooltip(t("Open in New Window")),
+                                )
+                            })
                             .child(
                                 Button::new(("edit-workspace", ix))
                                     .ghost()
@@ -292,7 +320,9 @@ impl WorkspaceMenu {
                         div()
                             .flex_none()
                             .size(ICON)
-                            .when(active, |this| this.child(Icon::new(IconName::Check).size(ICON).text_color(theme.primary))),
+                            .when(active, |this| this.child(Icon::new(IconName::Check).size(ICON).text_color(theme.primary)))
+                            // Shown in another window: picking it goes there.
+                            .when(elsewhere, |this| this.child(Icon::new(IconName::ExternalLink).size(ICON).text_color(theme.muted_foreground))),
                     )
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(WorkspaceMenuEvent::Activate(pick.clone())))),
             );

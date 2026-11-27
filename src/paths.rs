@@ -33,6 +33,6 @@ pub fn agent_home() -> PathBuf {
     home().join("agent")
 }
 
-fn user_home() -> PathBuf {
+pub fn user_home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
 }

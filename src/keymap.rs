@@ -76,6 +76,8 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("tab-8", "Go to tab 8", Tabs, WS, ["cmd-8"], crate::SelectTab8),
     shortcut!("tab-last", "Go to last tab", Tabs, WS, ["cmd-9"], crate::SelectLastTab),
     shortcut!("new-thread", "New thread", Workspace, WS, ["cmd-n"], crate::NewThread),
+    shortcut!("new-window", "New window", General, None, ["cmd-shift-n"], crate::NewWindow),
+    shortcut!("minimize", "Minimize window", General, None, ["cmd-m"], crate::Minimize),
     shortcut!("search", "Search", Workspace, WS, ["cmd-p"], crate::Search),
     shortcut!("open-editor", "Switch Agent / Editor", Workspace, WS, ["cmd-e"], crate::OpenEditor),
     shortcut!("surfaces", "Surfaces", Workspace, WS, ["cmd-alt-t"], crate::OpenSurface),
