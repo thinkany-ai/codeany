@@ -1188,7 +1188,9 @@ mod worktree_plan_tests {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let plan = Worktree::plan(&src, 1_700_000_123_456, "Fix the Login bug!").unwrap();
         assert_eq!(plan.branch, "codeany/fix-the-login-bug-123456");
-        assert!(plan.path.ends_with("worktrees/codeany-desktop/1700000123456"));
+        // Named after the checkout's folder, whatever it is called (CI's is `codeany`).
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).file_name().unwrap();
+        assert!(plan.path.ends_with(Path::new("worktrees").join(repo).join("1700000123456")));
         // A project below the repository's top maps to the same folder in the worktree.
         assert_eq!(plan.dir_for(&src), plan.path.join("src"));
         let plan = Worktree::plan(&src, 42, "修一下登录").unwrap();

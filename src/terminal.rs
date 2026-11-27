@@ -143,6 +143,9 @@ impl TerminalView {
             working_directory: cwd,
             drain_on_exit: false,
             env,
+            // Windows only: quote the shell's arguments, as Alacritty does by default.
+            #[cfg(windows)]
+            escape_args: true,
         };
         let pty = tty::new(&options, size.window_size(), 0)?;
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
