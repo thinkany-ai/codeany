@@ -1,6 +1,6 @@
 [package]
 name = "codeany"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "A local-first coding agent"
 license = "AGPL-3.0-only"
@@ -53,7 +53,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-agl = { git = "https://github.com/thinkany-ai/agl", tag = "v0.3.20" }
+agl = { git = "https://github.com/thinkany-ai/agl", tag = "v0.3.22" }
 nex = { git = "https://github.com/thinkany-ai/nex", rev = "12ea252" }
 tokio-tungstenite = "0.26"
 tokio-util = "0.7"
