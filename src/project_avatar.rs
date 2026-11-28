@@ -7,7 +7,9 @@ use std::{
     sync::Arc,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gpui_kit::*;
+use crate::threads::ProjectIcon;
 use gpui_kit::component::ActiveTheme as _;
 use resvg::{tiny_skia, usvg};
 
@@ -31,13 +33,47 @@ impl Asset for ProjectLogo {
 }
 
 fn load_logo(path: &Path, format: ImageFormat) -> Option<Arc<RenderImage>> {
-    let mut pixels = decode_logo(path, format)?;
+    Some(render_image(decode_logo(path, format)?))
+}
+
+fn render_image(mut pixels: image::RgbaImage) -> Arc<RenderImage> {
     // GPUI textures use BGRA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
     let frames = smallvec::SmallVec::from_buf([image::Frame::new(pixels)]);
-    Some(Arc::new(RenderImage::new(frames)))
+    Arc::new(RenderImage::new(frames))
+}
+
+pub fn import_icon(path: &Path) -> Option<ProjectIcon> {
+    let format = match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => ImageFormat::Png,
+        "jpg" | "jpeg" => ImageFormat::Jpeg,
+        "webp" => ImageFormat::Webp,
+        "svg" => ImageFormat::Svg,
+        _ => return None,
+    };
+    let pixels = decode_logo(path, format)?;
+    let mut png = Vec::new();
+    pixels.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    Some(ProjectIcon::Png(STANDARD.encode(png)))
+}
+
+struct CustomProjectImage;
+
+impl Asset for CustomProjectImage {
+    type Source = String;
+    type Output = Option<Arc<RenderImage>>;
+
+    fn load(png: String, _: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
+        async move {
+            if png.len() > 64 * 1024 {
+                return None;
+            }
+            let pixels = decode_raster(STANDARD.decode(png).ok()?, ImageFormat::Png)?;
+            Some(render_image(pixels))
+        }
+    }
 }
 
 /// The project's logo as the sidebar shows it, encoded as a PNG: what another
@@ -231,16 +267,26 @@ fn logo_candidates(project: &Path) -> Vec<(PathBuf, ImageFormat)> {
 pub struct ProjectAvatar {
     pub project: PathBuf,
     pub name: SharedString,
+    pub icon: Option<ProjectIcon>,
+    pub size: Option<Rems>,
 }
 
 impl RenderOnce for ProjectAvatar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let size = avatar_size(cx);
-        if let Some(Some(logo)) = window.use_asset::<ProjectLogo>(&self.project, cx) {
+        let size = self.size.map_or_else(|| avatar_size(cx), |size| size.to_pixels(cx.theme().font_size));
+        let logo = match self.icon {
+            Some(ProjectIcon::Emoji(emoji)) => {
+                return div().size(size).flex_none().flex().items_center().justify_center()
+                    .text_size(size * 0.72).line_height(size).child(emoji).into_any_element();
+            }
+            Some(ProjectIcon::Png(png)) => window.use_asset::<CustomProjectImage>(&png, cx).flatten(),
+            None => window.use_asset::<ProjectLogo>(&self.project, cx).flatten(),
+        };
+        if let Some(logo) = logo {
             return img(logo)
                 .size(size)
                 .flex_none()
-                .rounded(px(5.))
+                .rounded((size * 0.23).min(px(5.)))
                 .object_fit(ObjectFit::Contain)
                 .into_any_element();
         }
@@ -287,7 +333,7 @@ fn render_initials(name: &str, size: Pixels) -> AnyElement {
     div()
         .flex_none()
         .size(size)
-        .rounded(px(5.))
+        .rounded((size * 0.23).min(px(5.)))
         .bg(bg)
         .flex()
         .items_center()

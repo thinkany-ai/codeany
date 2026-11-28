@@ -43,6 +43,7 @@ pub struct FileTree {
     /// The device `root` is on; `None` is this one.
     machine: Option<String>,
     root: Option<PathBuf>,
+    title_project: Option<PathBuf>,
     /// Why the root's folder on another device is not listed (yet).
     notice: Option<SharedString>,
     /// Bumped whenever the root changes, so a late listing of the old one
@@ -129,6 +130,7 @@ impl FileTree {
         Self {
             machine: None,
             root: None,
+            title_project: None,
             notice: None,
             generation: 0,
             children: HashMap::new(),
@@ -138,6 +140,13 @@ impl FileTree {
             git: RepoSnapshot::default(),
             scroll_handle: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
+        }
+    }
+
+    pub fn set_title_project(&mut self, project: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.title_project != project {
+            self.title_project = project;
+            cx.notify();
         }
     }
 
@@ -466,10 +475,10 @@ impl Render for FileTree {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let title: SharedString = self
-            .root
-            .as_ref()
-            .and_then(|root| root.file_name())
-            .map(|name| name.to_string_lossy().to_uppercase())
+            .title_project
+            .as_deref()
+            .or(self.root.as_deref())
+            .map(crate::threads::project_label)
             .unwrap_or_else(|| t("NO FOLDER").into())
             .into();
 
@@ -478,7 +487,6 @@ impl Render for FileTree {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme.sidebar)
             .child(
                 div()
                     .h(px(32.))
@@ -489,7 +497,7 @@ impl Render for FileTree {
                     .text_size(TEXT)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.muted_foreground)
-                    .child(title),
+                    .child(div().min_w_0().truncate().child(title)),
             )
             .when_some(self.notice.clone().filter(|_| self.rows.is_empty()), |this, notice| {
                 this.child(div().px_3().py_2().text_size(TEXT).text_color(theme.muted_foreground).child(notice))

@@ -38,13 +38,16 @@ pub enum ProjectFilterEvent {
     Pick(ProjectSelection),
     /// Sort by name (true) or by last activity.
     SortByName(bool),
+    FlatByTime(bool),
 }
 
 pub struct ProjectFilter {
     input: Entity<InputState>,
     projects: Vec<PathBuf>,
+    icons: std::collections::HashMap<PathBuf, crate::threads::ProjectIcon>,
     selected: ProjectSelection,
     by_name: bool,
+    flat: bool,
     _subscription: Subscription,
 }
 
@@ -69,21 +72,25 @@ impl ProjectFilter {
             }
             _ => {}
         });
-        Self { input, projects: Vec::new(), selected: ProjectSelection::All, by_name: false, _subscription }
+        Self { input, projects: Vec::new(), icons: Default::default(), selected: ProjectSelection::All, by_name: false, flat: false, _subscription }
     }
 
     /// What to list as the menu opens: a fresh search, focused.
     pub fn open(
         &mut self,
         projects: Vec<PathBuf>,
+        icons: std::collections::HashMap<PathBuf, crate::threads::ProjectIcon>,
         selected: ProjectSelection,
         by_name: bool,
+        flat: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.projects = projects;
+        self.icons = icons;
         self.selected = selected;
         self.by_name = by_name;
+        self.flat = flat;
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -159,7 +166,7 @@ impl Render for ProjectFilter {
             let pick = project.clone();
             list = list.child(
                 row(("project-filter", ix).into(), selected)
-                    .child(ProjectAvatar { project: project.clone(), name: label.clone() })
+                    .child(ProjectAvatar { project: project.clone(), name: label.clone(), icon: self.icons.get(&project).cloned(), size: None })
                     .child(
                         div()
                             .flex_1()
@@ -184,6 +191,26 @@ impl Render for ProjectFilter {
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(ProjectFilterEvent::Pick(ProjectSelection::ChatsOnly)))),
             );
         }
+
+        let display = div()
+            .pt(layout::SPACE_1)
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(div().px(layout::SPACE_2).py(px(4.)).text_size(TEXT)
+                .text_color(theme.muted_foreground).child(t("Display mode")))
+            .children([("Grouped by project", false), ("In one list, by time", true)].into_iter().map(|(label, value)| {
+                row(("project-layout", usize::from(value)).into(), false)
+                    .child(div().flex_1().child(t(label)))
+                    .child(check(self.flat == value))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.flat = value;
+                        cx.emit(ProjectFilterEvent::FlatByTime(value));
+                        cx.notify();
+                    }))
+            }));
 
         let sort = div()
             .mt(layout::SPACE_1)
@@ -234,6 +261,7 @@ impl Render for ProjectFilter {
                     ),
             )
             .child(list)
-            .child(sort)
+            .child(display)
+            .when(!self.flat, |this| this.child(sort))
     }
 }

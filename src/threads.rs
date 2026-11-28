@@ -755,6 +755,8 @@ pub struct Store {
     /// The interface language's tag, or `None` to follow the system.
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub flat_project_threads: bool,
     /// Each project's row of open tabs.
     #[serde(default)]
     pub tabs: Vec<crate::chat_tabs::TabSet>,
@@ -801,11 +803,19 @@ pub struct Workspace {
     /// shows its folder's.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub project_names: HashMap<PathBuf, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub project_icons: HashMap<PathBuf, ProjectIcon>,
     /// Projects removed from the list. Their folders and conversations are
     /// kept, so a folder is not listed again just for the threads that
     /// worked in it, until it is added back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_projects: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProjectIcon {
+    Emoji(String),
+    Png(String),
 }
 
 /// Every named project's name, by folder, for whatever shows a project:
@@ -839,6 +849,7 @@ impl Workspace {
     pub fn remove_project(&mut self, project: &std::path::Path) {
         self.projects.retain(|p| p != project);
         self.project_names.remove(project);
+        self.project_icons.remove(project);
         if !self.removed_projects.iter().any(|p| p == project) {
             self.removed_projects.push(project.to_path_buf());
         }
@@ -858,6 +869,7 @@ impl Workspace {
             device_name,
             projects: Vec::new(),
             project_names: HashMap::new(),
+            project_icons: HashMap::new(),
             removed_projects: Vec::new(),
         }
     }
@@ -960,6 +972,7 @@ impl Default for Store {
             machine: None,
             tabs: Vec::new(),
             language: None,
+            flat_project_threads: false,
             agent_args: HashMap::new(),
             enabled_agents: default_enabled_agents(),
             remote_dirs: Default::default(),
@@ -1078,6 +1091,7 @@ impl Store {
                 machine: db.setting("machine").flatten(),
                 tabs: db.setting("tabs").unwrap_or_default(),
                 language: db.setting("language").flatten(),
+                flat_project_threads: db.setting("flat_project_threads").unwrap_or_default(),
                 agent_args: db.setting("agent_args").unwrap_or_default(),
                 enabled_agents: db.setting("enabled_agents").unwrap_or_else(default_enabled_agents),
                 remote_dirs: db.setting("remote_dirs").unwrap_or_default(),
@@ -1133,6 +1147,7 @@ impl Store {
         db.set_setting("machine", &self.machine);
         db.set_setting("tabs", &self.tabs);
         db.set_setting("language", &self.language);
+        db.set_setting("flat_project_threads", &self.flat_project_threads);
         db.set_setting("agent_args", &self.agent_args);
         db.set_setting("enabled_agents", &self.enabled_agents);
         db.set_setting("remote_dirs", &self.remote_dirs);

@@ -51,6 +51,7 @@ pub mod layout {
     pub const SIDEBAR_ROW_INSET: Pixels = px(10.);
     pub const SIDEBAR_NAV_ROW: Pixels = px(32.);
     pub const CONTENT_MAX: Pixels = px(720.);
+    pub const NEW_CHAT_COMPOSER_MAX: Pixels = px(720.);
 }
 
 /// A borderless icon button in the window chrome; they all share one size.

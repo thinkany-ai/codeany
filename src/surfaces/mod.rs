@@ -29,6 +29,8 @@ pub struct SurfaceContext {
     pub machine: Option<String>,
     /// The open project, if any.
     pub project: Option<PathBuf>,
+    /// The named project folder, before resolving a conversation’s worktree.
+    pub project_folder: Option<PathBuf>,
     /// The project's git work tree, if it is in one.
     pub git_root: Option<PathBuf>,
 }

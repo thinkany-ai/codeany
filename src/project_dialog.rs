@@ -20,7 +20,8 @@ use crate::i18n::{t, tf};
 use crate::agl_bridge;
 use crate::style::layout;
 use crate::style::size::{ICON, TEXT};
-use crate::threads::folder_label;
+use crate::threads::{ProjectIcon, folder_label};
+use crate::project_avatar::ProjectAvatar;
 
 pub const WIDTH: f32 = 480.;
 
@@ -36,7 +37,7 @@ pub struct DialogDevice {
 pub enum ProjectDialogEvent {
     /// Make a project called `name` of `folder` on `device` (`None`: this one).
     Create { name: String, device: Option<String>, folder: PathBuf },
-    Rename { project: PathBuf, name: String },
+    Rename { project: PathBuf, name: String, icon: Option<ProjectIcon> },
     Cancel,
 }
 
@@ -44,6 +45,9 @@ pub struct ProjectDialog {
     name: Entity<InputState>,
     /// The project being renamed; `None` while making one.
     renaming: Option<PathBuf>,
+    icon: Option<ProjectIcon>,
+    importing_icon: bool,
+    icon_error: bool,
     devices: Vec<DialogDevice>,
     device: Option<String>,
     folder: Option<PathBuf>,
@@ -60,13 +64,13 @@ impl ProjectDialog {
     pub fn new(
         devices: Vec<DialogDevice>,
         device: Option<String>,
-        renaming: Option<(PathBuf, String)>,
+        renaming: Option<(PathBuf, String, Option<ProjectIcon>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let name = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder(t("Project name"));
-            if let Some((_, current)) = &renaming {
+            if let Some((_, current, _)) = &renaming {
                 input.set_value(current.clone(), window, cx);
             }
             input
@@ -79,7 +83,10 @@ impl ProjectDialog {
         });
         Self {
             name,
-            renaming: renaming.map(|(project, _)| project),
+            icon: renaming.as_ref().and_then(|(_, _, icon)| icon.clone()),
+            importing_icon: false,
+            icon_error: false,
+            renaming: renaming.map(|(project, _, _)| project),
             devices,
             device,
             folder: None,
@@ -104,6 +111,7 @@ impl ProjectDialog {
     /// Whether there is enough to go on: a name to rename to, a folder for
     /// a new project.
     fn ready(&self, cx: &App) -> bool {
+        if self.importing_icon { return false; }
         match self.renaming {
             Some(_) => self.title(cx).is_some(),
             None => self.folder.is_some(),
@@ -111,9 +119,10 @@ impl ProjectDialog {
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
+        if !self.ready(cx) { return; }
         let Some(name) = self.title(cx) else { return };
         match (self.renaming.clone(), self.folder.clone()) {
-            (Some(project), _) => cx.emit(ProjectDialogEvent::Rename { project, name }),
+            (Some(project), _) => cx.emit(ProjectDialogEvent::Rename { project, name, icon: self.icon.clone() }),
             (None, Some(folder)) => cx.emit(ProjectDialogEvent::Create { name, device: self.device.clone(), folder }),
             // A project is a folder: there is none to make yet.
             (None, None) => {}
@@ -182,6 +191,72 @@ impl ProjectDialog {
             .find(|d| d.id == self.device)
             .map(|d| d.name.clone())
             .unwrap_or_else(crate::remote::this_name)
+    }
+
+    fn choose_icon_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.importing_icon = true;
+        self.icon_error = false;
+        cx.notify();
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(t("Choose image…").into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let path = match paths.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let selected = path.is_some();
+            let icon = match path {
+                Some(path) => cx.background_executor()
+                    .spawn(async move { crate::project_avatar::import_icon(&path) }).await,
+                None => None,
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.importing_icon = false;
+                this.icon_error = selected && icon.is_none();
+                if icon.is_some() { this.icon = icon; }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn render_icon(&self, project: PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
+        let name = self.title(cx).unwrap_or_else(|| folder_label(&project));
+        div().flex().flex_col().gap(layout::SPACE_2)
+            .child(div().flex().items_center().gap(layout::SPACE_2)
+                .child(ProjectAvatar { project, name: name.into(), icon: self.icon.clone(), size: None })
+                .child(Button::new("project-emoji").ghost().disabled(self.importing_icon).app_label(t("Emoji"))
+                    .dropdown_menu(move |menu, _, _| {
+                        ["📁", "💻", "🚀", "🛠️", "🎨", "📚", "🧪", "🌱", "⭐", "💡"]
+                            .into_iter().fold(menu, |menu, emoji| {
+                                let panel = panel.clone();
+                                menu.item(crate::style::menu_item(emoji).on_click(move |_, _, cx| {
+                                    let _ = panel.update(cx, |this, cx| {
+                                        this.icon = Some(ProjectIcon::Emoji(emoji.into()));
+                                        this.icon_error = false;
+                                        cx.notify();
+                                    });
+                                }))
+                            })
+                    }))
+                .child(Button::new("project-image").ghost().disabled(self.importing_icon).app_label(t("Choose image…"))
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_icon_image(window, cx))))
+                .when(self.icon.is_some(), |this| this.child(
+                    Button::new("reset-project-icon").ghost().disabled(self.importing_icon).app_label(t("Reset icon"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.icon = None;
+                            this.icon_error = false;
+                            cx.notify();
+                        })),
+                )))
+            .when(self.icon_error, |this| this.child(
+                div().text_size(TEXT).text_color(cx.theme().danger)
+                    .child(t("Choose a PNG, JPEG, WebP or SVG image up to 4 MB.")),
+            ))
     }
 
     fn render_folder(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -295,7 +370,10 @@ impl Render for ProjectDialog {
             .flex()
             .flex_col()
             .gap(layout::SPACE_2)
-            .child(label("Project name"))
+            .when_some(self.renaming.clone(), |this, project| {
+                this.child(label("Project icon")).child(self.render_icon(project, cx))
+            })
+            .child(label("Project name").when(!creating, |label| label.mt(layout::SPACE_2)))
             .child(Input::new(&self.name).text_size(TEXT))
             .when_some(suggested, |this, name| {
                 this.child(

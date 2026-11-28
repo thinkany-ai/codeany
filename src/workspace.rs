@@ -9,6 +9,7 @@ use std::{
 
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, kbd::Kbd,
+    popover::Popover,
     button::{Button, ButtonVariants as _},
     input::{Editor, EditorState, Input, InputEvent, InputState},
     menu::ContextMenuExt as _,
@@ -26,7 +27,7 @@ use crate::{
     SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, OpenSettings, OpenSurface, RefreshProject, Save, Search,
     OpenEditor, ToggleGitPanel, ToggleSidebar, ToggleTerminal,
     agent_panel::{AgentPanel, AgentPanelEvent},
-    search_palette::{self, Badge, SearchPalette, SearchPaletteEvent, Target},
+    search_palette::{self, SearchPalette, SearchPaletteEvent, Target},
     file_tree::{FileTree, FileTreeEvent},
     git::{self, RepoSnapshot},
     surface_host::{SurfaceHost, SurfaceHostEvent},
@@ -42,7 +43,6 @@ const SIDEBAR_DEFAULT: Pixels = px(260.);
 const SIDEBAR_MIN: Pixels = px(220.);
 const SIDEBAR_MAX: Pixels = px(600.);
 const CONVERSATION_MIN: Pixels = px(420.);
-const CONVERSATION_MAX: Pixels = px(1440.);
 const SURFACES_DEFAULT: Pixels = px(360.);
 const SURFACES_MIN: Pixels = px(300.);
 const SURFACES_MAX: Pixels = px(720.);
@@ -184,6 +184,9 @@ pub struct Workspace {
     tabs: Vec<EditorTab>,
     active_tab: Option<usize>,
     git: RepoSnapshot,
+    overview_open: bool,
+    overview_git: Option<((Option<String>, PathBuf), Option<RepoSnapshot>)>,
+    overview_poll: Option<Task<()>>,
     show_sidebar: bool,
     sidebar_width: Pixels,
     surfaces_width: Pixels,
@@ -299,13 +302,17 @@ impl Workspace {
     /// An editor window for `root`. It shares the main window's agent panel
     /// (for settings and the search palette) without showing or steering it.
     fn new_editor(
+        machine: Option<String>,
         root: Option<PathBuf>,
         main_window: (AnyWindowHandle, WeakEntity<Workspace>),
         agent_panel: Entity<AgentPanel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let this = Self::build(root, Mode::Editor, agent_panel, Some(main_window), window, cx);
+        let mut this = Self::build(None, Mode::Editor, agent_panel, Some(main_window), window, cx);
+        if root.is_some() {
+            this.set_location(machine, root, window, cx);
+        }
         this.focus_handle.focus(window, cx);
         this
     }
@@ -319,14 +326,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let file_tree = cx.new(FileTree::new);
-        let surfaces = cx.new(SurfaceHost::new);
+        let surfaces = cx.new(|cx| SurfaceHost::new(mode == Mode::Agent, cx));
 
         let mut subscriptions = vec![
             cx.subscribe_in(
                 &file_tree,
                 window,
                 |this, _, event: &FileTreeEvent, window, cx| match event {
-                    FileTreeEvent::OpenFile(path) => this.open_file(None, path.clone(), window, cx),
+                    FileTreeEvent::OpenFile(path) => {
+                        let machine = this.remote.as_ref().map(|(machine, _)| machine.clone());
+                        this.open_file(machine, path.clone(), window, cx);
+                    }
                 },
             ),
             cx.subscribe_in(&surfaces, window, |this, _, event: &SurfaceHostEvent, window, cx| match event {
@@ -376,6 +386,9 @@ impl Workspace {
             tabs: Vec::new(),
             active_tab: None,
             git: RepoSnapshot::default(),
+            overview_open: false,
+            overview_git: None,
+            overview_poll: None,
             show_sidebar: true,
             sidebar_width: SIDEBAR_DEFAULT,
             surfaces_width: SURFACES_DEFAULT,
@@ -401,11 +414,19 @@ impl Workspace {
     /// Point the surfaces at what the window shows: the conversation's
     /// folder on its device, or this one's project.
     fn sync_surfaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (machine, dir) = match self.remote.clone() {
-            Some((machine, dir)) => (Some(machine), dir),
-            None => (None, self.shown_dir()),
+        let (machine, dir) = self.conversation_location();
+        let project = match self.mode {
+            Mode::Agent => self.agent_panel.read(cx).conversation_project(),
+            Mode::Editor => self.root.clone(),
         };
-        self.surfaces.update(cx, |surfaces, cx| surfaces.set_location(machine, dir, window, cx));
+        self.surfaces.update(cx, |surfaces, cx| surfaces.set_location(machine, dir, project, window, cx));
+    }
+
+    fn conversation_location(&self) -> (Option<String>, Option<PathBuf>) {
+        match &self.remote {
+            Some((machine, dir)) => (Some(machine.clone()), dir.clone()),
+            None => (None, self.shown_dir()),
+        }
     }
 
     /// The folder the file tree, surfaces and git status show.
@@ -424,18 +445,25 @@ impl Workspace {
     }
 
     fn set_root(&mut self, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_location(None, root, window, cx);
+    }
+
+    fn set_location(&mut self, machine: Option<String>, root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Editor {
+            self.remote = machine.as_ref().map(|id| (id.clone(), root.clone()));
+        }
         self.root = root.clone();
         self.work_dir = None;
         self.tabs.clear();
         self.active_tab = None;
         self.git = RepoSnapshot::default();
         self.file_tree
-            .update(cx, |tree, cx| tree.set_root(root.clone(), cx));
-        self.sync_surfaces(window, cx);
+            .update(cx, |tree, cx| tree.set_location(machine.clone(), root.clone(), cx));
         if self.mode == Mode::Agent {
             self.agent_panel
                 .update(cx, |panel, cx| panel.set_project(root.clone(), cx));
         }
+        self.sync_surfaces(window, cx);
 
         let app = match self.mode {
             Mode::Agent => "CodeAny",
@@ -458,13 +486,14 @@ impl Workspace {
                     // read here, off the UI thread, with the git status.
                     let dirs = this
                         .read_with(cx, |this, cx| {
-                            (this.mode == Mode::Editor).then(|| this.file_tree.read(cx).loaded_dirs())
+                            (this.mode == Mode::Editor && machine.is_none()).then(|| this.file_tree.read(cx).loaded_dirs())
                         })
                         .ok()
                         .flatten();
+                    let machine = machine.clone();
                     let (snapshot, listing) = cx
                         .background_executor()
-                        .spawn(async move { (git::snapshot(None, &root), dirs.map(FileTree::read_dirs)) })
+                        .spawn(async move { (git::snapshot(machine.as_deref(), &root), dirs.map(FileTree::read_dirs)) })
                         .await;
                     let alive = this.update_in(cx, |this, window, cx| {
                         this.apply_snapshot(snapshot.unwrap_or_default(), listing, window, cx);
@@ -1032,6 +1061,9 @@ impl Workspace {
                     self.set_root(project.clone(), window, cx);
                 }
             }
+            AgentPanelEvent::OpenProjectInEditor { machine, project } => {
+                self.show_editor_window(machine.clone(), Some(project.clone()), true, window, cx);
+            }
             AgentPanelEvent::OpenSettings => self.open_settings(&OpenSettings, window, cx),
             AgentPanelEvent::TurnFinished => {
                 self.file_tree.update(cx, |tree, cx| tree.refresh(cx));
@@ -1057,26 +1089,49 @@ impl Workspace {
 
     /// Bring up this project's editor window, opening it when there is none.
     fn ensure_editor_window(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
-        let root = self.root.clone();
+        self.show_editor_window(None, self.root.clone(), false, window, cx)
+    }
+
+    fn show_editor_window(
+        &mut self,
+        machine: Option<String>,
+        root: Option<PathBuf>,
+        exact_project: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
         if let Some((handle, editor)) = &self.editor_window
             && let Some(editor) = editor.upgrade()
         {
             let handle = *handle;
-            let root = root.clone();
-            let shown = handle.update(cx, |_, window, cx| {
-                window.activate_window();
-                editor.update(cx, |editor, cx| {
-                    // Follow the main window's project, unless that would drop unsaved edits.
-                    if editor.root != root && !editor.tabs.iter().any(|tab| tab.dirty) {
-                        editor.set_root(root, window, cx);
+            let editor_state = editor.read(cx);
+            let same_location = editor_state.conversation_location() == (machine.clone(), root.clone());
+            let dirty = editor_state.tabs.iter().any(|tab| tab.dirty);
+            if same_location || !dirty || !exact_project {
+                let shown = handle.update(cx, |_, window, cx| {
+                    window.activate_window();
+                    if !same_location && !dirty {
+                        editor.update(cx, |editor, cx| {
+                            editor.set_location(machine.clone(), root.clone(), window, cx);
+                        });
                     }
-                })
-            });
-            if shown.is_ok() {
-                return Some((handle, editor));
+                });
+                if shown.is_ok() {
+                    return Some((handle, editor));
+                }
             }
         }
 
+        self.open_editor_window(machine, root, window, cx)
+    }
+
+    fn open_editor_window(
+        &mut self,
+        machine: Option<String>,
+        root: Option<PathBuf>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(AnyWindowHandle, Entity<Workspace>)> {
         let main = (window.window_handle(), cx.entity().downgrade());
         let agent_panel = self.agent_panel.clone();
         let options = WindowOptions {
@@ -1092,7 +1147,7 @@ impl Workspace {
         };
         let (handle, editor) = gpui_kit::open_window(options, cx, move |window, cx| {
             crate::style::apply(window, cx);
-            cx.new(|cx| Workspace::new_editor(root, main, agent_panel, window, cx))
+            cx.new(|cx| Workspace::new_editor(machine, root, main, agent_panel, window, cx))
         })
         .ok()?;
         self.editor_window = Some((handle, editor.downgrade()));
@@ -1153,13 +1208,37 @@ impl Workspace {
         let command = |label: &'static str, icon: IconName, action: Box<dyn Action>| search_palette::Item {
             icon,
             label: t(label).into(),
+            agent: None,
             detail: None,
-            badge: Badge::Keys(Kbd::binding_for_action(action.as_ref(), Some("Workspace"), window)),
+            shortcut: Kbd::binding_for_action(action.as_ref(), Some("Workspace"), window),
             target: Target::Action(action),
             updated_at: 0,
         };
-        let commands = vec![
-            command("New Thread", IconName::SquarePen, Box::new(NewThread)),
+        let quick_action = |label, icon, target| search_palette::Item {
+            label,
+            icon,
+            agent: None,
+            detail: None,
+            shortcut: None,
+            target,
+            updated_at: 0,
+        };
+        let panel = self.agent_panel.read(cx);
+        let mut commands = Vec::new();
+        if let Some(project) = panel.draft_project() {
+            let mut current = command("New Thread", IconName::SquarePen, Box::new(NewThread));
+            current.label = tf("New thread in {project}", &[("project", crate::threads::project_label(&project))]);
+            commands.push(current);
+        }
+        commands.extend([
+            quick_action(t("New thread in another project…").into(), IconName::SquarePen, Target::ChooseThreadProject),
+            quick_action(t("New thread without a project").into(), IconName::MessageSquare, Target::NewThreadInProject(None)),
+            quick_action(t("New project").into(), IconName::FolderPlus, Target::NewProject),
+            command("Settings…", IconName::Settings, Box::new(OpenSettings)),
+        ]);
+        let quick_count = commands.len();
+        commands.extend([
+            quick_action(t("Change theme").into(), IconName::Palette, Target::ChangeTheme),
             command("Open Folder…", IconName::FolderOpen, Box::new(OpenFolder)),
             command("Open Editor Window", IconName::Code, Box::new(OpenEditor)),
             command("Toggle Sidebar", IconName::PanelLeft, Box::new(ToggleSidebar)),
@@ -1169,17 +1248,39 @@ impl Workspace {
             command("Save", IconName::Save, Box::new(Save)),
             command("Close Tab", IconName::X, Box::new(CloseTab)),
             command("Refresh", IconName::RefreshCw, Box::new(RefreshProject)),
-            command("Settings…", IconName::Settings, Box::new(OpenSettings)),
-        ];
-        let panel = self.agent_panel.read(cx);
-        let others = panel
-            .threads()
+        ]);
+        let threads = panel.threads();
+        let local_device = crate::remote::this_name();
+        let others = threads
             .iter()
-            .map(|t| search_palette::thread_item(t.id, &t.title, t.project.as_ref(), t.updated_at))
+            .map(|thread| {
+                let device = match thread.machine.as_deref() {
+                    Some(id) => panel.machine_name(id, thread.machine_name.as_deref()),
+                    None => local_device.clone(),
+                };
+                let project = thread.project.as_ref().map(|path| crate::threads::project_label(path));
+                let mode = project.as_ref().map(|_| {
+                    t(if thread.worktree.is_some() { "Worktree" } else { "Local" }).to_string()
+                });
+                let mut context = vec![device, project.unwrap_or_else(|| t("Chats only").into())];
+                context.extend(mode);
+                context.extend(panel.thread_branch(thread));
+                search_palette::thread_item(thread, context.join(" · "))
+            })
             .chain(panel.recent_projects().iter().map(search_palette::project_item))
             .collect();
+        drop(threads);
 
-        let palette = cx.new(|cx| SearchPalette::new(commands, others, window, cx));
+        let palette = cx.new(|cx| SearchPalette::new(commands, Some(quick_count), others, window, cx));
+        self.show_search_palette(palette, window, cx);
+    }
+
+    fn show_search_palette(
+        &mut self,
+        palette: Entity<SearchPalette>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self._palette = Some(cx.subscribe_in(&palette, window, Self::on_palette_event));
         // Where a full-height palette's top would sit when centred.
         let height = window.viewport_size().height;
@@ -1191,6 +1292,7 @@ impl Workspace {
                 .margin_top(top)
                 .p_0()
                 .close_button(false)
+                .on_ok(|_, _, _| false)
                 .child(content.clone())
         });
         // The dialog takes focus as it opens; hand it to the search box after.
@@ -1199,19 +1301,70 @@ impl Workspace {
 
     fn on_palette_event(
         &mut self,
-        _: &Entity<SearchPalette>,
+        palette: &Entity<SearchPalette>,
         event: &SearchPaletteEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let SearchPaletteEvent::Pick(target) = event;
-        // Close first: a command may open a dialog of its own.
+        // Close first: an action may open a dialog of its own.
         window.close_dialog(cx);
         self._palette = None;
+        let SearchPaletteEvent::Pick(target) = event else {
+            if let Some(previous) = palette.read(cx).previous() {
+                self.show_search_palette(previous, window, cx);
+            }
+            return;
+        };
         match target.clone() {
             Target::Action(action) => {
                 self.focus_handle.focus(window, cx);
                 window.dispatch_action(action, cx);
+            }
+            Target::ChooseThreadProject => {
+                let panel = self.agent_panel.read(cx);
+                let current = panel.draft_project();
+                let options = panel
+                    .device_projects()
+                    .into_iter()
+                    .filter(|path| Some(path) != current.as_ref())
+                    .map(|path| {
+                        let mut item = search_palette::project_item(&path);
+                        item.target = Target::NewThreadInProject(Some(path));
+                        item
+                    })
+                    .collect();
+                let new_project = search_palette::Item {
+                    icon: IconName::FolderPlus,
+                    agent: None,
+                    label: t("New project").into(),
+                    detail: None,
+                    shortcut: None,
+                    target: Target::NewProject,
+                    updated_at: 0,
+                };
+                let picker = cx.new(|cx| {
+                    SearchPalette::new(vec![new_project], None, options, window, cx)
+                        .with_previous(palette.clone())
+                });
+                self.show_search_palette(picker, window, cx);
+            }
+            Target::NewThreadInProject(project) => match self.mode {
+                Mode::Agent => self.agent_panel.update(cx, |panel, cx| {
+                    panel.new_thread_in_project(project, window, cx);
+                }),
+                Mode::Editor => self.with_main_window(cx, move |main, window, cx| {
+                    main.agent_panel.update(cx, |panel, cx| panel.new_thread_in_project(project, window, cx));
+                }),
+            },
+            Target::NewProject => match self.mode {
+                Mode::Agent => self.agent_panel.update(cx, |panel, cx| panel.open_project_dialog(None, window, cx)),
+                Mode::Editor => self.with_main_window(cx, |main, window, cx| {
+                    main.agent_panel.update(cx, |panel, cx| panel.open_project_dialog(None, window, cx));
+                }),
+            },
+            Target::ChangeTheme => {
+                self.settings.update(cx, |settings, cx| settings.show_appearance(cx));
+                self.open_settings(&OpenSettings, window, cx);
             }
             Target::Thread(id) => match self.mode {
                 Mode::Agent => self
@@ -1380,7 +1533,7 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| this.new_thread(&NewThread, window, cx)))
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&mut self, reserve_window_buttons: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let content = match self.mode {
             Mode::Agent => crate::panel_views::cached(self.sidebar_view.clone()).into_any_element(),
@@ -1400,13 +1553,6 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)))
                         .app_tooltip(t("Hide Sidebar (⌘B)")),
                 )
-                .child(
-                    chrome_button("sidebar-search")
-                        .child(crate::icons::search().size(ICON))
-                        .text_color(theme.muted_foreground)
-                        .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
-                        .app_tooltip(t("Search (⌘P)")),
-                )
                 .into_any_element(),
         };
         let sidebar = div()
@@ -1415,11 +1561,12 @@ impl Workspace {
                 div()
                     .h(layout::HEADER).flex_none().flex().items_center()
                     .pt(layout::HEADER_TOP_INSET)
-                    .pl(px(TRAFFIC_LIGHTS_WIDTH)).pr(layout::SIDEBAR_INSET)
+                    .pl(if reserve_window_buttons { px(TRAFFIC_LIGHTS_WIDTH) } else { layout::SIDEBAR_INSET })
+                    .pr(layout::SIDEBAR_INSET)
                     .child(div().flex_1().min_w_0().child(header))
                     .when(self.mode == Mode::Editor, |this| this.child(Self::drag_region("sidebar-drag"))),
             )
-            .child(
+            .when(self.mode == Mode::Agent, |this| this.child(
                 div()
                     .flex_none()
                     .px(layout::SIDEBAR_INSET)
@@ -1428,20 +1575,18 @@ impl Workspace {
                     .items_center()
                     .gap(layout::SPACE_1)
                     .child(div().flex_1().min_w_0().child(self.render_new_chat_button(cx)))
-                    .when(self.mode == Mode::Agent, |this| {
-                        this.child(
+                    .child(
                             chrome_button("sidebar-search")
                                 .child(crate::icons::search().size(ICON))
                                 .text_color(theme.muted_foreground)
                                 .accessibility_label(t("Search"))
                                 .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
-                                .app_tooltip(t("Search (⌘P)")),
-                        )
-                    }),
-            )
+                                .app_tooltip(t("Search")),
+                    ),
+            ))
             .child(div().flex_1().min_h_0().min_w_0().child(content));
 
-        sidebar.child(self.render_sidebar_footer(cx))
+        sidebar.when(self.mode == Mode::Agent, |this| this.child(self.render_sidebar_footer(cx)))
     }
 
     /// Settings and the optional app update in the sidebar footer.
@@ -1752,8 +1897,143 @@ impl Workspace {
             .child(Self::drag_region("chat-tabs-drag"))
     }
 
-    fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn set_overview_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.overview_open = open;
+        self.overview_git = None;
+        self.overview_poll = open.then(|| cx.spawn(async move |this, cx| {
+            loop {
+                let Ok((machine, dir)) = this.read_with(cx, |this, _| this.conversation_location()) else {
+                    break;
+                };
+                if let Some(dir) = dir {
+                    let target = (machine, dir);
+                    let (machine, dir) = target.clone();
+                    let snapshot = cx.background_executor()
+                        .spawn(async move { git::snapshot(machine.as_deref(), &dir) })
+                        .await;
+                    if this.update(cx, |this, cx| {
+                        let location = this.conversation_location();
+                        if location.0 == target.0 && location.1.as_ref() == Some(&target.1) {
+                            let result = Some((target, snapshot));
+                            if this.overview_git != result {
+                                this.overview_git = result;
+                                cx.notify();
+                            }
+                        }
+                    }).is_err() {
+                        break;
+                    }
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+        }));
+        cx.notify();
+    }
+
+    fn render_project_overview(&self, cx: &Context<Self>) -> impl IntoElement {
+        let workspace = cx.entity().downgrade();
+        let theme = cx.theme();
+        Popover::new("project-overview")
+            .anchor(Anchor::TopRight)
+            .open(self.overview_open)
+            .on_open_change(cx.listener(|this, open: &bool, _, cx| this.set_overview_open(*open, cx)))
+            .p_0()
+            .trigger(
+                chrome_button("project-overview-button")
+                    .child(Icon::new(IconName::SquareMenu).size(ICON))
+                    .text_color(if self.overview_open { theme.primary } else { theme.muted_foreground })
+                    .accessibility_label(t("Project Overview")),
+            )
+            .content(move |_, _, cx| {
+                workspace.read_with(cx, |this, cx| this.project_overview_content(workspace.clone(), cx))
+                    .unwrap_or_else(|_| div().into_any_element())
+            })
+    }
+
+    fn project_overview_content(&self, workspace: WeakEntity<Self>, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let (machine, dir) = self.conversation_location();
+        let device = machine.as_deref()
+            .map(|id| self.agent_panel.read(cx).machine_name(id, None))
+            .unwrap_or_else(crate::remote::this_name);
+        let snapshot = self.overview_git.as_ref()
+            .filter(|((id, path), _)| id == &machine && Some(path) == dir.as_ref());
+        let project = self.agent_panel.read(cx).conversation_project();
+        let project_name = project.as_deref().map(crate::threads::project_label)
+            .unwrap_or_else(|| t("No project").into());
+        let checkout = match (&dir, &project) {
+            (Some(dir), Some(project)) if dir != project => t("Worktree"),
+            (_, Some(_)) => t("Local"),
+            _ => t("No project"),
+        };
+        let git = snapshot.and_then(|(_, git)| git.as_ref());
+        let branch = match git {
+            Some(git) => git.branch.as_deref().filter(|branch| *branch != "HEAD")
+                .unwrap_or_else(|| t("Detached HEAD")),
+            None if dir.is_some() && snapshot.is_none() => t("Loading…"),
+            None => t("Terminal"),
+        };
+        let diff = git.map(|git| format!("{} ({})", t("Diff"), git.statuses.len()))
+            .unwrap_or_else(|| t("Diff").into());
+        let row = |id, icon, label: String, trailing| {
+            div().id(id).h(layout::CONTROL).px(layout::SPACE_2).rounded(layout::RADIUS)
+                .flex().items_center().gap(layout::SPACE_2).min_w_0()
+                .child(Icon::new(icon).size(ICON).flex_none().text_color(theme.muted_foreground))
+                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(label))
+                .child(Icon::new(trailing).size(ICON).flex_none().text_color(theme.muted_foreground))
+                .cursor_pointer().hover(|this| this.bg(theme.list_hover))
+        };
+        let open_surface = |surface| {
+            let workspace = workspace.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                let _ = workspace.update(cx, |this, cx| {
+                    if this.surfaces.update(cx, |host, cx| host.open(surface, window, cx)) {
+                        this.set_overview_open(false, cx);
+                    }
+                });
+            }
+        };
+        let devices_workspace = workspace.clone();
+        let project_workspace = workspace.clone();
+        div().w(px(320.)).p(layout::SPACE_2).flex().flex_col().gap(layout::SPACE_1).text_size(TEXT)
+            .child(
+                row("overview-device", IconName::Monitor, device, IconName::ChevronRight)
+                    .on_click(move |_, window, cx| {
+                        let _ = devices_workspace.update(cx, |this, cx| {
+                            this.set_overview_open(false, cx);
+                            this.settings.update(cx, |settings, cx| settings.show_devices(cx));
+                            this.open_settings(&OpenSettings, window, cx);
+                        });
+                    }),
+            )
+            .when_some(project, |this, project| this.child(
+                row("overview-project", IconName::Folder, project_name, IconName::ExternalLink)
+                    .aria_label(t("Open in Editor"))
+                    .on_click(move |_, window, cx| {
+                        let _ = project_workspace.update(cx, |this, cx| {
+                            this.set_overview_open(false, cx);
+                            this.open_editor_window(machine.clone(), Some(project.clone()), window, cx);
+                        });
+                    }),
+            ))
+            .when(dir.is_some(), |this| this.child(
+                row("overview-worktree", IconName::GitFork, checkout.into(), IconName::Files)
+                    .on_click(open_surface("files")),
+            ))
+            .child(
+                row("overview-branch", IconName::GitBranch, branch.into(), IconName::SquareTerminal)
+                    .on_click(open_surface("terminal")),
+            )
+            .when(git.is_some(), |this| this.child(
+                row("overview-diff", IconName::FileDiff, diff, IconName::ChevronRight)
+                    .on_click(open_surface("diff")),
+            ))
+            .into_any_element()
+    }
+
+    fn render_header(&mut self, reserve_window_buttons: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let window_button_inset = if reserve_window_buttons { px(TRAFFIC_LIGHTS_WIDTH) } else { layout::SPACE_2 };
         let project: SharedString = self
             .root
             .as_ref()
@@ -1784,7 +2064,7 @@ impl Workspace {
                 let shown = self.show_sidebar;
                 // Left of the tabs, as in Termany: past the window buttons
                 // when the sidebar is hidden.
-                this.pl(if shown { layout::SPACE_2 } else { px(TRAFFIC_LIGHTS_WIDTH) })
+                this.pl(if shown { layout::SPACE_2 } else { window_button_inset })
                     .child(
                         div()
                             .flex_none()
@@ -1823,7 +2103,7 @@ impl Workspace {
                 if self.show_sidebar {
                     this.pl_4()
                 } else {
-                    this.pl(px(TRAFFIC_LIGHTS_WIDTH)).child(
+                    this.pl(window_button_inset).child(
                         chrome_button("show-sidebar")
                             .child(crate::icons::sidebar().size(ICON))
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -1862,10 +2142,19 @@ impl Workspace {
                     )
             })
             .when(self.mode == Mode::Agent, |this| this.child(self.render_chat_tabs(cx)))
-            .when(self.mode != Mode::Agent, |this| this.child(Self::drag_region("header-drag")))
+            .when(self.mode == Mode::Editor, |this| {
+                this.child(Self::drag_region("header-drag"))
+                    .child(
+                        chrome_button("back-to-codeany")
+                            .app_icon(IconName::Code)
+                            .on_click(cx.listener(|this, _, window, cx| this.open_editor(&OpenEditor, window, cx)))
+                            .app_tooltip(t("Return to CodeAny")),
+                    )
+            })
             .when(!self.show_sidebar && self.mode == Mode::Agent, |this| {
                 this.child(self.render_editor_button("header-editor", cx))
             })
+            .when(self.mode == Mode::Agent, |this| this.child(self.render_project_overview(cx)))
             .when(!self.surfaces.read(cx).is_visible(), |this| {
                 this.child(
                     chrome_button("toggle-surfaces")
@@ -1945,18 +2234,20 @@ impl Render for Workspace {
         crate::style::use_theme(&choice, window, cx);
         let theme = cx.theme().clone();
 
+        let reserve_window_buttons = !cfg!(target_os = "macos") || !window.is_fullscreen();
         let content = match self.mode {
             Mode::Agent => crate::panel_views::cached(self.chat_view.clone()).into_any_element(),
             Mode::Editor => self.render_editor_area(cx),
         };
 
         let center = div()
-            .size_full()
+            .h_full()
+            .flex_1()
             .min_w_0()
             .overflow_hidden()
             .flex()
             .flex_col()
-            .child(self.render_header(cx))
+            .child(self.render_header(reserve_window_buttons, cx))
             .child(div().flex_1().min_h_0().min_w_0().child(content));
 
         let surfaces_visible = self.surfaces.read(cx).is_visible();
@@ -1978,14 +2269,11 @@ impl Render for Workspace {
             .when(self.show_sidebar, |main| {
                 main.child(
                     div().relative().flex_none().w(sidebar_width).h_full()
-                        .child(self.render_sidebar(cx))
+                        .child(self.render_sidebar(reserve_window_buttons, cx))
                         .child(Self::panel_divider(PanelDivider::Sidebar, cx)),
                 )
             })
-            .child(
-                div().flex_1().min_w_0().flex().justify_center()
-                    .child(center.max_w(CONVERSATION_MAX)),
-            )
+            .child(center)
             .when(surfaces_visible, |main| {
                 main.child(
                     div().relative().flex_none().w(surfaces_width).h_full()

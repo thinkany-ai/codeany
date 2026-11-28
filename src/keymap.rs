@@ -78,7 +78,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("new-thread", "New thread", Workspace, WS, ["cmd-n"], crate::NewThread),
     shortcut!("new-window", "New window", General, None, ["cmd-shift-n"], crate::NewWindow),
     shortcut!("minimize", "Minimize window", General, None, ["cmd-m"], crate::Minimize),
-    shortcut!("search", "Search", Workspace, WS, ["cmd-p"], crate::Search),
+    shortcut!("search", "Search", Workspace, WS, ["cmd-k"], crate::Search),
     shortcut!("open-editor", "Switch Agent / Editor", Workspace, WS, ["cmd-e"], crate::OpenEditor),
     shortcut!("surfaces", "Surfaces", Workspace, WS, ["cmd-alt-t"], crate::OpenSurface),
     shortcut!("toggle-sidebar", "Toggle sidebar", Workspace, WS, ["cmd-b"], crate::ToggleSidebar),
@@ -90,7 +90,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     shortcut!("quit", "Quit CodeAny", General, None, ["cmd-q"], crate::Quit),
     shortcut!("terminal-copy", "Copy", Terminal, TERM, ["cmd-c"], crate::terminal::Copy),
     shortcut!("terminal-paste", "Paste", Terminal, TERM, ["cmd-v"], crate::terminal::Paste),
-    shortcut!("terminal-clear", "Clear", Terminal, TERM, ["cmd-k"], crate::terminal::Clear),
+    shortcut!("terminal-clear", "Clear", Terminal, TERM, ["cmd-shift-k"], crate::terminal::Clear),
 ];
 
 struct Keymap {

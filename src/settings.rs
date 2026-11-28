@@ -264,6 +264,11 @@ impl Settings {
         }
     }
 
+    pub(crate) fn show_appearance(&mut self, cx: &mut Context<Self>) {
+        self.section = Section::Appearance;
+        cx.notify();
+    }
+
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let inner_radius = (theme.radius_lg - FRAME_BORDER).max(px(0.));
@@ -312,14 +317,22 @@ impl Settings {
                     )
                     .child(t(section.label()))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.section = section;
-                        this.stop_recording(cx);
-                        if section == Section::Devices {
-                            this.watch_devices(cx);
-                        }
-                        cx.notify();
+                        this.select_section(section, cx);
                     }))
             }))
+    }
+
+    pub(crate) fn show_devices(&mut self, cx: &mut Context<Self>) {
+        self.select_section(Section::Devices, cx);
+    }
+
+    fn select_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        self.stop_recording(cx);
+        if section == Section::Devices {
+            self.watch_devices(cx);
+        }
+        cx.notify();
     }
 
     fn heading(title: &'static str, cx: &App) -> impl IntoElement {
@@ -981,11 +994,31 @@ impl Settings {
                 panel.update(cx, |panel, cx| panel.redetect_local_agents(cx)).ok();
             });
         }
-        let heading = div()
+        let (status, status_color) = match &result {
+            Some(Ok(agents)) => {
+                let count = agents.iter().filter(|agent| agent.available).count().to_string();
+                (tf("Detected {n} agents", &[("n", count)]), theme.muted_foreground)
+            }
+            Some(Err(_)) => (t("Agents unavailable").to_string(), theme.danger),
+            None => (t("Detecting agents…").to_string(), theme.muted_foreground),
+        };
+        let toolbar = div()
+            .py_3()
             .flex()
-            .items_start()
-            .justify_between()
-            .child(Self::heading("Agents", cx))
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().text_size(TEXT).text_color(status_color).child(status))
+            .child(
+                Button::new("agents-retry")
+                    .outline()
+                    .app_icon(IconName::RefreshCw)
+                    .app_label(t("Detect again"))
+                    .disabled(result.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.agent_panel.update(cx, |panel, cx| panel.retry_local_agents(cx)).ok();
+                        cx.notify();
+                    })),
+            )
             .child(
                 Button::new("agent-add")
                     .outline()
@@ -997,47 +1030,29 @@ impl Settings {
         let draft = self.agent_editor.as_ref()
             .filter(|editor| editor.is_draft())
             .map(|editor| self.render_agent_editor(&editor.id, cx));
-        let intro = div()
-            .mb_2()
-            .text_size(TEXT)
-            .text_color(theme.muted_foreground)
-            .child(t("Each agent you turn on is offered when you start or switch a thread. Its executable, arguments and icon are under Edit, with a connection test."));
+        let section = div()
+            .child(Self::heading("Agents", cx))
+            .child(
+                div()
+                    .text_size(TEXT)
+                    .text_color(theme.muted_foreground)
+                    .child(t("Configure your local agents here.")),
+            )
+            .child(toolbar)
+            .children(draft);
         let mut agents = match result {
             Some(Ok(agents)) => agents,
-            // Why none are listed, and a way to look again.
             Some(Err(err)) => {
-                let panel = self.agent_panel.clone();
-                return div()
-                    .child(heading)
-                    .children(draft)
-                    .child(intro)
+                return section
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .items_start()
-                            .gap(crate::style::layout::SPACE_2)
-                            .child(div().text_size(TEXT).text_color(theme.danger).child(t("Agents unavailable")))
-                            .child(
-                                div()
-                                    .text_size(TEXT)
-                                    .text_color(theme.muted_foreground)
-                                    .child(SharedString::from(crate::agent_panel::display_error(&err))),
-                            )
-                            .child(Button::new("agents-retry").small().app_label(t("Try again")).on_click(move |_, _, cx| {
-                                panel.update(cx, |panel, cx| panel.retry_local_agents(cx)).ok();
-                            })),
+                            .text_size(TEXT)
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(crate::agent_panel::display_error(&err))),
                     )
                     .into_any_element();
             }
-            None => {
-                return div()
-                    .child(heading)
-                    .children(draft)
-                    .child(intro)
-                    .child(div().text_size(TEXT).text_color(theme.muted_foreground).child(t("Detecting agents…")))
-                    .into_any_element();
-            }
+            None => return section.into_any_element(),
         };
         agents.sort_by_key(|agent| {
             let builtin = crate::agl_bridge::builtin_agent_ids().contains(&agent.id);
@@ -1119,12 +1134,7 @@ impl Settings {
             }
             rows = rows.child(row);
         }
-        div()
-            .child(heading)
-            .child(intro)
-            .children(draft)
-            .child(Self::card(rows, cx))
-            .into_any_element()
+        section.child(Self::card(rows, cx)).into_any_element()
     }
 
     fn render_agent_editor(&self, agent: &str, cx: &mut Context<Self>) -> AnyElement {

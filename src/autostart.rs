@@ -51,13 +51,136 @@ fn entry_path() -> std::path::PathBuf {
         .join("autostart/ai.codeany.desktop")
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub fn enabled() -> Result<bool> {
     Ok(entry_path().try_exists()?)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub fn set_enabled(enabled: bool) -> Result<()> {
+    set_file_entry(enabled)
+}
+
+#[cfg(target_os = "macos")]
+pub fn enabled() -> Result<bool> {
+    match macos::service() {
+        Some(service) => Ok(macos::status(&service) == macos::ENABLED),
+        None => Ok(entry_path().try_exists()?),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_enabled(enabled: bool) -> Result<()> {
+    let Some(service) = macos::service() else {
+        return set_file_entry(enabled);
+    };
+    let legacy = macos::has_legacy_entry()?;
+    macos::set_enabled(&service, enabled)?;
+    if legacy {
+        set_file_entry(false)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn migrate_legacy_entry() -> Result<()> {
+    let Some(service) = macos::service() else {
+        return Ok(());
+    };
+    if !macos::has_legacy_entry()? {
+        return Ok(());
+    }
+    // Respect a user who disabled the old entry in System Settings.
+    if !macos::legacy_requires_approval() {
+        macos::set_enabled(&service, true)?;
+        if macos::status(&service) != macos::ENABLED {
+            return Ok(());
+        }
+    }
+    set_file_entry(false)
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+    use objc2::{
+        msg_send,
+        rc::Retained,
+        runtime::{AnyClass, AnyObject},
+    };
+    use objc2_foundation::{NSString, NSURL};
+
+    #[link(name = "ServiceManagement", kind = "framework")]
+    unsafe extern "C" {}
+
+    // SMAppServiceStatus is an NSInteger in the SDK.
+    const NOT_REGISTERED: isize = 0;
+    pub(super) const ENABLED: isize = 1;
+    const REQUIRES_APPROVAL: isize = 2;
+
+    fn service_class() -> Option<&'static AnyClass> {
+        // The framework also exists on macOS 12, but this class starts at 13.
+        AnyClass::get(c"SMAppService")
+    }
+
+    pub(super) fn service() -> Option<Retained<AnyObject>> {
+        // SAFETY: mainAppService returns an SMAppService on supported systems.
+        unsafe { msg_send![service_class()?, mainAppService] }
+    }
+
+    pub(super) fn status(service: &AnyObject) -> isize {
+        // SAFETY: this object came from mainAppService.
+        unsafe { msg_send![service, status] }
+    }
+
+    pub(super) fn set_enabled(service: &AnyObject, enabled: bool) -> Result<()> {
+        let status = status(service);
+        if enabled {
+            if status == ENABLED {
+                return Ok(());
+            }
+            // SAFETY: SMAppService uses the standard BOOL + NSError convention.
+            let result: Result<(), Retained<objc2_foundation::NSError>> =
+                unsafe { msg_send![service, registerAndReturnError: _] };
+            result.map_err(|err| anyhow::anyhow!("{}", err.localizedDescription()))?;
+        } else if matches!(status, ENABLED | REQUIRES_APPROVAL) {
+            // SAFETY: same method signature as registration.
+            let result: Result<(), Retained<objc2_foundation::NSError>> =
+                unsafe { msg_send![service, unregisterAndReturnError: _] };
+            result.map_err(|err| anyhow::anyhow!("{}", err.localizedDescription()))?;
+        } else {
+            anyhow::ensure!(
+                status == NOT_REGISTERED,
+                "CodeAny login item could not be found"
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_legacy_entry() -> Result<bool> {
+        let entry = match std::fs::read_to_string(entry_path()) {
+            Ok(entry) => entry,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        // The old filename was shared with CodeAny Dev. Migrate only the entry
+        // pointing to this bundle so neither installation changes the other's setting.
+        Ok(entry_contents().is_ok_and(|expected| entry == expected))
+    }
+
+    pub(super) fn legacy_requires_approval() -> bool {
+        let path = entry_path();
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        // SAFETY: called only when SMAppService is available, with a file URL.
+        let status: isize = unsafe {
+            msg_send![service_class().expect("SMAppService is available"), statusForLegacyURL: &*url]
+        };
+        status == REQUIRES_APPROVAL
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn set_file_entry(enabled: bool) -> Result<()> {
     let path = entry_path();
     if !enabled {
         return match std::fs::remove_file(&path) {

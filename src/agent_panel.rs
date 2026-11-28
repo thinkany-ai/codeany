@@ -84,6 +84,7 @@ pub struct ChatTab {
 
 pub enum AgentPanelEvent {
     OpenFile(PathBuf),
+    OpenProjectInEditor { machine: Option<String>, project: PathBuf },
     SwitchProject(Option<PathBuf>),
     TurnFinished,
     OpenSettings,
@@ -129,10 +130,12 @@ pub struct AgentPanel {
     picker_open: bool,
     /// Threads of closed tabs, most recent last, for reopening.
     closed_tabs: Vec<u64>,
+    projects_expanded: bool,
     ungrouped_expanded: bool,
     /// Archived threads are listed at the foot of the sidebar, folded.
     archived_expanded: bool,
     sort_repositories_by_name: bool,
+    all_flat_threads: bool,
     navigation_history: Vec<u64>,
     navigation_index: usize,
     all_projects: bool,
@@ -190,8 +193,10 @@ impl AgentPanel {
                 match event {
                     ProjectFilterEvent::Pick(selection) => {
                         this.shown_project = selection.clone();
+                        this.all_flat_threads = false;
                         match selection {
                             ProjectSelection::Project(project) => {
+                                this.projects_expanded = true;
                                 this.expanded_projects.insert(project.clone());
                             }
                             ProjectSelection::ChatsOnly => this.ungrouped_expanded = true,
@@ -200,6 +205,12 @@ impl AgentPanel {
                         this.project_filter_open = false;
                     }
                     ProjectFilterEvent::SortByName(by_name) => this.sort_repositories_by_name = *by_name,
+                    ProjectFilterEvent::FlatByTime(flat) => {
+                        this.sm().store.flat_project_threads = *flat;
+                        this.s().store.save();
+                        this.project_filter_open = false;
+                        cx.refresh_windows();
+                    }
                 }
                 cx.notify();
             }),
@@ -308,9 +319,11 @@ impl AgentPanel {
             picker,
             picker_open: false,
             closed_tabs: Vec::new(),
+            projects_expanded: true,
             ungrouped_expanded: true,
             archived_expanded: false,
             sort_repositories_by_name: false,
+            all_flat_threads: false,
             navigation_history: Vec::new(),
             navigation_index: 0,
             all_projects: false,
@@ -1000,7 +1013,7 @@ impl AgentPanel {
         self.s().machine_online(machine)
     }
 
-    fn machine_name(&self, id: &str, fallback: Option<&str>) -> String {
+    pub(crate) fn machine_name(&self, id: &str, fallback: Option<&str>) -> String {
         self.s().machine_name(id, fallback)
     }
 
@@ -1502,11 +1515,19 @@ impl AgentPanel {
                     .text_size(TEXT)
                     .text_color(theme.foreground)
                     .cursor_pointer()
-                    .child(Icon::new(icon).size(ICON).text_color(theme.muted_foreground))
-                    .child(summary)
+                    .child(Icon::new(icon).size(ICON).flex_none().text_color(theme.muted_foreground))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(summary),
+                    )
                     .when(failed > 0, |this| {
                         this.child(
                             div()
+                                .flex_none()
                                 .text_color(theme.danger)
                                 .child(tf("· {n} failed", &[("n", failed.to_string())])),
                         )
@@ -1515,6 +1536,7 @@ impl AgentPanel {
                     .child(
                         Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
                             .size(ICON)
+                            .flex_none()
                             .text_color(theme.muted_foreground.opacity(0.6)),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(key, open, cx))),
@@ -1614,13 +1636,14 @@ impl AgentPanel {
     }
 
     /// Open the dialog that makes a project, or renames `renaming`.
-    fn open_project_dialog(&mut self, renaming: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_project_dialog(&mut self, renaming: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let mut devices = vec![DialogDevice { id: None, name: tf("This machine ({name})", &[("name", remote::this_name())]), online: true }];
         devices.extend(self.menu_devices().into_iter().map(|d| DialogDevice { id: Some(d.id), name: d.name, online: d.online }));
         let (device, creating) = (self.machine.clone(), renaming.is_none());
         let renaming = renaming.map(|project| {
             let name = project_label(&project);
-            (project, name)
+            let icon = self.project_icon(&project);
+            (project, name, icon)
         });
         let dialog = cx.new(|cx| ProjectDialog::new(devices, device, renaming, window, cx));
         let subscription = cx.subscribe_in(&dialog, window, Self::on_project_dialog);
@@ -1652,8 +1675,15 @@ impl AgentPanel {
         self.project_dialog = None;
         match event {
             ProjectDialogEvent::Cancel => {}
-            ProjectDialogEvent::Rename { project, name } => {
+            ProjectDialogEvent::Rename { project, name, icon } => {
                 let workspace = self.workspace.clone();
+                if let Some(ws) = self.sm().store.workspaces.iter_mut().find(|ws| Some(&ws.id) == workspace.as_ref()) {
+                    if let Some(icon) = icon {
+                        ws.project_icons.insert(project.clone(), icon.clone());
+                    } else {
+                        ws.project_icons.remove(project);
+                    }
+                }
                 self.name_project(workspace, project, name, cx);
                 self.s().store.save();
                 cx.refresh_windows();
@@ -1766,6 +1796,7 @@ impl AgentPanel {
         self.name_project(id, &dir, &name, cx);
         self.s().store.save();
         if self.machine == device {
+            self.projects_expanded = true;
             self.expanded_projects.insert(dir.clone());
             self.new_thread_in_project(Some(dir), window, cx);
         }
@@ -1773,7 +1804,7 @@ impl AgentPanel {
         cx.notify();
     }
 
-    fn new_thread_in_project(&mut self, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn new_thread_in_project(&mut self, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         // Another device's project is a folder there: the new thread works
         // in it on that device; this window's project stays as it is.
         if let Some(machine) = self.machine.clone() {
@@ -1834,35 +1865,28 @@ impl AgentPanel {
         }
     }
 
-    fn render_thread_row(&self, thread: &Thread, indent: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_thread_row(&self, thread: &Thread, indent: bool, flat: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let id = thread.id;
         let active = self.active == Some(id);
+        let menu_background = theme.sidebar.opacity(1.).blend(if active { theme.list_active } else { theme.list_hover });
         let running = self.s().running.contains(&id);
         let settled = thread.settled;
         let open = self.is_open_in_tab(thread);
-        div()
-            .id((if indent { "project-thread" } else { "thread" }, id))
-            .group("thread")
-            .relative()
-            .h(layout::SIDEBAR_ROW)
-            .flex_none()
-            .px(layout::SIDEBAR_ROW_INSET)
+        let project = thread.project.as_ref().filter(|_| flat);
+        let icon_size = crate::style::size::icon_pixels(cx);
+        let avatar_width = avatar_size(cx);
+        let agent_icon_offset = px(-4.);
+        let first_line = div()
+            .h(if flat { avatar_width.max(layout::SIDEBAR_ROW - px(6.)) } else { layout::SIDEBAR_ROW })
             .flex()
             .items_center()
             .gap(layout::SPACE_2)
-            // Rounder than buttons, as Codex's rows: the highlight is a pill-ish tile.
-            .rounded(px(10.))
-            .cursor_pointer()
-            .text_size(TEXT)
-            .when(active, |this| this.bg(theme.list_active))
-            .when(!active, |this| this.hover(|this| this.bg(theme.list_hover)))
-            .when(indent, |this| this.pr(layout::SPACE_3))
             // The status dot sits under the project's avatar, so the
             // thread itself reads as indented beneath the project.
             .child(
                 div()
-                    .w(avatar_size(cx))
+                    .w(avatar_width)
                     .flex_none()
                     .flex()
                     .items_center()
@@ -1873,18 +1897,15 @@ impl AgentPanel {
                 div()
                     .flex_none()
                     // Closer to the dot than the row's gap, so the two read as a pair.
-                    .ml(px(-4.))
+                    .ml(agent_icon_offset)
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(agent_icon(&thread.agent, crate::style::size::icon_pixels(cx), cx)),
+                    .child(agent_icon(&thread.agent, icon_size, cx)),
             )
             .child(
-                div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap()
-                    // Room for the menu button that hovering shows at the end.
-                    .group_hover("thread", |this| this.pr(layout::CONTROL))
+                div().flex_1().min_w_0().truncate()
                     .text_color(if active || open { theme.foreground } else { theme.foreground.opacity(0.8) })
-                    // Threads open in a tab stand out from the rest.
                     .when(open, |this| this.font_weight(FontWeight::MEDIUM))
                     .child(display_title(&thread.title)),
             )
@@ -1900,15 +1921,20 @@ impl AgentPanel {
                         .child(name),
                 )
             })
-            // No time: a running thread shows it is working, and hovering a
-            // row shows its menu over the end of it, the title making room.
+            // On hover the menu takes the place of the time or activity indicator.
             .child(
                 div()
                     .flex_none()
                     .relative()
+                    .group_hover("thread", |this| this.min_w(layout::CONTROL))
                     .h_full()
                     .flex()
                     .items_center()
+                    .when(flat && !running, |this| {
+                        this.child(div().group_hover("thread", |this| this.invisible())
+                            .text_size(rems(0.875)).text_color(theme.muted_foreground)
+                            .child(crate::threads::relative_time(thread.updated_at)))
+                    })
                     .when(running, |this| {
                         this.child(div().group_hover("thread", |this| this.invisible()).child(render_working(cx)))
                     })
@@ -1928,12 +1954,11 @@ impl AgentPanel {
                             .group_hover("thread", |this| this.visible())
                             .child(
                                 crate::style::chrome_button("thread-menu")
-                                    // Bare on the row's own highlight, no backdrop of its own.
                                     .custom(
                                         gpui_kit::component::button::ButtonCustomVariant::new(cx)
-                                            .color(gpui_kit::transparent_black())
-                                            .hover(gpui_kit::transparent_black())
-                                            .active(gpui_kit::transparent_black())
+                                            .color(menu_background)
+                                            .hover(menu_background)
+                                            .active(menu_background)
                                             .foreground(theme.muted_foreground)
                                             .shadow(false),
                                     )
@@ -1943,7 +1968,48 @@ impl AgentPanel {
                                     .dropdown_menu(thread_menu(panel, id, settled)),
                             )
                     }),
-            )
+            );
+
+        div()
+            .id((if indent { "project-thread" } else { "thread" }, id))
+            .group("thread")
+            .flex_none()
+            .px(layout::SIDEBAR_ROW_INSET)
+            .flex()
+            .flex_col()
+            .rounded(px(10.))
+            .cursor_pointer()
+            .text_size(TEXT)
+            .when(active, |this| this.bg(theme.list_active))
+            .when(!active, |this| this.hover(|this| this.bg(theme.list_hover)))
+            .when(indent, |this| this.pr(layout::SPACE_3))
+            .when(flat, |this| this.py(px(3.)))
+            .child(first_line)
+            .when_some(project, |this, path| {
+                let name = SharedString::from(project_label(path));
+                let action_size = px(20.);
+                this.child(
+                    div()
+                        .id(("flat-thread-project", id))
+                        .group("project")
+                        .min_h(action_size)
+                        .flex()
+                        .items_center()
+                        .gap(layout::SPACE_2)
+                        .pl(avatar_width + icon_size + layout::SPACE_2 * 2. + agent_icon_offset)
+                        .child(div().flex_1().min_w_0().truncate().text_size(rems(0.875))
+                            .text_color(theme.muted_foreground).child(name))
+                        .child(
+                            div().id("flat-project-actions")
+                                .w_0()
+                                .h(action_size)
+                                .flex_none()
+                                .overflow_hidden()
+                                .group_hover("project", |this| this.w(action_size))
+                                .child(Self::project_actions(path, action_size, false, cx)),
+                        ),
+                )
+            })
             // A click shows the thread in the active tab; ⌘-click or a
             // middle-click opens it in a new one, as links do in a browser.
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -1960,6 +2026,39 @@ impl AgentPanel {
             .into_any_element()
     }
 
+    fn project_actions(project: &PathBuf, size: Pixels, show_menu: bool, cx: &mut Context<Self>) -> AnyElement {
+        let color = cx.theme().muted_foreground;
+        let button = |id, icon| {
+            crate::style::chrome_button(id)
+                .size(size)
+                .w(size)
+                .h(size)
+                .child(Icon::new(icon).size(ICON).text_color(color))
+        };
+        let new_thread_path = project.clone();
+        div().flex().items_center()
+            .when(show_menu, |this| this.child(
+                button("project-menu", IconName::Ellipsis)
+                    .accessibility_label(t("Project options"))
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .dropdown_menu(project_menu(cx.entity().downgrade(), project.clone())),
+            ))
+            .child(
+                button("new-project-thread", IconName::SquarePen)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.new_thread_in_project(Some(new_thread_path.clone()), window, cx);
+                    }))
+                    .app_tooltip(t("New Thread")),
+            )
+            .into_any_element()
+    }
+
+    fn project_icon(&self, project: &std::path::Path) -> Option<crate::threads::ProjectIcon> {
+        self.s().store.workspaces.iter().find(|ws| Some(&ws.id) == self.workspace.as_ref())?
+            .project_icons.get(project).cloned()
+    }
+
     fn render_project_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let filtering = self.shown_project != ProjectSelection::All;
@@ -1971,8 +2070,11 @@ impl AgentPanel {
                 this.project_filter_open = *open;
                 if *open {
                     let projects = this.device_projects();
+                    let icons = this.s().store.workspaces.iter().find(|ws| Some(&ws.id) == this.workspace.as_ref())
+                        .map(|ws| ws.project_icons.clone()).unwrap_or_default();
                     let (shown, by_name) = (this.shown_project.clone(), this.sort_repositories_by_name);
-                    this.project_filter.update(cx, |filter, cx| filter.open(projects, shown, by_name, window, cx));
+                    let flat = this.s().store.flat_project_threads;
+                    this.project_filter.update(cx, |filter, cx| filter.open(projects, icons, shown, by_name, flat, window, cx));
                 }
                 cx.notify();
             }))
@@ -1990,7 +2092,7 @@ impl AgentPanel {
     /// The projects of the device the sidebar shows, most recently active
     /// first: this one's opened folders, another's last picked folder, and
     /// the folders their threads work in.
-    fn device_projects(&self) -> Vec<PathBuf> {
+    pub(crate) fn device_projects(&self) -> Vec<PathBuf> {
         let mut projects: Vec<PathBuf> = self.s().store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref()).map(|w| w.projects.clone()).unwrap_or_default();
         let mut latest: HashMap<PathBuf, u64> = HashMap::new();
         let shared = self.shared.clone();
@@ -2308,26 +2410,27 @@ impl AgentPanel {
                                 key: Option<PathBuf>,
                                 entries: &[Entry],
                                 indent: bool,
+                                flat: bool,
                                 cx: &mut Context<Self>|
          -> Stateful<Div> {
-            let all = this.long_projects.contains(&key);
-            let shown = if all { entries.len() } else { entries.len().min(if indent { 3 } else { THREADS_PER_PROJECT }) };
+            let all = if flat { this.all_flat_threads } else { this.long_projects.contains(&key) };
+            let limit = if flat { 30 } else if indent { 3 } else { THREADS_PER_PROJECT };
+            let shown = if all { entries.len() } else { entries.len().min(limit) };
             let mut list = list.child(
                 div()
                     .flex_none()
                     .flex()
                     .flex_col()
-                    // Highlights nearly touch, as in Codex.
-                    .gap(px(1.))
+                    .gap(if flat { px(4.) } else { px(1.) })
                     .children(entries[..shown].iter().map(|entry| match entry {
-                        Entry::Thread(t) => this.render_thread_row(t, indent, cx),
+                        Entry::Thread(t) => this.render_thread_row(t, indent, flat, cx),
                     })),
             );
             let more = entries.len() - shown;
             if more > 0 {
                 list = list.child(
                     div()
-                        .id(SharedString::from(format!("more-{key:?}")))
+                        .id(SharedString::from(if flat { "more-flat-threads".into() } else { format!("more-{key:?}") }))
                         .h(layout::CONTROL)
                         .pl(layout::SIDEBAR_ROW_INSET + avatar_size(cx) + layout::SPACE_2)
                         .flex()
@@ -2338,7 +2441,11 @@ impl AgentPanel {
                         .hover(|this| this.text_color(theme.foreground))
                         .child(tf("More ({n})", &[("n", more.to_string())]))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.long_projects.insert(key.clone());
+                            if flat {
+                                this.all_flat_threads = true;
+                            } else {
+                                this.long_projects.insert(key.clone());
+                            }
                             cx.notify();
                         })),
                 );
@@ -2346,20 +2453,34 @@ impl AgentPanel {
             list
         };
 
-        list = list.child(
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .py_1()
+        let section_header = |projects: bool, cx: &Context<Self>| {
+            let (id, label, expanded) = if projects {
+                ("projects-section", "Projects", self.projects_expanded)
+            } else {
+                ("chats-section", "Chats", self.ungrouped_expanded)
+            };
+            div().flex_none().h(layout::SIDEBAR_NAV_ROW).flex().items_center()
                 .px(layout::SIDEBAR_ROW_INSET)
                 .child(
-                    div()
-                        .flex_1()
-                        .text_size(TEXT)
-                        .text_color(theme.muted_foreground)
-                        .child(t("Projects")),
+                    div().id(id).flex_1().h_full().flex().items_center().gap(layout::SPACE_1)
+                        .text_size(TEXT).text_color(theme.muted_foreground)
+                        .cursor_pointer().hover(|this| this.text_color(theme.foreground))
+                        .child(t(label))
+                        .child(Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight }).size(ICON))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let expanded = if projects {
+                                &mut this.projects_expanded
+                            } else {
+                                &mut this.ungrouped_expanded
+                            };
+                            *expanded = !*expanded;
+                            cx.notify();
+                        })),
                 )
+        };
+
+        list = list.child(
+            section_header(true, cx)
                 .child(self.render_project_filter(cx))
                 .child(
                     icon_button("add-project", IconName::FolderPlus)
@@ -2368,7 +2489,22 @@ impl AgentPanel {
                 ),
         );
 
-        let ungrouped = {
+        if self.projects_expanded && !chats_only && shared.store.flat_project_threads {
+            let workspace = shared.store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref());
+            let mut entries: Vec<_> = active_threads()
+                .filter(|thread| thread.project.as_ref().is_some_and(|path| {
+                    selection.includes(Some(path)) && workspace.is_none_or(|workspace| !workspace.removed(path))
+                }))
+                .collect();
+            entries.sort_by_key(|thread| (std::cmp::Reverse(thread.updated_at), thread.id));
+            let entries: Vec<_> = entries.into_iter().map(Entry::Thread).collect();
+            if entries.is_empty() {
+                let label = if self.device_projects().is_empty() { "Open a folder to start a project" } else { "No threads yet" };
+                list = list.child(div().px(layout::SIDEBAR_ROW_INSET).py_1().text_size(TEXT)
+                    .text_color(theme.muted_foreground).child(t(label)));
+            }
+            list = push_entries(self, list, None, &entries, false, true, cx);
+        } else if self.projects_expanded && !chats_only {
             // Ordered, so equal timestamps never reshuffle from one frame to the next.
             let mut groups: std::collections::BTreeMap<Option<PathBuf>, Vec<Entry>> = Default::default();
             for thread in active_threads() {
@@ -2412,9 +2548,7 @@ impl AgentPanel {
                     rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
                 }
             });
-            if chats_only {
-                projects.clear();
-            } else if let ProjectSelection::Project(shown) = selection {
+            if let ProjectSelection::Project(shown) = selection {
                 projects.retain(|p| p == shown);
                 if projects.is_empty() {
                     projects.push(shown.clone());
@@ -2427,7 +2561,7 @@ impl AgentPanel {
             };
             projects.truncate(projects.len() - hidden_projects);
 
-            if projects.is_empty() && !chats_only {
+            if projects.is_empty() {
                 list = list.child(
                     div()
                         .px(layout::SIDEBAR_ROW_INSET)
@@ -2448,7 +2582,6 @@ impl AgentPanel {
                 });
                 let count = entries.len();
                 let path = project.clone();
-                let new_thread_path = path.clone();
                 list = list.child(
                     div()
                         .id(SharedString::from(format!("project-{}", project.display())))
@@ -2469,6 +2602,8 @@ impl AgentPanel {
                         .child(ProjectAvatar {
                             project: project.clone(),
                             name: name.clone(),
+                            icon: self.project_icon(project),
+                            size: None,
                         })
                         .child(
                             div()
@@ -2513,20 +2648,7 @@ impl AgentPanel {
                                         .justify_end()
                                         .invisible()
                                         .group_hover("project", |this| this.visible())
-                                        .child(
-                                            icon_button("project-menu", IconName::Ellipsis)
-                                                .accessibility_label(t("Project options"))
-                                                .on_click(|_, _, cx| cx.stop_propagation())
-                                                .dropdown_menu(project_menu(cx.entity().downgrade(), project.clone())),
-                                        )
-                                        .child(
-                                            icon_button("new-project-thread", IconName::SquarePen)
-                                                .on_click(cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.new_thread_in_project(Some(new_thread_path.clone()), window, cx);
-                                                }))
-                                                .app_tooltip(t("New Thread")),
-                                        ),
+                                        .child(Self::project_actions(project, layout::CONTROL, true, cx)),
                                 ),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2538,7 +2660,7 @@ impl AgentPanel {
                         .context_menu(project_menu(cx.entity().downgrade(), project.clone())),
                 );
                 if expanded {
-                    list = push_entries(self, list, key, entries, true, cx);
+                    list = push_entries(self, list, key, entries, true, false, cx);
                 }
             }
             if hidden_projects > 0 {
@@ -2561,8 +2683,43 @@ impl AgentPanel {
                         })),
                 );
             }
-            groups.remove(&None).unwrap_or_default()
-        };
+        }
+
+        if selection.includes(None) {
+            list = list.child(
+                section_header(false, cx)
+                    .id("chats-section-row")
+                    .group("chats-section")
+                    .mt(layout::SPACE_3)
+                    .child(
+                        div()
+                            .id("chats-section-actions")
+                            .flex_none()
+                            .invisible()
+                            .group_hover("chats-section", |this| this.visible())
+                            .child(
+                                icon_button("new-unprojected-thread", IconName::SquarePen)
+                                    .accessibility_label(t("New Thread"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.ungrouped_expanded = true;
+                                        this.new_thread_in_project(None, window, cx);
+                                    }))
+                                    .app_tooltip(t("New Thread")),
+                            ),
+                    ),
+            );
+            if self.ungrouped_expanded {
+                let mut chats: Vec<_> = active_threads().filter(|thread| thread.project.is_none()).collect();
+                chats.sort_by_key(|thread| (std::cmp::Reverse(thread.updated_at), thread.id));
+                let chats: Vec<_> = chats.into_iter().map(Entry::Thread).collect();
+                if chats.is_empty() {
+                    list = list.child(div().px(layout::SIDEBAR_ROW_INSET).py_1().text_size(TEXT)
+                        .text_color(theme.muted_foreground).child(t("No chats yet")));
+                } else {
+                    list = push_entries(self, list, None, &chats, false, false, cx);
+                }
+            }
+        }
 
         // ---- Archived threads: out of the lists above, kept until deleted.
         let mut archived: Vec<Entry> =
@@ -2601,71 +2758,7 @@ impl AgentPanel {
                     })),
             );
             if self.archived_expanded {
-                list = push_entries(self, list, Some(PathBuf::from("archived:")), &archived, false, cx);
-            }
-        }
-
-        if selection.includes(None) && (chats_only || !ungrouped.is_empty()) {
-            let expanded = self.ungrouped_expanded;
-            list = list.child(
-                div()
-                    .id("no-project-group")
-                    .mt(layout::SPACE_1)
-                    .h(layout::SIDEBAR_NAV_ROW)
-                    .flex_none()
-                    .px(layout::SIDEBAR_ROW_INSET)
-                    .flex()
-                    .items_center()
-                    .gap(layout::SPACE_2)
-                    .rounded(layout::RADIUS)
-                    .cursor_pointer()
-                    .hover(|this| this.bg(theme.list_hover))
-                    .text_size(TEXT)
-                    .child(
-                        div()
-                            .size(avatar_size(cx))
-                            .flex_none()
-                            .rounded(px(5.))
-                            .bg(theme.list_hover)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(IconName::MessageCircle).size(ICON).text_color(theme.muted_foreground)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_color(theme.foreground)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(t("Chats only")),
-                    )
-                    .child(
-                        Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                            .size(ICON)
-                            .text_color(theme.muted_foreground),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.ungrouped_expanded = !this.ungrouped_expanded;
-                        cx.notify();
-                    })),
-            );
-            if expanded {
-                if ungrouped.is_empty() {
-                    list = list.child(
-                        div()
-                            .px(layout::SIDEBAR_ROW_INSET)
-                            .py_1()
-                            .text_size(TEXT)
-                            .text_color(theme.muted_foreground)
-                            .child(t("No chats yet")),
-                    );
-                } else {
-                    list = push_entries(self, list, None, &ungrouped, true, cx);
-                }
+                list = push_entries(self, list, Some(PathBuf::from("archived:")), &archived, false, false, cx);
             }
         }
 
@@ -2933,7 +3026,7 @@ impl AgentPanel {
                 div()
                     .mt(px(28.))
                     .w_full()
-                    .max_w(layout::CONTENT_MAX)
+                    .max_w(layout::NEW_CHAT_COMPOSER_MAX)
                     .child(self.render_composer(None, cx)),
             )
             .into_any_element()
@@ -3087,6 +3180,7 @@ impl AgentPanel {
                     _ => self.project.clone(),
                 };
                 let (icon, text) = tool_line(title, detail.as_deref(), running, base.as_deref());
+                let code = code.as_ref().or_else(|| title.contains('\n').then_some(title));
                 let has_output = output.as_ref().is_some_and(|o| !o.trim().is_empty())
                     || code.is_some()
                     || !images.is_empty();
@@ -3171,7 +3265,7 @@ impl AgentPanel {
                                 .text_size(TEXT)
                                 .line_height(relative(1.5))
                                 .text_color(theme.foreground.opacity(0.75))
-                                .when_some(code.clone(), |this, code| {
+                                .when_some(code.cloned(), |this, code| {
                                     this.child(div().text_color(theme.foreground).child(code))
                                         .when(output.is_some(), |this| {
                                             this.child(div().my_2().h(px(1.)).bg(theme.border))
@@ -3616,6 +3710,14 @@ impl AgentPanel {
             .into_any_element()
     }
 
+    pub(crate) fn conversation_project(&self) -> Option<PathBuf> {
+        self.picked_project(self.active_thread().as_deref())
+    }
+
+    pub(crate) fn draft_project(&self) -> Option<PathBuf> {
+        self.picked_project(None)
+    }
+
     /// The project of `thread`, or the one the next new thread works in:
     /// this window's here, the folder last picked on another device.
     fn picked_project(&self, thread: Option<&Thread>) -> Option<PathBuf> {
@@ -3690,14 +3792,19 @@ impl AgentPanel {
             .into_any_element()
     }
 
+    pub(crate) fn thread_branch(&self, thread: &Thread) -> Option<String> {
+        thread.worktree.as_ref().map(|worktree| worktree.branch.clone())
+            .or_else(|| thread.start_branch.clone())
+            .or_else(|| {
+                let target = self.project_target(Some(thread))?;
+                let git = self.project_git.as_ref().filter(|_| self.git_project.as_ref() == Some(&target))?;
+                Some(git.branch.clone().unwrap_or_else(|| t("Detached HEAD").into()))
+            })
+    }
+
     fn render_branch_picker(&self, thread: Option<&Thread>, cx: &mut Context<Self>) -> Option<AnyElement> {
         if let Some(thread) = thread {
-            let branch = thread.worktree.as_ref().map(|worktree| worktree.branch.clone())
-                .or_else(|| thread.start_branch.clone())
-                .or_else(|| {
-                    let git = self.project_git.as_ref()?;
-                    Some(git.branch.clone().unwrap_or_else(|| t("Detached HEAD").into()))
-                })?;
+            let branch = self.thread_branch(thread)?;
             return Some(self.context_label("branch", IconName::GitBranch, branch, Some(t("Current branch").into()), cx));
         }
 
@@ -4457,9 +4564,16 @@ fn tool_line(
         "Generate image" => (IconName::Image, t(if running { "Generating image" } else { "Generated image" }).into()),
         "View image" => (IconName::Image, with(pick(("Viewing", "Viewing {detail}"), ("Viewed", "Viewed {detail}")), &short)),
         // A tool we do not know by name: its own name, untranslated.
-        other if detail.is_empty() => (IconName::Wrench, other.to_string()),
-        other => (IconName::Wrench, format!("{other} {detail}")),
+        other => {
+            let label = tool_title_preview(other);
+            let text = if detail.is_empty() { label } else { format!("{label} {detail}") };
+            (IconName::Wrench, text)
+        }
     }
+}
+
+fn tool_title_preview(title: &str) -> String {
+    title.lines().next().unwrap_or_default().trim().to_owned()
 }
 
 /// "Read files, ran commands, searched the web", the failures, and an icon.
@@ -4495,7 +4609,7 @@ fn summarize_group(items: &[ChatItem], ixs: &[usize]) -> (String, usize, IconNam
             "Computer" => t("used the computer").to_string(),
             "Browser" => t("used the browser").to_string(),
             "Update todos" => t("updated todos").to_string(),
-            other => other.to_string(),
+            other => tool_title_preview(other),
         };
         if !parts.contains(&part) {
             parts.push(part);
@@ -4583,6 +4697,15 @@ mod group_tests {
         assert_eq!(summary, "Used the computer, ran 1 command");
         // A command exiting non-zero is not counted as a failure.
         assert_eq!(failed, 0);
+    }
+
+    #[test]
+    fn multiline_tool_titles_stay_on_one_line() {
+        let title = "Run python -c\nprint('hello')\nprint('world')";
+        let (_, label) = tool_line(title, None, false, None);
+        assert_eq!(label, "Run python -c");
+        let items = [tool(title, ToolStatus::Done), tool("Read", ToolStatus::Done)];
+        assert_eq!(summarize_group(&items, &[0, 1]).0, "Run python -c, read 1 file");
     }
 
     #[test]
@@ -4745,10 +4868,16 @@ fn project_menu(
     project: PathBuf,
 ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
     move |menu, _, _| {
-        let (new_thread, rename, remove) = (panel.clone(), panel.clone(), panel.clone());
-        let (thread_in, renamed, removed) = (project.clone(), project.clone(), project.clone());
+        let (new_thread, editor, rename, remove) = (panel.clone(), panel.clone(), panel.clone(), panel.clone());
+        let (thread_in, opened, renamed, removed) = (project.clone(), project.clone(), project.clone(), project.clone());
         menu.item(crate::style::menu_item(t("New Thread")).on_click(move |_, window, cx| {
             new_thread.update(cx, |this, cx| this.new_thread_in_project(Some(thread_in.clone()), window, cx)).ok();
+        }))
+        .item(crate::style::menu_item(t("Open in Editor")).on_click(move |_, _, cx| {
+            editor.update(cx, |this, cx| cx.emit(AgentPanelEvent::OpenProjectInEditor {
+                machine: this.machine.clone(),
+                project: opened.clone(),
+            })).ok();
         }))
         .item(crate::style::menu_item(t("Edit")).on_click(move |_, window, cx| {
             rename.update(cx, |this, cx| this.open_project_dialog(Some(renamed.clone()), window, cx)).ok();

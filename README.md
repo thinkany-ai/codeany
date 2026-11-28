@@ -11,7 +11,7 @@ A lightweight coding-agent app with an editor window, built with [GPUI](https://
   no LSP. Files the agent or a surface opens land there.
 - **Surfaces** (⌥⌘T): panels that open beside a conversation: browser, terminal, files, diff,
   pull request and device.
-- **Search palette** (⌘P): run a command, open a thread or switch project from one box.
+- **Search palette** (⌘K): run a command, open a thread or switch project from one box.
 - **Settings** (⌘, or the gear at the bottom of the sidebar): a modal over a dimmed window with
   General, Appearance, Agents, Shortcuts and About sections. Appearance has 13 themes
   (Codex, Default Dark, Solarized Dark, Daylight, Meadow, Charcoal, Gruvbox Dark/Light,
@@ -31,7 +31,7 @@ the error and keeps the running app. Ctrl-C stops both.
 | ------------- | ------------------- |
 | ⌘E            | Editor window (from it: back to the agent) |
 | ⌘N            | New thread          |
-| ⌘P            | Search palette      |
+| ⌘K            | Search palette      |
 | ⌘T            | New chat tab        |
 | ⌥⌘T           | Open a surface      |
 | ⌘,            | Settings            |
@@ -40,7 +40,7 @@ the error and keeps the running app. Ctrl-C stops both.
 | ⌘B            | Toggle file tree    |
 | ⌘⇧G           | Toggle git changes  |
 | ⌘J or ⌃\`     | Toggle terminal     |
-| ⌘C / ⌘V / ⌘K  | Terminal copy / paste / clear |
+| ⌘C / ⌘V / ⇧⌘K | Terminal copy / paste / clear |
 
 ## Devices
 
@@ -141,7 +141,7 @@ Vulkan; packaging files live in `packaging/`.
 | `src/git.rs` + `src/git_panel.rs` | `git` CLI + gpui-component `Diff` |
 | `src/terminal.rs` | `alacritty_terminal` PTY, rendered as styled text rows |
 | `src/surface_host.rs` + `src/surfaces/` | surface panel and its extensions |
-| `src/search_palette.rs` | ⌘P palette |
+| `src/search_palette.rs` | ⌘K palette |
 | `src/settings.rs` | settings dialog |
 | `src/themes.rs` + `src/style.rs` | theme palettes and how they map onto the component theme |
 

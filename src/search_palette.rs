@@ -1,18 +1,18 @@
-//! ⌘P: one box to run a command, open a thread or switch project, after
-//! Termany's search palette.
+//! Search for commands, threads, and projects.
 
 use std::path::PathBuf;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, kbd::Kbd,
+    ActiveTheme as _, Icon,
     input::{Input, InputEvent, InputState},
+    kbd::Kbd,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::i18n::{t, tf};
-use crate::threads::relative_time;
+use crate::style::AppButtonStyle as _;
 use crate::style::size::{ICON, TEXT};
 
 pub const WIDTH: f32 = 560.;
@@ -23,6 +23,10 @@ pub enum Target {
     Action(Box<dyn Action>),
     Thread(u64),
     Project(PathBuf),
+    ChooseThreadProject,
+    NewThreadInProject(Option<PathBuf>),
+    NewProject,
+    ChangeTheme,
 }
 
 impl Clone for Target {
@@ -31,57 +35,82 @@ impl Clone for Target {
             Target::Action(action) => Target::Action(action.boxed_clone()),
             Target::Thread(id) => Target::Thread(*id),
             Target::Project(path) => Target::Project(path.clone()),
+            Target::ChooseThreadProject => Target::ChooseThreadProject,
+            Target::NewThreadInProject(path) => Target::NewThreadInProject(path.clone()),
+            Target::NewProject => Target::NewProject,
+            Target::ChangeTheme => Target::ChangeTheme,
         }
     }
 }
 
 pub struct Item {
     pub icon: IconName,
+    pub agent: Option<String>,
     pub label: String,
-    /// Dim second line: a thread's project, a project's path.
+    /// Second-line context for threads, right-aligned context for projects.
     pub detail: Option<String>,
-    /// Right-hand badge: a shortcut for commands, else the kind.
-    pub badge: Badge,
+    pub shortcut: Option<Kbd>,
     pub target: Target,
     /// Newer first among equal matches.
     pub updated_at: u64,
 }
 
-pub enum Badge {
-    Keys(Option<Kbd>),
-    Kind(&'static str),
+struct Row {
+    item: usize,
+    heading: Option<&'static str>,
 }
 
 pub enum SearchPaletteEvent {
     Pick(Target),
+    Back,
 }
 
 impl EventEmitter<SearchPaletteEvent> for SearchPalette {}
 
 pub struct SearchPalette {
     input: Entity<InputState>,
+    previous: Option<Entity<Self>>,
     commands: Vec<Item>,
+    /// None when choosing a project for a new thread.
+    quick_actions: Option<usize>,
     others: Vec<Item>,
     /// Indices into `commands` then `others` (offset by commands.len()).
-    rows: Vec<usize>,
+    rows: Vec<Row>,
     selected: usize,
     scroll: ScrollHandle,
     _subscription: Subscription,
 }
 
 impl SearchPalette {
-    pub fn new(commands: Vec<Item>, others: Vec<Item>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        commands: Vec<Item>,
+        quick_actions: Option<usize>,
+        others: Vec<Item>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(t("Run a command, or search threads and projects…"))
+            InputState::new(window, cx).placeholder(t(if quick_actions.is_some() {
+                "Run a command, or search threads and projects…"
+            } else {
+                "Search projects…"
+            }))
         });
-        let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
-            InputEvent::Change => this.filter(cx),
-            InputEvent::PressEnter { .. } => this.confirm(cx),
-            _ => {}
-        });
+        let subscription =
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, _, event: &InputEvent, _, cx| match event {
+                    InputEvent::Change => this.filter(cx),
+                    InputEvent::PressEnter { .. } => this.confirm(cx),
+                    _ => {}
+                },
+            );
         let mut this = Self {
             input,
+            previous: None,
             commands,
+            quick_actions,
             others,
             rows: Vec::new(),
             selected: 0,
@@ -90,6 +119,15 @@ impl SearchPalette {
         };
         this.filter(cx);
         this
+    }
+
+    pub fn with_previous(mut self, previous: Entity<Self>) -> Self {
+        self.previous = Some(previous);
+        self
+    }
+
+    pub fn previous(&self) -> Option<Entity<Self>> {
+        self.previous.clone()
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -107,28 +145,67 @@ impl SearchPalette {
         self.input.read(cx).value().trim().to_lowercase()
     }
 
-    /// Commands first, then threads and projects, each by how well they match.
     fn filter(&mut self, cx: &mut Context<Self>) {
         let query = self.query(cx);
-        self.rows = if query.is_empty() {
-            (0..self.commands.len()).collect()
-        } else {
-            let rank = |items: &[Item], offset: usize| {
-                let mut hits: Vec<(i32, u64, usize)> = items
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(ix, item)| {
-                        let score = score(&item.label, &query);
-                        (score >= 0).then_some((score, item.updated_at, ix + offset))
-                    })
-                    .collect();
-                hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-                hits.into_iter().map(|(_, _, ix)| ix)
+        let mut commands = Vec::new();
+        let mut threads = Vec::new();
+        let mut projects = Vec::new();
+        for (ix, item) in self.commands.iter().chain(&self.others).enumerate() {
+            let relevance = if query.is_empty() {
+                0
+            } else {
+                score(&item.label, &query)
             };
-            rank(&self.commands, 0)
-                .chain(rank(&self.others, self.commands.len()))
-                .collect()
+            if relevance < 0 {
+                continue;
+            }
+            let group = match item.target {
+                Target::Thread(_) => &mut threads,
+                Target::Project(_) => &mut projects,
+                Target::NewThreadInProject(Some(_)) if self.quick_actions.is_none() => {
+                    &mut projects
+                }
+                _ => &mut commands,
+            };
+            group.push((relevance, item.updated_at, ix));
+        }
+        for group in [&mut commands, &mut threads, &mut projects] {
+            group.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        }
+        let groups = if self.quick_actions.is_none() {
+            [
+                ("Project results", projects),
+                ("Quick actions", commands),
+                ("Thread results", threads),
+            ]
+        } else if query.is_empty() {
+            commands.truncate(self.quick_actions.unwrap_or_default());
+            threads.truncate(5);
+            projects.truncate(3);
+            [
+                ("Quick actions", commands),
+                ("Recent threads", threads),
+                ("Recent projects", projects),
+            ]
+        } else {
+            [
+                ("Thread results", threads),
+                ("Project results", projects),
+                ("Command results", commands),
+            ]
         };
+        self.rows = groups
+            .into_iter()
+            .flat_map(|(heading, group)| {
+                group
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, (_, _, item))| Row {
+                        item,
+                        heading: (index == 0).then_some(heading),
+                    })
+            })
+            .collect();
         self.selected = 0;
         self.scroll.scroll_to_item(0);
         cx.notify();
@@ -136,15 +213,19 @@ impl SearchPalette {
 
     fn select(&mut self, selected: usize, cx: &mut Context<Self>) {
         self.selected = selected;
-        // Children of the list: an optional section header, then the rows.
-        let header = usize::from(self.query(cx).is_empty());
-        self.scroll.scroll_to_item(selected + header);
+        let headers = self
+            .rows
+            .iter()
+            .take(selected + 1)
+            .filter(|row| row.heading.is_some())
+            .count();
+        self.scroll.scroll_to_item(selected + headers);
         cx.notify();
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        if let Some(&ix) = self.rows.get(self.selected) {
-            cx.emit(SearchPaletteEvent::Pick(self.item(ix).target.clone()));
+        if let Some(row) = self.rows.get(self.selected) {
+            cx.emit(SearchPaletteEvent::Pick(self.item(row.item).target.clone()));
         }
     }
 
@@ -180,11 +261,77 @@ impl Render for SearchPalette {
         let max_list = (window.viewport_size().height * 0.7).min(px(MAX_HEIGHT)) - px(41.);
         let dim = theme.muted_foreground;
 
-        let rows = self.rows.iter().enumerate().map(|(n, &ix)| {
-            let item = self.item(ix);
+        let rows = self.rows.iter().enumerate().flat_map(|(n, row)| {
+            let item = self.item(row.item);
             let active = n == self.selected;
-            div()
-                .id(("search-row", ix))
+            let title = div().flex_1().min_w_0().text_size(TEXT).truncate().child(
+                if item.label.is_empty() {
+                    t("(untitled)").into()
+                } else {
+                    item.label.clone()
+                },
+            );
+            let content = if let Some(agent) = &item.agent {
+                let icon_size = crate::style::size::icon_pixels(cx);
+                let icon_gap = px(10.);
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(icon_gap)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .child(crate::agent_icons::agent_icon(agent, icon_size, cx)),
+                            )
+                            .child(title)
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(TEXT)
+                                    .text_color(dim)
+                                    .child(crate::threads::relative_time(item.updated_at)),
+                            ),
+                    )
+                    .children(item.detail.clone().map(|detail| {
+                        div()
+                            .pl(icon_size + icon_gap)
+                            .text_size(rems(0.875))
+                            .text_color(dim)
+                            .truncate()
+                            .child(detail)
+                    }))
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(Icon::new(item.icon).size(ICON).flex_none().text_color(dim))
+                    .child(title)
+                    .when_some(item.detail.clone(), |this, detail| {
+                        this.child(
+                            div()
+                                .max_w(relative(0.38))
+                                .min_w_0()
+                                .text_size(TEXT)
+                                .text_color(dim)
+                                .truncate()
+                                .child(detail),
+                        )
+                    })
+                    .into_any_element()
+            };
+            let entry = div()
+                .id(("search-row", row.item))
                 .flex()
                 .items_center()
                 .gap(px(10.))
@@ -203,51 +350,37 @@ impl Render for SearchPalette {
                     this.selected = n;
                     this.confirm(cx);
                 }))
-                .child(Icon::new(item.icon).size(ICON).flex_none().text_color(dim))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(1.))
-                        .child(
-                            div()
-                                .text_size(TEXT)
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(if item.label.is_empty() { t("(untitled)").into() } else { item.label.clone() }),
-                        )
-                        .when_some(item.detail.clone(), |this, detail| {
-                            this.child(
-                                div()
-                                    .text_size(TEXT)
-                                    .text_color(dim)
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .child(detail),
-                            )
-                        }),
-                )
-                .map(|this| match &item.badge {
-                    Badge::Keys(Some(kbd)) => this.child(
+                .child(content)
+                .when(matches!(item.target, Target::ChooseThreadProject), |this| {
+                    this.child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(ICON)
+                            .flex_none()
+                            .text_color(dim),
+                    )
+                })
+                .when_some(item.shortcut.clone(), |this, shortcut| {
+                    this.child(
                         div()
                             .flex_none()
                             .text_size(TEXT)
                             .text_color(if active { theme.foreground } else { dim })
-                            .child(kbd.clone().outline().text_size(TEXT)),
-                    ),
-                    Badge::Keys(None) => this,
-                    Badge::Kind(kind) => this.child(
-                        div()
-                            .flex_none()
-                            .text_size(TEXT)
-                            .text_color(dim)
-                            .child(t(kind).to_uppercase()),
-                    ),
-                })
+                            .child(shortcut.outline().text_size(TEXT)),
+                    )
+                });
+            let heading = row.heading.map(|label| {
+                div()
+                    .px(px(10.))
+                    .pt(px(7.))
+                    .pb(px(4.))
+                    .text_size(TEXT)
+                    .text_color(dim)
+                    .child(t(label))
+                    .into_any_element()
+            });
+            heading
+                .into_iter()
+                .chain(std::iter::once(entry.into_any_element()))
         });
 
         div()
@@ -267,7 +400,20 @@ impl Render for SearchPalette {
                     .border_b_1()
                     .border_color(theme.border)
                     .text_size(TEXT)
-                    .child(crate::icons::search().size(ICON).text_color(dim))
+                    .when(self.previous.is_none(), |this| {
+                        this.child(crate::icons::search().size(ICON).text_color(dim))
+                    })
+                    .when(self.previous.is_some(), |this| {
+                        this.child(
+                            crate::style::chrome_button("search-back")
+                                .child(Icon::new(IconName::ArrowLeft).size(ICON).text_color(dim))
+                                .accessibility_label(t("Back"))
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(SearchPaletteEvent::Back)),
+                                )
+                                .app_tooltip(t("Back")),
+                        )
+                    })
                     .child(Input::new(&self.input).text_size(TEXT).appearance(false)),
             )
             .child(
@@ -277,17 +423,6 @@ impl Render for SearchPalette {
                     .max_h(max_list)
                     .overflow_y_scroll()
                     .p(px(6.))
-                    .when(query.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .px(px(6.))
-                                .pt(px(4.))
-                                .pb(px(4.))
-                                .text_size(TEXT)
-                                .text_color(dim)
-                                .child(t("COMMANDS")),
-                        )
-                    })
                     .when(!query.is_empty() && self.rows.is_empty(), |this| {
                         this.child(
                             div()
@@ -295,7 +430,10 @@ impl Render for SearchPalette {
                                 .text_center()
                                 .text_size(TEXT)
                                 .text_color(dim)
-                                .child(tf("No matches for \"{query}\".", &[("query", self.input.read(cx).value().trim().to_string())])),
+                                .child(tf(
+                                    "No matches for \"{query}\".",
+                                    &[("query", self.input.read(cx).value().trim().to_string())],
+                                )),
                         )
                     })
                     .children(rows),
@@ -303,29 +441,25 @@ impl Render for SearchPalette {
     }
 }
 
-/// A thread's row: its project and how long ago it moved.
-pub fn thread_item(id: u64, title: &str, project: Option<&PathBuf>, updated_at: u64) -> Item {
-    let project = project.map(|p| crate::threads::project_label(p));
-    let when = relative_time(updated_at);
+pub fn thread_item(thread: &crate::threads::Thread, detail: String) -> Item {
     Item {
         icon: IconName::MessageSquare,
-        label: title.to_string(),
-        detail: Some(match project {
-            Some(project) => format!("{project} · {when}"),
-            None => when,
-        }),
-        badge: Badge::Kind("Thread"),
-        target: Target::Thread(id),
-        updated_at,
+        agent: Some(thread.agent.clone()),
+        label: thread.title.clone(),
+        detail: Some(detail),
+        shortcut: None,
+        target: Target::Thread(thread.id),
+        updated_at: thread.updated_at,
     }
 }
 
 pub fn project_item(path: &PathBuf) -> Item {
     Item {
         icon: IconName::Folder,
+        agent: None,
         label: crate::threads::project_label(path),
         detail: Some(path.display().to_string()),
-        badge: Badge::Kind("Project"),
+        shortcut: None,
         target: Target::Project(path.clone()),
         updated_at: 0,
     }

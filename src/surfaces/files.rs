@@ -83,6 +83,8 @@ impl SurfaceView for FilesSurface {
             let (machine, root) = (ctx.machine.clone(), ctx.project.clone());
             self.tree.update(cx, |tree, cx| tree.set_location(machine, root, cx));
         }
+        let project = ctx.project_folder.clone();
+        self.tree.update(cx, |tree, cx| tree.set_title_project(project, cx));
         self.ctx = ctx.clone();
         self.load_status(cx);
     }

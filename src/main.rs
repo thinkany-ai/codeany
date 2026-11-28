@@ -184,7 +184,15 @@ fn main() {
     agl_bridge::start_local();
     remote::init();
 
-    gpui_kit::application()
+    let app = gpui_kit::application();
+    #[cfg(target_os = "macos")]
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            workspace::open_new_window(cx);
+        }
+    });
+
+    app
         .with_assets(style::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
@@ -208,6 +216,10 @@ fn main() {
                 }
             })
             .detach();
+            #[cfg(target_os = "macos")]
+            if let Err(err) = autostart::migrate_legacy_entry() {
+                eprintln!("codeany: could not migrate the login item: {err:#}");
+            }
             #[cfg(target_os = "macos")]
             if updater::start(cx) {
                 cx.set_global(UpdaterRunning);

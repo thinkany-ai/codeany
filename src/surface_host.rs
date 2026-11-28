@@ -44,9 +44,13 @@ pub struct SurfaceHost {
 impl EventEmitter<SurfaceHostEvent> for SurfaceHost {}
 
 impl SurfaceHost {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(include_files: bool, cx: &mut Context<Self>) -> Self {
+        let mut extensions = surfaces::builtin();
+        if !include_files {
+            extensions.retain(|extension| extension.manifest().id != "files");
+        }
         Self {
-            extensions: surfaces::builtin(),
+            extensions,
             open: Vec::new(),
             active: None,
             visible: false,
@@ -67,18 +71,21 @@ impl SurfaceHost {
 
     /// Show `project` on `machine` (`None`: this one): every surface follows
     /// the workspace to the device it is on.
-    pub fn set_location(&mut self, machine: Option<String>, project: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_location(&mut self, machine: Option<String>, project: Option<PathBuf>, project_folder: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(device) = machine.clone() else {
             let git_root = project.as_deref().and_then(|p| git::toplevel(None, p));
-            self.set_context(SurfaceContext { machine, project, git_root }, window, cx);
+            self.set_context(SurfaceContext { machine, project, project_folder, git_root }, window, cx);
             return;
         };
         if self.ctx.machine == machine && self.ctx.project == project {
+            if self.ctx.project_folder != project_folder {
+                self.set_context(SurfaceContext { project_folder, ..self.ctx.clone() }, window, cx);
+            }
             return;
         }
         // Its work tree is a round trip away: surfaces open without it and
         // hear of it when it is known.
-        self.set_context(SurfaceContext { machine, project: project.clone(), git_root: None }, window, cx);
+        self.set_context(SurfaceContext { machine, project: project.clone(), project_folder, git_root: None }, window, cx);
         let Some(project) = project else { return };
         cx.spawn_in(window, async move |this, cx| {
             let git_root = cx
@@ -234,11 +241,12 @@ impl SurfaceHost {
                     this.extensions.iter().fold(menu, |menu, extension| {
                         let manifest = extension.manifest();
                         let id = manifest.id;
-                        let disabled = this.index_of(id).is_none() && extension.unavailable(&this.ctx).is_some();
+                        if this.index_of(id).is_none() && extension.unavailable(&this.ctx).is_some() {
+                            return menu;
+                        }
                         let host = host.clone();
                         menu.item(
                             crate::style::menu_item_with_icon(t(manifest.name), manifest.icon.clone())
-                                .disabled(disabled)
                                 .on_click(move |_, window, cx| {
                                     let _ = host.update(cx, |this, cx| this.open(id, window, cx));
                                 }),
@@ -258,18 +266,18 @@ impl SurfaceHost {
             })
     }
 
-    /// The surfaces to open, each with its key; unavailable ones dimmed.
+    /// The available surfaces to open, each with its key.
     fn render_launcher(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let items: Vec<_> = self
             .extensions
             .iter()
-            .map(|e| (e.manifest(), e.unavailable(&self.ctx)))
+            .filter(|extension| extension.unavailable(&self.ctx).is_none())
+            .map(|extension| extension.manifest())
             .collect();
         let keys: Vec<(char, &'static str)> = items
             .iter()
-            .filter(|(_, unavailable)| unavailable.is_none())
-            .map(|(m, _)| (m.key, m.id))
+            .map(|m| (m.key, m.id))
             .collect();
         div()
             .id("surface-launcher")
@@ -299,8 +307,7 @@ impl SurfaceHost {
                     .text_color(theme.muted_foreground)
                     .child(t("Open a surface")),
             )
-            .children(items.into_iter().map(|(m, unavailable)| {
-                let enabled = unavailable.is_none();
+            .children(items.into_iter().map(|m| {
                 let open = self.index_of(m.id).is_some();
                 let id = m.id;
                 div()
@@ -312,19 +319,13 @@ impl SurfaceHost {
                     .gap_3()
                     .rounded_lg()
                     .text_size(TEXT)
-                    .when(!enabled, |this| this.opacity(0.45))
-                    .when(enabled, |this| {
-                        this.cursor_pointer()
-                            .hover(|this| this.bg(theme.list_hover))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open(id, window, cx);
-                            }))
-                    })
+                    .cursor_pointer()
+                    .hover(|this| this.bg(theme.list_hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open(id, window, cx);
+                    }))
                     .child(Icon::new(m.icon.clone()).size(ICON))
                     .child(div().flex_1().child(t(m.name)))
-                    .when_some(unavailable, |this, reason| {
-                        this.child(div().text_size(TEXT).text_color(theme.muted_foreground).child(t(reason)))
-                    })
                     .when(open, |this| this.child(div().size(px(6.)).rounded_full().bg(theme.primary)))
                     .child(
                         div()
