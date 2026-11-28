@@ -112,8 +112,8 @@ jobs:
           persist-credentials: false
       - name: Select release version
         run: |
-          git fetch --no-tags origin "refs/tags/v$VERSION:refs/tags/v$VERSION"
-          git restore --source "refs/tags/v$VERSION" -- Cargo.toml Cargo.lock
+          git fetch --no-tags origin "refs/tags/v$VERSION"
+          git restore --source FETCH_HEAD -- Cargo.toml Cargo.lock
       - uses: actions/download-artifact@v4
         with:
           name: codeany-macos-${{ needs.package.outputs.version }}
