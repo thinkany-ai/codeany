@@ -79,7 +79,8 @@ pub fn agent_command(agent: &str) -> Option<String> {
 pub fn agent_env(agent: &str) -> Vec<(String, String)> {
     let Ok(cfg) = agl::config::Config::load() else { return Vec::new() };
     let Some(entry) = cfg.custom_agents.iter().find(|c| c.id == agent) else { return Vec::new() };
-    let builtin = builtin_agent(agent).map(|d| d.env).unwrap_or_default();
+    let base = agent.split_once("-profile-").map_or(agent, |(base, _)| base);
+    let builtin = builtin_agent(base).map(|d| d.env).unwrap_or_default();
     let mut env: Vec<(String, String)> = entry
         .env
         .iter()
@@ -121,15 +122,27 @@ fn protocol_name(protocol: agl::agents::Protocol) -> &'static str {
     }
 }
 
+pub fn builtin_agent_ids() -> &'static std::collections::HashSet<String> {
+    static IDS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        agl::agents::registry(&agl::config::Config::default()).into_iter().map(|agent| agent.id).collect()
+    })
+}
+
 fn builtin_agent(agent: &str) -> Option<agl::agents::AgentDef> {
     agl::agents::registry(&agl::config::Config::default()).into_iter().find(|d| d.id == agent)
 }
+
+static CONFIG_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Choose an agent's executable (`None` or blank: look it up on the PATH)
 /// and the variables its processes start with, on this machine; agl then
 /// re-reads its configuration. Both live in agl's `custom_agents` entry.
 pub fn set_agent_launch(
     agent: String,
+    source: Option<String>,
+    new_protocol: Option<agl::agents::Protocol>,
+    name: String,
     command: Option<String>,
     env: Vec<(String, String)>,
 ) -> impl Future<Output = Result<()>> + Send + 'static {
@@ -141,37 +154,119 @@ pub fn set_agent_launch(
                 Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest).to_string_lossy().into_owned(),
                 None => c,
             });
-        let mut cfg = agl::config::Config::load()?;
-        cfg.custom_agents.retain(|c| c.id != agent);
-        if command.is_some() || !env.is_empty() {
-            let def = builtin_agent(&agent).ok_or_else(|| anyhow!("unknown agent {agent}"))?;
-            if !agent_command_editable(&agent) {
-                bail!("this agent's executable and environment cannot be changed");
+        {
+            let _write = CONFIG_WRITE.lock().unwrap();
+            let mut cfg = agl::config::Config::load()?;
+            if let Some(protocol) = new_protocol {
+                let command = command.ok_or_else(|| anyhow!("an executable is required"))?;
+                store_agent_entry(&mut cfg, agl::config::CustomAgent {
+                    id: agent,
+                    name: Some(name),
+                    command,
+                    args: Vec::new(),
+                    protocol: protocol_name(protocol).into(),
+                    env: env.into_iter().collect(),
+                    icon: None,
+                });
+            } else {
+                update_agent_launch(&mut cfg, agent, source.as_deref(), name, command, env)?;
             }
-            let protocol = protocol_name(def.protocol);
-            // No executable chosen: the agent's own command name, the first
-            // one found on the PATH, as agl would pick.
-            let command = command
-                .or_else(|| def.commands.iter().find(|c| agl::shellenv::which(c).is_some()).cloned())
-                .or_else(|| def.commands.first().cloned())
-                .ok_or_else(|| anyhow!("{agent} has no command"))?;
-            let mut merged: std::collections::HashMap<String, String> = def.env.into_iter().collect();
-            merged.extend(env);
-            cfg.custom_agents.push(agl::config::CustomAgent {
-                id: def.id,
-                name: Some(def.name),
-                command,
-                args: def.args,
-                protocol: protocol.into(),
-                env: merged,
-                // agl keeps a built-in agent's own icon when none is named.
-                icon: None,
-            });
+            cfg.save()?;
         }
-        cfg.save()?;
         backend(None).call("env.reload", json!({})).await?;
         Ok(())
     })
+}
+
+pub fn delete_agent(agent: String) -> impl Future<Output = Result<()>> + Send + 'static {
+    spawn(async move {
+        if builtin_agent_ids().contains(&agent) {
+            bail!("cannot delete a built-in agent");
+        }
+        {
+            let _write = CONFIG_WRITE.lock().unwrap();
+            let mut cfg = agl::config::Config::load()?;
+            cfg.custom_agents.retain(|entry| entry.id != agent);
+            cfg.save()?;
+        }
+        backend(None).call("env.reload", json!({})).await?;
+        Ok(())
+    })
+}
+
+fn update_agent_launch(
+    cfg: &mut agl::config::Config,
+    agent: String,
+    source: Option<&str>,
+    name: String,
+    command: Option<String>,
+    env: Vec<(String, String)>,
+) -> Result<()> {
+    let base_id = source.unwrap_or(&agent);
+    let builtin = builtin_agent(base_id);
+    let def = agl::agents::find_def(cfg, base_id).ok_or_else(|| anyhow!("unknown agent {base_id}"))?;
+    let default_def = builtin.as_ref().unwrap_or(&def);
+    let base = base_id.split_once("-profile-").map_or(base_id, |(base, _)| base);
+    let default_env = builtin_agent(base).map(|def| def.env).unwrap_or_default();
+    let icon = cfg.custom_agents.iter().find(|c| c.id == base_id).and_then(|c| c.icon.clone());
+    let command_override = command.is_some();
+    let needs_entry = source.is_some() || builtin.is_none() || command_override
+        || !env.is_empty() || name != default_def.name || icon.is_some();
+    if needs_entry && !agent_command_editable(base_id) {
+        bail!("this agent's executable and environment cannot be changed");
+    }
+    if needs_entry {
+        let command = command
+            .or_else(|| default_def.commands.iter().find(|c| agl::shellenv::which(c).is_some()).cloned())
+            .or_else(|| default_def.commands.first().cloned())
+            .ok_or_else(|| anyhow!("{base_id} has no command"))?;
+        let mut merged: std::collections::HashMap<String, String> =
+            default_env.into_iter().collect();
+        merged.extend(env);
+        store_agent_entry(cfg, agl::config::CustomAgent {
+            id: agent,
+            name: Some(name),
+            command,
+            args: def.args,
+            protocol: protocol_name(def.protocol).into(),
+            env: merged,
+            icon,
+        });
+    } else {
+        cfg.custom_agents.retain(|entry| entry.id != agent);
+    }
+    Ok(())
+}
+
+fn store_agent_entry(cfg: &mut agl::config::Config, entry: agl::config::CustomAgent) {
+    if let Some(existing) = cfg.custom_agents.iter_mut().find(|existing| existing.id == entry.id) {
+        *existing = entry;
+    } else {
+        cfg.custom_agents.insert(0, entry);
+    }
+}
+
+#[test]
+fn duplicate_agent_keeps_protocol_and_separates_config() {
+    let mut cfg = agl::config::Config::default();
+    let command = Some("/example/claude".to_string());
+    update_agent_launch(
+        &mut cfg, "claude".into(), None, "Claude Personal".into(), command.clone(),
+        vec![("TEST_PROFILE".into(), "personal".into())],
+    ).unwrap();
+    update_agent_launch(
+        &mut cfg, "claude-profile-test".into(), Some("claude"), "Claude Work".into(), command,
+        vec![("TEST_PROFILE".into(), "work".into())],
+    ).unwrap();
+
+    let original = agl::agents::find_def(&cfg, "claude").unwrap();
+    let copy = agl::agents::find_def(&cfg, "claude-profile-test").unwrap();
+    assert_eq!(copy.commands, original.commands);
+    assert!(copy.protocol == agl::agents::Protocol::Claude);
+    assert_eq!(original.name, "Claude Personal");
+    assert_eq!(copy.name, "Claude Work");
+    assert_eq!(original.env, vec![("TEST_PROFILE".into(), "personal".into())]);
+    assert_eq!(copy.env, vec![("TEST_PROFILE".into(), "work".into())]);
 }
 
 /// What the connection test asks for, and the answer it wants back.
@@ -505,7 +600,11 @@ impl Backend {
     /// Installed agents and what agl can do with each.
     pub fn detect(&self) -> impl Future<Output = Result<Vec<AgentInfo>>> + Send + 'static {
         let call = self.call("agents.list", json!({}));
-        async move { Ok(serde_json::from_value(call.await?)?) }
+        async move {
+            let mut agents: Vec<AgentInfo> = serde_json::from_value(call.await?)?;
+            agents.sort_by_key(|agent| builtin_agent_ids().contains(&agent.id));
+            Ok(agents)
+        }
     }
 
     /// Models an agent offers, without starting a conversation.

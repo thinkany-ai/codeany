@@ -740,10 +740,14 @@ impl Hub {
                 let mut changed = false;
                 for ws in s.store.workspaces.iter_mut().filter(|w| w.device.as_deref() == Some(machine.as_str())) {
                     if let Some(theirs) = list.iter().find(|r| r.id == ws.id) {
-                        if (&ws.title, &ws.icon, &ws.projects) != (&theirs.title, &theirs.icon, &theirs.projects) {
+                        if (&ws.title, &ws.icon, &ws.projects, &ws.project_names, &ws.removed_projects)
+                            != (&theirs.title, &theirs.icon, &theirs.projects, &theirs.project_names, &theirs.removed_projects)
+                        {
                             ws.title = theirs.title.clone();
                             ws.icon = theirs.icon.clone();
                             ws.projects = theirs.projects.clone();
+                            ws.project_names = theirs.project_names.clone();
+                            ws.removed_projects = theirs.removed_projects.clone();
                             changed = true;
                         }
                     }

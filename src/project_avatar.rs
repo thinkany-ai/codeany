@@ -58,9 +58,33 @@ fn decode_logo(path: &Path, format: ImageFormat) -> Option<image::RgbaImage> {
     if bytes.len() as u64 > MAX_LOGO_BYTES {
         return None;
     }
-    if format == ImageFormat::Svg {
-        return render_svg(&bytes);
+    let pixels = if format == ImageFormat::Svg {
+        render_svg(&bytes)?
+    } else {
+        decode_raster(bytes, format)?
+    };
+    // Asset canvases can include transparent margins around the actual logo.
+    // Fit the visible artwork into the avatar, preserving its aspect ratio.
+    let (mut left, mut top) = (pixels.width(), pixels.height());
+    let (mut right, mut bottom) = (0, 0);
+    for (x, y, pixel) in pixels.enumerate_pixels() {
+        if pixel.0[3] != 0 {
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x + 1);
+            bottom = bottom.max(y + 1);
+        }
     }
+    if left >= right || top >= bottom {
+        return None;
+    }
+    let visible = image::imageops::crop_imm(&pixels, left, top, right - left, bottom - top);
+    Some(image::DynamicImage::ImageRgba8(visible.to_image())
+        .resize(THUMBNAIL_SIZE, THUMBNAIL_SIZE, image::imageops::FilterType::Lanczos3)
+        .into_rgba8())
+}
+
+fn decode_raster(bytes: Vec<u8>, format: ImageFormat) -> Option<image::RgbaImage> {
     let format = image::ImageFormat::from_extension(format.extension())?;
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     let mut limits = image::Limits::default();
@@ -68,7 +92,7 @@ fn decode_logo(path: &Path, format: ImageFormat) -> Option<image::RgbaImage> {
     limits.max_image_height = Some(4096);
     limits.max_alloc = Some(96 * 1024 * 1024);
     reader.limits(limits);
-    Some(reader.decode().ok()?.thumbnail(THUMBNAIL_SIZE, THUMBNAIL_SIZE).into_rgba8())
+    Some(reader.decode().ok()?.into_rgba8())
 }
 
 fn render_svg(bytes: &[u8]) -> Option<image::RgbaImage> {

@@ -305,9 +305,7 @@ impl Render for SearchPalette {
 
 /// A thread's row: its project and how long ago it moved.
 pub fn thread_item(id: u64, title: &str, project: Option<&PathBuf>, updated_at: u64) -> Item {
-    let project = project
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned());
+    let project = project.map(|p| crate::threads::project_label(p));
     let when = relative_time(updated_at);
     Item {
         icon: IconName::MessageSquare,
@@ -325,10 +323,7 @@ pub fn thread_item(id: u64, title: &str, project: Option<&PathBuf>, updated_at: 
 pub fn project_item(path: &PathBuf) -> Item {
     Item {
         icon: IconName::Folder,
-        label: path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string()),
+        label: crate::threads::project_label(path),
         detail: Some(path.display().to_string()),
         badge: Badge::Kind("Project"),
         target: Target::Project(path.clone()),

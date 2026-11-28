@@ -1,7 +1,7 @@
 //! The Projects section's filter menu: search the projects, show one of
 //! them only (or all), and choose how they are sorted.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
@@ -16,9 +16,26 @@ use crate::project_avatar::ProjectAvatar;
 use crate::style::layout;
 use crate::style::size::{ICON, TEXT};
 
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum ProjectSelection {
+    #[default]
+    All,
+    Project(PathBuf),
+    ChatsOnly,
+}
+
+impl ProjectSelection {
+    pub fn includes(&self, project: Option<&Path>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Project(path) => project == Some(path.as_path()),
+            Self::ChatsOnly => project.is_none(),
+        }
+    }
+}
+
 pub enum ProjectFilterEvent {
-    /// Show only this project; `None` shows all of them.
-    Pick(Option<PathBuf>),
+    Pick(ProjectSelection),
     /// Sort by name (true) or by last activity.
     SortByName(bool),
 }
@@ -26,7 +43,7 @@ pub enum ProjectFilterEvent {
 pub struct ProjectFilter {
     input: Entity<InputState>,
     projects: Vec<PathBuf>,
-    selected: Option<PathBuf>,
+    selected: ProjectSelection,
     by_name: bool,
     _subscription: Subscription,
 }
@@ -34,10 +51,7 @@ pub struct ProjectFilter {
 impl EventEmitter<ProjectFilterEvent> for ProjectFilter {}
 
 fn name(project: &std::path::Path) -> String {
-    project
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| project.display().to_string())
+    crate::threads::project_label(project)
 }
 
 impl ProjectFilter {
@@ -48,19 +62,21 @@ impl ProjectFilter {
             // Enter picks the first project that matches.
             InputEvent::PressEnter { .. } => {
                 if let Some(first) = this.matches(cx).into_iter().next() {
-                    cx.emit(ProjectFilterEvent::Pick(Some(first)));
+                    cx.emit(ProjectFilterEvent::Pick(ProjectSelection::Project(first)));
+                } else if this.matches_chats_only(cx) {
+                    cx.emit(ProjectFilterEvent::Pick(ProjectSelection::ChatsOnly));
                 }
             }
             _ => {}
         });
-        Self { input, projects: Vec::new(), selected: None, by_name: false, _subscription }
+        Self { input, projects: Vec::new(), selected: ProjectSelection::All, by_name: false, _subscription }
     }
 
     /// What to list as the menu opens: a fresh search, focused.
     pub fn open(
         &mut self,
         projects: Vec<PathBuf>,
-        selected: Option<PathBuf>,
+        selected: ProjectSelection,
         by_name: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -73,6 +89,11 @@ impl ProjectFilter {
             input.focus(window, cx);
         });
         cx.notify();
+    }
+
+    fn matches_chats_only(&self, cx: &App) -> bool {
+        let query = self.input.read(cx).value().trim().to_lowercase();
+        t("Chats only").to_lowercase().contains(&query)
     }
 
     fn matches(&self, cx: &App) -> Vec<PathBuf> {
@@ -114,14 +135,15 @@ impl Render for ProjectFilter {
         let mut list = div().id("project-filter-list").max_h(px(320.)).overflow_y_scroll().flex().flex_col().gap(px(2.));
         if !searching {
             list = list.child(
-                row("all-projects".into(), self.selected.is_none())
+                row("all-projects".into(), self.selected == ProjectSelection::All)
                     .child(Icon::new(IconName::Folder).size(ICON).text_color(theme.muted_foreground))
                     .child(div().flex_1().child(t("All projects")))
-                    .child(check(self.selected.is_none()))
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ProjectFilterEvent::Pick(None)))),
+                    .child(check(self.selected == ProjectSelection::All))
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ProjectFilterEvent::Pick(ProjectSelection::All)))),
             );
         }
-        if matches.is_empty() {
+        let show_chats_only = self.matches_chats_only(cx);
+        if matches.is_empty() && !show_chats_only {
             list = list.child(
                 div()
                     .px(layout::SPACE_2)
@@ -132,7 +154,7 @@ impl Render for ProjectFilter {
             );
         }
         for (ix, project) in matches.into_iter().enumerate() {
-            let selected = self.selected.as_ref() == Some(&project);
+            let selected = matches!(&self.selected, ProjectSelection::Project(path) if path == &project);
             let label: SharedString = name(&project).into();
             let pick = project.clone();
             list = list.child(
@@ -148,7 +170,18 @@ impl Render for ProjectFilter {
                             .child(label),
                     )
                     .child(check(selected))
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(ProjectFilterEvent::Pick(Some(pick.clone()))))),
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(ProjectFilterEvent::Pick(ProjectSelection::Project(pick.clone()))))),
+            );
+        }
+
+        if show_chats_only {
+            let selected = self.selected == ProjectSelection::ChatsOnly;
+            list = list.child(
+                row("chats-only".into(), selected)
+                    .child(Icon::new(IconName::MessageCircle).size(ICON).text_color(theme.muted_foreground))
+                    .child(div().flex_1().child(t("Chats only")))
+                    .child(check(selected))
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ProjectFilterEvent::Pick(ProjectSelection::ChatsOnly)))),
             );
         }
 

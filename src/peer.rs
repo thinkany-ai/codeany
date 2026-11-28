@@ -27,6 +27,23 @@
 //! After the handshake the client sends one JSON line (`{"service":"agl"}`,
 //! `{"ping":true}`, …), the host answers one, and a service request then
 //! carries a WebSocket both ways.
+//!
+//! Devices of one account that are not paired get a direct link too, the
+//! way Termany's `nex.direct` does it. The relay stays the source of trust:
+//!
+//! ```text
+//!   client                       relay                        host
+//!     | -- "codeany.e2e" stream --> | -------------------------> |
+//!     | <-- ticket, key, addresses  | <------------------------- |
+//!     | ===== Noise NNpsk0 to 192.168.x / 100.x (no relay) ====> |
+//! ```
+//!
+//! The relay only carries a stream between devices of one account, so a
+//! device that gets a ticket is in the account. The ticket lasts
+//! `TICKET_TTL` and is renewed through the relay, which a device removed
+//! from the account can no longer do. The key passes through the relay, as
+//! everything does between devices that are not paired; pairing two devices
+//! keeps the relay out of it.
 
 use std::{
     collections::HashMap,
@@ -67,6 +84,19 @@ const MODE_PAIRED: u8 = b'K';
 const MODE_REQUEST: u8 = b'Q';
 /// Asks for the authorization code; only over the relay (loopback here).
 const MODE_INVITE: u8 = b'I';
+/// Asks for a ticket to connect directly; only over the relay (loopback
+/// here), which has checked that both devices are in one account.
+const MODE_TICKET: u8 = b'T';
+/// A direct connection from a device of the account, with its ticket.
+const MODE_ACCOUNT: u8 = b'A';
+const PATTERN_ACCOUNT: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
+/// The relay service that says this device hands out tickets.
+pub const DIRECT_SERVICE: &str = "codeany.direct";
+/// 16 random bytes, then when it expires (unix seconds, big endian).
+const TICKET_LEN: usize = 24;
+/// How long a ticket lets an account device connect directly before it
+/// has to ask the relay for the next one.
+const TICKET_TTL: Duration = Duration::from_secs(15 * 60);
 
 const MAX_FRAME: usize = 65_535;
 const CHUNK: usize = 16 * 1024;
@@ -77,6 +107,10 @@ const DIAL_TIMEOUT: Duration = Duration::from_millis(1500);
 /// A device that did not answer directly is not tried again for this long
 /// before a connection falls back to the relay.
 const DIRECT_RETRY: Duration = Duration::from_secs(30);
+/// The same for an account device that is not paired. Longer than the
+/// pause between measurements, so those find it again, not a connection
+/// that someone waits on.
+pub const ACCOUNT_RETRY: Duration = Duration::from_secs(60);
 /// No 0/O, 1/I: the code is read off one screen and typed into another.
 const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -195,7 +229,17 @@ pub struct Request {
     invite: Invite,
 }
 
-/// How a paired device answers directly right now.
+/// What an account device gave us to reach it directly.
+#[derive(Clone)]
+struct Ticket {
+    ticket: Vec<u8>,
+    key: [u8; 32],
+    endpoints: Vec<Endpoint>,
+    /// When to ask for the next one.
+    renew_at: Instant,
+}
+
+/// How a device answers directly right now.
 #[derive(Clone, Debug)]
 pub struct DirectStatus {
     /// Round trip once connected, like a ping.
@@ -214,8 +258,15 @@ struct State {
     requests: Vec<Request>,
     /// The port the listener got.
     port: Option<u16>,
+    listen_error: Option<String>,
     tailscale_name: Option<String>,
+    /// By public key for a paired device, by relay id for an account device.
     direct: HashMap<String, DirectStatus>,
+    /// Tickets of account devices, by relay id.
+    tickets: HashMap<String, Ticket>,
+    /// What this device's own tickets are derived from. Never saved: a
+    /// restart, or leaving the account, voids every ticket handed out.
+    ticket_master: [u8; 32],
     /// The secret of the last authorization code copied, and when it stops
     /// working. Kept in memory only: a restart voids it too.
     offer: Option<(Vec<u8>, Instant)>,
@@ -231,8 +282,11 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         file: read_file(&peers_path()),
         requests: Vec::new(),
         port: None,
+        listen_error: None,
         tailscale_name: None,
         direct: HashMap::new(),
+        tickets: HashMap::new(),
+        ticket_master: random_key(),
         offer: None,
         offer_scanned: false,
         scanned_in: Vec::new(),
@@ -391,6 +445,70 @@ fn pairing_psk(secret: &[u8]) -> [u8; 32] {
         .expand(b"codeany-pairing/v1", &mut out)
         .expect("32 bytes is a valid HKDF length");
     out
+}
+
+fn random_key() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    out[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    out
+}
+
+fn ticket_key(master: &[u8; 32], ticket: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hkdf::Hkdf::<Sha256>::new(Some(b"codeany-direct/v1"), master)
+        .expand(ticket, &mut out)
+        .expect("32 bytes is a valid HKDF length");
+    out
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether account devices that are not paired may connect directly.
+fn tickets_allowed() -> bool {
+    crate::remote::account().is_some() && !strict()
+}
+
+/// A ticket for a device the relay vouches for, as the answer it gets.
+fn issue_ticket() -> Value {
+    if !tickets_allowed() {
+        return json!({ "error": "this device only accepts end-to-end encrypted devices" });
+    }
+    let mut ticket = uuid::Uuid::new_v4().as_bytes().to_vec();
+    ticket.extend_from_slice(&(unix_now() + TICKET_TTL.as_secs()).to_be_bytes());
+    let key = ticket_key(&STATE.lock().unwrap().ticket_master, &ticket);
+    json!({
+        "ok": true,
+        "ticket": B64.encode(&ticket),
+        "key": B64.encode(key),
+        "ttl": TICKET_TTL.as_secs(),
+        "endpoints": local_endpoints(),
+    })
+}
+
+/// The key of a ticket this device handed out and that still works.
+fn redeem_ticket(ticket: &[u8]) -> Result<[u8; 32]> {
+    if ticket.len() != TICKET_LEN || !tickets_allowed() {
+        bail!("no ticket is accepted");
+    }
+    let expires = u64::from_be_bytes(ticket[16..].try_into().expect("8 bytes"));
+    if expires <= unix_now() {
+        bail!("the ticket expired");
+    }
+    Ok(ticket_key(&STATE.lock().unwrap().ticket_master, ticket))
+}
+
+/// Void every ticket, handed out or held: the account changed.
+pub fn reset_tickets() {
+    let mut state = STATE.lock().unwrap();
+    state.ticket_master = random_key();
+    state.tickets.clear();
+    state.direct.retain(|key, _| key.starts_with(PUBLIC_KEY_PREFIX));
 }
 
 /// How long a copied authorization code lets devices ask to connect.
@@ -649,6 +767,47 @@ pub fn port() -> Option<u16> {
     STATE.lock().unwrap().port
 }
 
+pub fn listen_error() -> Option<String> {
+    STATE.lock().unwrap().listen_error.clone()
+}
+
+fn port_path() -> std::path::PathBuf {
+    crate::paths::home().join("peer-port.json")
+}
+
+pub fn save_port(port: Option<std::num::NonZeroU16>) -> Result<()> {
+    write_secret(&port_path(), &port)
+}
+
+pub fn configured_port() -> Option<std::num::NonZeroU16> {
+    let path = port_path();
+    match std::fs::read_to_string(&path) {
+        Ok(value) => match serde_json::from_str(&value) {
+            Ok(port) => port,
+            Err(err) => {
+                eprintln!("codeany: invalid device port setting: {err}");
+                None
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            eprintln!("codeany: cannot read device port setting: {err}");
+            None
+        }
+    }
+}
+
+pub fn port_override() -> Option<u16> {
+    std::env::var("CODEANY_PEER_PORT").ok()?.parse().ok()
+}
+
+pub fn default_port() -> u16 {
+    let dev = crate::paths::home()
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with("-dev"));
+    DEFAULT_PORT + u16::from(dev)
+}
+
 // ---------------------------------------------------------------------------
 // Network addresses
 // ---------------------------------------------------------------------------
@@ -804,7 +963,7 @@ where
     };
     let prologue = prologue(mode);
     let mut builder = snow::Builder::new(pattern.parse()?).prologue(&prologue);
-    if mode != MODE_INVITE {
+    if !matches!(mode, MODE_INVITE | MODE_TICKET) {
         let remote = remote.ok_or_else(|| anyhow!("no key for the other device"))?;
         builder = builder.local_private_key(private).remote_public_key(remote);
     }
@@ -821,6 +980,29 @@ where
         .map_err(|_| anyhow!(t("the device closed the connection during the handshake")))?;
     hs.read_message(&reply, &mut buf)
         .map_err(|_| anyhow!(t("the device is not the one paired (its key does not match)")))?;
+    Ok(spawn_transport(io, hs.into_stateless_transport_mode()?))
+}
+
+/// The client half of a direct connection to an account device.
+async fn initiate_account<S>(mut io: S, ticket: &[u8], key: &[u8; 32]) -> Result<DuplexStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut prologue = prologue(MODE_ACCOUNT);
+    prologue.extend_from_slice(ticket);
+    let mut hs = snow::Builder::new(PATTERN_ACCOUNT.parse()?)
+        .prologue(&prologue)
+        .psk(0, key)
+        .build_initiator()?;
+    let mut buf = vec![0u8; MAX_FRAME];
+    io.write_u8(MODE_ACCOUNT).await?;
+    write_frame(&mut io, ticket).await?;
+    let n = hs.write_message(&[], &mut buf)?;
+    write_frame(&mut io, &buf[..n]).await?;
+    // A host that restarted, or left the account, no longer knows the
+    // ticket and hangs up.
+    let reply = read_frame(&mut io).await.map_err(|_| anyhow!("the ticket was refused"))?;
+    hs.read_message(&reply, &mut buf).map_err(|_| anyhow!("the ticket was refused"))?;
     Ok(spawn_transport(io, hs.into_stateless_transport_mode()?))
 }
 
@@ -871,26 +1053,22 @@ async fn reply(stream: &mut DuplexStream, value: Value) -> Result<()> {
 pub fn start() {
     LazyLock::force(&IDENTITY);
     agl_bridge::runtime().spawn(async {
-        let wanted = std::env::var("CODEANY_PEER_PORT")
-            .ok()
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or_else(|| {
-                let dev = crate::paths::home()
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().ends_with("-dev"));
-                DEFAULT_PORT + u16::from(dev)
-            });
+        let explicit = port_override().or_else(|| configured_port().map(std::num::NonZeroU16::get));
+        let wanted = explicit.unwrap_or_else(default_port);
         let listener = match TcpListener::bind(("0.0.0.0", wanted)).await {
-            Ok(l) => l,
+            Err(err) if explicit.is_none() => {
+                eprintln!("codeany: cannot listen on device port {wanted} ({err}); using another");
+                TcpListener::bind(("0.0.0.0", 0)).await
+            }
+            result => result,
+        };
+        let listener = match listener {
+            Ok(listener) => listener,
             Err(err) => {
-                eprintln!("codeany: port {wanted} for paired devices is taken ({err}); using another");
-                match TcpListener::bind(("0.0.0.0", 0)).await {
-                    Ok(l) => l,
-                    Err(err) => {
-                        eprintln!("codeany: cannot listen for paired devices: {err}");
-                        return;
-                    }
-                }
+                let error = format!("TCP {wanted}: {err}");
+                eprintln!("codeany: cannot listen for paired devices: {error}");
+                STATE.lock().unwrap().listen_error = Some(error);
+                return;
             }
         };
         let port = listener.local_addr().map(|a| a.port()).ok();
@@ -939,6 +1117,7 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
     let _ = socket.set_nodelay(true);
     let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mode = socket.read_u8().await?;
+        let mut prologue = prologue(mode);
         let (pattern, psk, secret) = match mode {
             MODE_PAIRED => (PATTERN_PAIRED, None, None),
             // Asking to connect needs the secret of a code still in force.
@@ -949,16 +1128,24 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
             // The authorization code only goes to the relay's streams: those
             // reach this port from loopback; LAN neighbours do not.
             MODE_INVITE if from.ip().is_loopback() => (PATTERN_INVITE, None, None),
+            // So does a ticket: the relay only carries streams between
+            // devices of one account.
+            MODE_TICKET if from.ip().is_loopback() => (PATTERN_INVITE, None, None),
+            MODE_ACCOUNT => {
+                let ticket = read_frame(&mut socket).await?;
+                let key = redeem_ticket(&ticket)?;
+                prologue.extend_from_slice(&ticket);
+                (PATTERN_ACCOUNT, Some(key), None)
+            }
             _ => bail!("unexpected greeting"),
         };
         let private = IDENTITY.private();
-        let prologue = prologue(mode);
         let mut builder = snow::Builder::new(pattern.parse()?).prologue(&prologue);
-        if mode != MODE_INVITE {
+        if matches!(mode, MODE_PAIRED | MODE_REQUEST) {
             builder = builder.local_private_key(&private);
         }
         if let Some(psk) = &psk {
-            builder = builder.psk(2, psk);
+            builder = builder.psk(if mode == MODE_ACCOUNT { 0 } else { 2 }, psk);
         }
         let mut hs = builder.build_responder()?;
         let mut buf = vec![0u8; MAX_FRAME];
@@ -980,6 +1167,10 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
     let request: Value = serde_json::from_str(&line)?;
     match mode {
         MODE_INVITE => reply(&mut stream, json!({ "ok": true, "invite": new_invite() })).await,
+        MODE_TICKET => reply(&mut stream, issue_ticket()).await,
+        // The ticket's key got it this far; it is served like a device
+        // that came through the relay, only over a shorter way.
+        MODE_ACCOUNT => serve_request(stream, request).await,
         MODE_REQUEST => {
             let remote = remote.ok_or_else(|| anyhow!("no key"))?;
             let answer = match accept_request(&remote, &request["pair"]) {
@@ -1012,7 +1203,7 @@ async fn serve(mut socket: TcpStream, from: SocketAddr) -> Result<()> {
 }
 
 /// A request from a paired device.
-async fn serve_paired(mut stream: DuplexStream, remote: &str, request: Value) -> Result<()> {
+async fn serve_paired(stream: DuplexStream, remote: &str, request: Value) -> Result<()> {
     // It may tell us how to reach it now; keep its addresses current.
     if let Some(hello) = request.get("hello").and_then(|h| h.as_str()) {
         if let Ok(invite) = parse_invite(hello) {
@@ -1021,6 +1212,11 @@ async fn serve_paired(mut stream: DuplexStream, remote: &str, request: Value) ->
             }
         }
     }
+    serve_request(stream, request).await
+}
+
+/// Answer a device that may use this one: a ping, or one of the services.
+async fn serve_request(mut stream: DuplexStream, request: Value) -> Result<()> {
     if request["check"].as_bool() == Some(true) || request["ping"].as_bool() == Some(true) {
         let share = crate::remote::hosting();
         return reply(
@@ -1207,10 +1403,16 @@ pub enum Via {
 /// the relay (still end-to-end encrypted).
 async fn open_paired(peer: &Peer, allow_relay: bool) -> Result<(DuplexStream, Via)> {
     let remote = parse_public_key(&peer.public_key)?;
-    let recently_failed = direct_status(&peer.public_key)
-        .is_some_and(|s| s.rtt_ms.is_none() && s.at.elapsed() < DIRECT_RETRY);
-    let mut direct_error = None;
-    if !(recently_failed && allow_relay && peer.nex_device_id.is_some()) {
+    let status = direct_status(&peer.public_key);
+    let recently_failed = status.as_ref().is_some_and(|s| s.rtt_ms.is_none() && s.at.elapsed() < DIRECT_RETRY);
+    let relay = peer.nex_device_id.as_deref().filter(|_| allow_relay && crate::remote::account().is_some());
+    // The relay first when the direct way is the slow one (a tailnet that
+    // itself goes through a far relay, say).
+    let relay_faster = relay.is_some_and(|id| {
+        let direct = status.as_ref().and_then(|s| s.rtt_ms);
+        direct.is_some() && !crate::remote::direct_wins(direct, crate::remote::relay_rtt(id))
+    });
+    let direct = || async {
         let handshake = |socket: TcpStream| {
             let remote = remote.clone();
             async move {
@@ -1219,20 +1421,35 @@ async fn open_paired(peer: &Peer, allow_relay: bool) -> Result<(DuplexStream, Vi
                     .map_err(|_| anyhow!("handshake timed out"))?
             }
         };
-        match dial_with(&peer.endpoints, handshake).await {
+        dial_with(&peer.endpoints, handshake).await
+    };
+    let mut direct_error = None;
+    if !((recently_failed || relay_faster) && relay.is_some()) {
+        match direct().await {
             Ok((stream, endpoint)) => return Ok((stream, Via::Direct(endpoint))),
             Err(err) => direct_error = Some(err),
         }
     }
-    match (&peer.nex_device_id, allow_relay && crate::remote::account().is_some()) {
-        (Some(nex_id), true) => {
-            let io = relay_stream(nex_id).await?;
-            let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, initiate(io, MODE_PAIRED, Some(&remote), None))
-                .await
-                .map_err(|_| anyhow!("handshake timed out"))??;
-            Ok((stream, Via::Relay))
+    match relay {
+        Some(nex_id) => {
+            let opened = async {
+                let io = relay_stream(nex_id).await?;
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, initiate(io, MODE_PAIRED, Some(&remote), None))
+                    .await
+                    .map_err(|_| anyhow!("handshake timed out"))?
+            }
+            .await;
+            match opened {
+                Ok(stream) => Ok((stream, Via::Relay)),
+                // The relay was only the faster of two ways that work.
+                Err(err) if relay_faster => match direct().await {
+                    Ok((stream, endpoint)) => Ok((stream, Via::Direct(endpoint))),
+                    Err(_) => Err(err),
+                },
+                Err(err) => Err(err),
+            }
         }
-        _ => Err(anyhow!(tf(
+        None => Err(anyhow!(tf(
             "cannot reach {name} directly ({reason}); both machines need the same Wi-Fi or Tailscale network, or the same account",
             &[
                 ("name", peer.display_name()),
@@ -1314,6 +1531,142 @@ pub async fn remeasure() {
             }
         };
         set_direct(&peer.public_key, status);
+    });
+    futures::future::join_all(checks).await;
+}
+
+// ---------------------------------------------------------------------------
+// Account devices, directly
+// ---------------------------------------------------------------------------
+
+/// The ticket to reach `nex_id` directly: the one held, or a new one from
+/// the device itself, through the relay.
+async fn ticket_for(nex_id: &str) -> Result<Ticket> {
+    if let Some(ticket) = STATE.lock().unwrap().tickets.get(nex_id) {
+        if Instant::now() < ticket.renew_at {
+            return Ok(ticket.clone());
+        }
+    }
+    let io = relay_stream(nex_id).await?;
+    let mut stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, initiate(io, MODE_TICKET, None, None))
+        .await
+        .map_err(|_| anyhow!(t("the device did not answer")))??;
+    let answer = tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange(&mut stream, &json!({ "direct": true })))
+        .await
+        .map_err(|_| anyhow!(t("the device did not answer")))??;
+    let bytes = |name: &str| answer[name].as_str().and_then(|text| B64.decode(text).ok());
+    let ticket = bytes("ticket").filter(|t| t.len() == TICKET_LEN);
+    let key = bytes("key").and_then(|k| <[u8; 32]>::try_from(k).ok());
+    let (Some(ticket), Some(key)) = (ticket, key) else {
+        bail!("the device sent no ticket");
+    };
+    let endpoints: Vec<Endpoint> = serde_json::from_value(answer["endpoints"].clone()).unwrap_or_default();
+    let endpoints = endpoints
+        .into_iter()
+        .take(16)
+        .filter(|e| {
+            e.port > 0
+                && !e.host.is_empty()
+                && e.host.len() <= 253
+                && e.host.chars().all(|c| c.is_ascii_alphanumeric() || ".:_-".contains(c))
+        })
+        .collect();
+    let ttl = answer["ttl"].as_u64().unwrap_or(0).min(TICKET_TTL.as_secs());
+    let ticket = Ticket {
+        ticket,
+        key,
+        endpoints,
+        // Well before the device stops taking it.
+        renew_at: Instant::now() + Duration::from_secs(ttl.saturating_sub(60)),
+    };
+    STATE.lock().unwrap().tickets.insert(nex_id.to_string(), ticket.clone());
+    Ok(ticket)
+}
+
+/// A session with an account device over the LAN or the tailnet.
+async fn open_account(nex_id: &str) -> Result<(DuplexStream, Endpoint)> {
+    let ticket = ticket_for(nex_id).await?;
+    let handshake = |socket: TcpStream| {
+        let ticket = ticket.clone();
+        async move {
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, initiate_account(socket, &ticket.ticket, &ticket.key))
+                .await
+                .map_err(|_| anyhow!("handshake timed out"))?
+        }
+    };
+    let opened = dial_with(&ticket.endpoints, handshake).await;
+    if opened.is_err() {
+        // It may have restarted or moved to another network: the next try
+        // asks it again.
+        STATE.lock().unwrap().tickets.remove(nex_id);
+    }
+    opened
+}
+
+fn unreachable(err: &anyhow::Error) -> DirectStatus {
+    DirectStatus { rtt_ms: None, endpoint: None, note: Some(format!("{err:#}")), share: false, at: Instant::now() }
+}
+
+/// Whether a connection to this account device should try the direct way:
+/// not when it just failed to answer there.
+pub fn account_direct_due(nex_id: &str) -> bool {
+    !direct_status(nex_id).is_some_and(|s| s.rtt_ms.is_none() && s.at.elapsed() < ACCOUNT_RETRY)
+}
+
+/// A WebSocket to `service` on an account device, without the relay.
+pub async fn connect_account(nex_id: &str, service: &str) -> Result<crate::remote::Ws> {
+    let (mut stream, endpoint) = match open_account(nex_id).await {
+        Ok(found) => found,
+        Err(err) => {
+            set_direct(nex_id, unreachable(&err));
+            return Err(err);
+        }
+    };
+    let started = Instant::now();
+    exchange(&mut stream, &json!({ "service": service })).await?;
+    set_direct(
+        nex_id,
+        DirectStatus {
+            rtt_ms: Some((started.elapsed().as_millis() as u32).max(1)),
+            endpoint: Some(endpoint),
+            note: None,
+            share: true,
+            at: Instant::now(),
+        },
+    );
+    let (ws, _) = tokio_tungstenite::client_async(format!("ws://{nex_id}/{service}"), stream)
+        .await
+        .context("open the stream")?;
+    Ok(Box::new(ws))
+}
+
+/// Measure the direct way to these account devices (the ones online that
+/// hand out tickets and are not paired), and forget every other one.
+pub async fn measure_account(nex_ids: Vec<String>) {
+    {
+        let mut state = STATE.lock().unwrap();
+        state.tickets.retain(|id, _| nex_ids.contains(id));
+        state.direct.retain(|key, _| key.starts_with(PUBLIC_KEY_PREFIX) || nex_ids.contains(key));
+    }
+    let checks = nex_ids.into_iter().map(|nex_id| async move {
+        let measured = async {
+            let (mut stream, endpoint) = open_account(&nex_id).await?;
+            let started = Instant::now();
+            let answer = exchange(&mut stream, &json!({ "ping": true })).await?;
+            anyhow::Ok(DirectStatus {
+                rtt_ms: Some((started.elapsed().as_millis() as u32).max(1)),
+                endpoint: Some(endpoint),
+                note: None,
+                share: answer["share"].as_bool().unwrap_or(false),
+                at: Instant::now(),
+            })
+        };
+        let status = match tokio::time::timeout(Duration::from_secs(12), measured).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(err)) => unreachable(&err),
+            Err(_) => unreachable(&anyhow!("timed out")),
+        };
+        set_direct(&nex_id, status);
     });
     futures::future::join_all(checks).await;
 }
@@ -1646,6 +1999,124 @@ mod tests {
         });
     }
 
+    #[test]
+    fn tickets_expire_and_belong_to_one_master() {
+        let master = [4u8; 32];
+        let mut ticket = vec![1u8; 16];
+        ticket.extend_from_slice(&100u64.to_be_bytes());
+        let key = ticket_key(&master, &ticket);
+        assert_eq!(key, ticket_key(&master, &ticket));
+        // Another device, or this one after a restart.
+        assert_ne!(key, ticket_key(&[5u8; 32], &ticket));
+        // A later expiry written into the ticket is another ticket.
+        let mut longer = ticket.clone();
+        longer[23] ^= 1;
+        assert_ne!(key, ticket_key(&master, &longer));
+        // Signed out, no ticket is taken at all.
+        assert!(redeem_ticket(&ticket).is_err());
+    }
+
+    #[test]
+    fn the_faster_way_wins_and_direct_wins_ties() {
+        use crate::remote::direct_wins;
+        assert!(direct_wins(Some(3), Some(180)));
+        assert!(direct_wins(Some(120), Some(100)));
+        assert!(direct_wins(Some(40), None));
+        // A tailnet that goes around the world loses to the relay.
+        assert!(!direct_wins(Some(400), Some(120)));
+        assert!(!direct_wins(None, Some(120)));
+        assert!(!direct_wins(None, None));
+    }
+
+    /// A device of the account that is not paired, over the real listener:
+    /// `cargo test peer::tests::listener_serves_account -- --ignored --test-threads=1`
+    #[test]
+    #[ignore]
+    fn listener_serves_account_devices_by_ticket() {
+        let home = std::env::temp_dir().join(format!("codeany-account-test-{}", std::process::id()));
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        // SAFETY: an ignored test run on its own, before any thread reads them.
+        unsafe {
+            std::env::set_var("CODEANY_HOME", &home);
+            std::env::set_var("CODEANY_PEER_PORT", port.to_string());
+        }
+        let _inbox = crate::sync::start(&[]);
+        start();
+        set_share(true);
+        let rt = agl_bridge::runtime();
+        rt.block_on(async {
+            for _ in 0..50 {
+                if self::port().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(self::port(), Some(port));
+            let dial = || TcpStream::connect(("127.0.0.1", port));
+            // What the relay's stream is to the listener: a loopback connection.
+            let ask = || async {
+                let mut s = initiate(dial().await.unwrap(), MODE_TICKET, None, None).await.unwrap();
+                exchange(&mut s, &json!({ "direct": true })).await
+            };
+            let parts = |answer: &Value| {
+                let ticket = B64.decode(answer["ticket"].as_str().unwrap()).unwrap();
+                let key: [u8; 32] = B64.decode(answer["key"].as_str().unwrap()).unwrap().try_into().unwrap();
+                (ticket, key)
+            };
+
+            // Signed out there is no account to be a device of.
+            assert!(ask().await.is_err());
+
+            crate::remote::set_test_account(true);
+            let answer = ask().await.unwrap();
+            let (ticket, key) = parts(&answer);
+            assert_eq!(ticket.len(), TICKET_LEN);
+            assert_eq!(answer["ttl"], TICKET_TTL.as_secs());
+            let endpoints: Vec<Endpoint> = serde_json::from_value(answer["endpoints"].clone()).unwrap();
+            assert!(endpoints.iter().all(|e| e.port == port));
+
+            // The ticket gets a ping answered, and a service.
+            let mut s = initiate_account(dial().await.unwrap(), &ticket, &key).await.unwrap();
+            let pong = exchange(&mut s, &json!({ "ping": true })).await.unwrap();
+            assert_eq!(pong["share"], true);
+            let mut s = initiate_account(dial().await.unwrap(), &ticket, &key).await.unwrap();
+            exchange(&mut s, &json!({ "service": "codeany" })).await.unwrap();
+            let (mut ws, _) = tokio_tungstenite::client_async("ws://account/codeany", s).await.unwrap();
+            let msg = agl::protocol::WireMsg::Request { id: "1".into(), method: "threads.list".into(), params: json!({}) }.to_json();
+            ws.send(Message::Text(msg.into())).await.unwrap();
+            let Some(Ok(Message::Text(reply))) = ws.next().await else { panic!("no reply") };
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["result"], json!([]));
+
+            // Not without the key, nor with a ticket made to last longer.
+            assert!(initiate_account(dial().await.unwrap(), &ticket, &[0u8; 32]).await.is_err());
+            let mut longer = ticket.clone();
+            longer[16] = 0x7f;
+            assert!(initiate_account(dial().await.unwrap(), &longer, &key).await.is_err());
+            // A ticket that ran out.
+            let mut old = ticket[..16].to_vec();
+            old.extend_from_slice(&(unix_now() - 1).to_be_bytes());
+            let old_key = ticket_key(&STATE.lock().unwrap().ticket_master, &old);
+            assert!(initiate_account(dial().await.unwrap(), &old, &old_key).await.is_err());
+
+            // Only end-to-end encrypted devices: no tickets, old or new.
+            STATE.lock().unwrap().file.strict = true;
+            assert!(ask().await.is_err());
+            assert!(initiate_account(dial().await.unwrap(), &ticket, &key).await.is_err());
+            STATE.lock().unwrap().file.strict = false;
+            assert!(initiate_account(dial().await.unwrap(), &ticket, &key).await.is_ok());
+
+            // Leaving the account voids what was handed out.
+            reset_tickets();
+            assert!(initiate_account(dial().await.unwrap(), &ticket, &key).await.is_err());
+            let (ticket, key) = parts(&ask().await.unwrap());
+            assert!(initiate_account(dial().await.unwrap(), &ticket, &key).await.is_ok());
+            crate::remote::set_test_account(false);
+            assert!(initiate_account(dial().await.unwrap(), &ticket, &key).await.is_err());
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The real listener, end to end, in a throwaway home:
     /// `cargo test peer::tests::listener -- --ignored --test-threads=1`
     #[test]
@@ -1656,8 +2127,9 @@ mod tests {
         // SAFETY: an ignored test run on its own, before any thread reads them.
         unsafe {
             std::env::set_var("CODEANY_HOME", &home);
-            std::env::set_var("CODEANY_PEER_PORT", port.to_string());
+            std::env::remove_var("CODEANY_PEER_PORT");
         }
+        save_port(std::num::NonZeroU16::new(port)).unwrap();
         let mut inbox = crate::sync::start(&[]);
         start();
         let rt = agl_bridge::runtime();

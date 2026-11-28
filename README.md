@@ -46,8 +46,10 @@ the error and keeps the running app. Ctrl-C stops both.
 
 Settings → Devices connects your machines, like Termany's device management:
 
-- **Account**: sign in with termany.sh (or reuse Termany's sign-in) on each machine. While
-  signed in a machine is online on the nex relay.
+- **Account**: sign in with codeany.ai on each machine. While signed in a machine is online
+  on the nex relay, and the account's machines reach each other with no pairing: directly
+  over the same Wi-Fi or Tailscale network when that answers (the relay hands out a
+  short-lived key for it), through the relay otherwise or when it is clearly faster.
 - **Authorization code**: connect two machines without an account, or end-to-end encrypt
   two in the same account. Paste one machine's authorization code into **Connect a device**
   on the other, then type the connection code it shows into **Verify access** on the first.

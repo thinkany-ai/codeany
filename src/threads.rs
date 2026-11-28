@@ -797,9 +797,58 @@ pub struct Workspace {
     /// Its projects, beyond the folders its threads work in.
     #[serde(default)]
     pub projects: Vec<PathBuf>,
+    /// The names given to its projects, by folder; one without a name
+    /// shows its folder's.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub project_names: HashMap<PathBuf, String>,
+    /// Projects removed from the list. Their folders and conversations are
+    /// kept, so a folder is not listed again just for the threads that
+    /// worked in it, until it is added back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_projects: Vec<PathBuf>,
+}
+
+/// Every named project's name, by folder, for whatever shows a project:
+/// kept current as the store loads and saves.
+static PROJECT_NAMES: std::sync::RwLock<Option<HashMap<PathBuf, String>>> = std::sync::RwLock::new(None);
+
+/// What a project is called: the name it was given, else its folder's.
+pub fn project_label(project: &std::path::Path) -> String {
+    if let Some(name) = PROJECT_NAMES.read().unwrap().as_ref().and_then(|names| names.get(project)) {
+        return name.clone();
+    }
+    folder_label(project)
+}
+
+/// A folder's own name.
+pub fn folder_label(folder: &std::path::Path) -> String {
+    folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| folder.display().to_string())
 }
 
 impl Workspace {
+    /// List `project`, first; one removed before is back.
+    pub fn add_project(&mut self, project: &std::path::Path) {
+        self.removed_projects.retain(|p| p != project);
+        if !self.projects.iter().any(|p| p == project) {
+            self.projects.insert(0, project.to_path_buf());
+        }
+    }
+
+    /// Take `project` off the list, with the name it was given. Its
+    /// conversations stay, out of sight until it is added again.
+    pub fn remove_project(&mut self, project: &std::path::Path) {
+        self.projects.retain(|p| p != project);
+        self.project_names.remove(project);
+        if !self.removed_projects.iter().any(|p| p == project) {
+            self.removed_projects.push(project.to_path_buf());
+        }
+    }
+
+    /// Whether `project` was removed from the list.
+    pub fn removed(&self, project: &std::path::Path) -> bool {
+        self.removed_projects.iter().any(|p| p == project)
+    }
+
     pub fn new(title: String, icon: Option<String>, device: Option<String>, device_name: Option<String>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -808,6 +857,8 @@ impl Workspace {
             device,
             device_name,
             projects: Vec::new(),
+            project_names: HashMap::new(),
+            removed_projects: Vec::new(),
         }
     }
 
@@ -1045,11 +1096,29 @@ impl Store {
         if let Some(db) = &store.db {
             crate::db::start_writer(db, &path);
         }
+        store.publish_project_names();
         store
+    }
+
+    /// Tell [`project_label`] what the projects are called. This device's
+    /// names win where a folder of the same path is named elsewhere too.
+    pub fn publish_project_names(&self) {
+        *PROJECT_NAMES.write().unwrap() = Some(self.project_names());
+    }
+
+    fn project_names(&self) -> HashMap<PathBuf, String> {
+        let mut names = HashMap::new();
+        for remote in [true, false] {
+            for ws in self.workspaces.iter().filter(|w| w.device.is_some() == remote) {
+                names.extend(ws.project_names.iter().map(|(folder, name)| (folder.clone(), name.clone())));
+            }
+        }
+        names
     }
 
     /// Write what changed.
     pub fn save(&self) {
+        self.publish_project_names();
         let Some(db) = &self.db else { return };
         db.set_setting("agent", &self.agent);
         db.set_setting("access", &self.access);
@@ -1268,6 +1337,41 @@ mod provider_error_tests {
         assert_eq!(provider_error(r#"Here is the config: {"error": {"message": "x"}}"#), None);
         assert_eq!(provider_error(r#"{"name": "codeany"}"#), None);
         assert_eq!(provider_error("All done."), None);
+    }
+}
+
+#[cfg(test)]
+mod project_tests {
+    use super::*;
+
+    #[test]
+    fn a_removed_project_stays_off_the_list_until_it_is_added_again() {
+        let folder = PathBuf::from("/Users/me/code/api-server");
+        let mut ws = Workspace::new("mbp".into(), None, None, None);
+        ws.add_project(&folder);
+        ws.project_names.insert(folder.clone(), "Billing API".into());
+        ws.remove_project(&folder);
+        assert!(ws.removed(&folder) && ws.projects.is_empty() && ws.project_names.is_empty());
+        ws.add_project(&folder);
+        ws.add_project(&folder);
+        assert!(!ws.removed(&folder));
+        assert_eq!(ws.projects, vec![folder]);
+    }
+
+    #[test]
+    fn this_devices_name_for_a_folder_wins() {
+        let folder = PathBuf::from("/Users/me/code/api-server");
+        let mut store = Store::default();
+        let mut here = Workspace::new("mbp".into(), None, None, None);
+        here.project_names.insert(folder.clone(), "Billing API".into());
+        let mut there = Workspace::new("mini".into(), None, Some("dev1".into()), None);
+        there.project_names.insert(folder.clone(), "Mini's API".into());
+        there.project_names.insert(PathBuf::from("/srv/site"), "Site".into());
+        store.workspaces = vec![here, there];
+        let names = store.project_names();
+        assert_eq!(names[&folder], "Billing API");
+        assert_eq!(names[std::path::Path::new("/srv/site")], "Site");
+        assert_eq!(folder_label(&folder), "api-server");
     }
 }
 

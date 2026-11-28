@@ -93,6 +93,10 @@ impl Section {
 /// The agent settings being edited.
 struct AgentEditor {
     id: String,
+    source: Option<String>,
+    new_protocol: Option<agl::agents::Protocol>,
+    name: Entity<InputState>,
+    original_name: String,
     path: Entity<InputState>,
     args: Entity<TextareaState>,
     /// `NAME=value` per line, set on the agent's processes.
@@ -105,6 +109,13 @@ struct AgentEditor {
     icon: IconChoice,
     error: Option<String>,
     saving: bool,
+    confirm_delete: bool,
+}
+
+impl AgentEditor {
+    fn is_draft(&self) -> bool {
+        self.source.is_some() || self.new_protocol.is_some()
+    }
 }
 
 enum IconChoice {
@@ -121,10 +132,10 @@ enum AgentTest {
     Failed(String),
 }
 
-/// Whether devices can join through a termany.sh account. Off until the
-/// cloud side ships: devices connect with an authorization code only. A
-/// machine already signed in still shows the account and can sign out.
-const ACCOUNTS: bool = false;
+/// Whether devices can join through a codeany.ai account. Without it
+/// devices connect with an authorization code only; a machine already
+/// signed in still shows the account and can sign out.
+const ACCOUNTS: bool = true;
 
 /// Shortcuts that belong to one control and cannot be changed.
 const FIXED_SHORTCUTS: &[(&str, &str)] = &[
@@ -147,6 +158,11 @@ fn logo() -> Arc<Image> {
 pub struct Settings {
     section: Section,
     agent_panel: WeakEntity<AgentPanel>,
+    port_input: Option<Entity<InputState>>,
+    port_saved: bool,
+    port_error: Option<String>,
+    autostart: Option<Result<bool, String>>,
+    autostart_error: Option<String>,
     /// Every device, while Devices is shown.
     devices: Option<Result<Vec<remote::Device>, String>>,
     /// A sign-in, sign-out or other device action is under way.
@@ -217,6 +233,11 @@ impl Settings {
         Self {
             section: Section::Appearance,
             agent_panel: agent_panel.downgrade(),
+            port_input: None,
+            port_saved: false,
+            port_error: None,
+            autostart: None,
+            autostart_error: None,
             devices: None,
             busy: false,
             device_error: None,
@@ -342,7 +363,7 @@ impl Settings {
             .child(control)
     }
 
-    fn render_general(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_general(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(panel) = self.agent_panel.upgrade() else {
             return div().into_any_element();
         };
@@ -384,6 +405,7 @@ impl Settings {
                     menu
                 }
             });
+        let startup = self.render_startup(window, cx);
         let language = Self::row(
             "Language",
             Some(t("Follows the system unless you pick one.").into()),
@@ -393,7 +415,82 @@ impl Settings {
         div()
             .child(Self::heading("General", cx))
             .child(Self::card(language, cx))
+            .child(startup)
             .into_any_element()
+    }
+
+    fn render_startup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let input = self.port_input.get_or_insert_with(|| cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder(peer::default_port().to_string());
+            if let Some(port) = peer::configured_port() {
+                state.set_value(port.to_string(), window, cx);
+            }
+            state
+        })).clone();
+        let port_override = peer::port_override();
+        let mut hint = t("Leave blank to use the default. Changes take effect after restarting CodeAny.").to_string();
+        if let Some(port) = peer::port() {
+            hint.push(' ');
+            hint.push_str(&tf("Listening on TCP {port}.", &[("port", port.to_string())]));
+        }
+        let port_control = div().flex().items_center().gap_2()
+            .child(div().w(px(96.)).child(Input::new(&input).disabled(port_override.is_some())))
+            .child(Button::new("save-device-port").outline().app_label(t("Save"))
+                .disabled(port_override.is_some())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let value = input.read(cx).value();
+                    let value = value.trim();
+                    let result = if value.is_empty() {
+                        peer::save_port(None).map_err(|err| err.to_string())
+                    } else {
+                        value.parse::<std::num::NonZeroU16>()
+                            .map_err(|_| t("Enter a port from 1 to 65535.").to_string())
+                            .and_then(|port| peer::save_port(Some(port)).map_err(|err| err.to_string()))
+                    };
+                    this.port_saved = result.is_ok();
+                    this.port_error = result.err();
+                    cx.notify();
+                })))
+            .into_any_element();
+        let autostart = self.autostart.get_or_insert_with(|| crate::autostart::enabled().map_err(|err| err.to_string()));
+        let login = Self::row(
+            "Launch CodeAny at login",
+            None,
+            Switch::new("launch-at-login")
+                .checked(matches!(autostart, Ok(true)))
+                .disabled(autostart.is_err())
+                .on_click(cx.listener(|this, enabled: &bool, _, cx| {
+                    match crate::autostart::set_enabled(*enabled) {
+                        Ok(()) => {
+                            this.autostart = Some(Ok(*enabled));
+                            this.autostart_error = None;
+                        }
+                        Err(err) => this.autostart_error = Some(err.to_string()),
+                    }
+                    cx.notify();
+                }))
+                .into_any_element(),
+            cx,
+        );
+        let content = div()
+            .child(Self::row("Device connection port", Some(hint), port_control, cx))
+            .when(port_override.is_some(), |this| this.child(
+                div().text_size(TEXT).child(t("Managed by CODEANY_PEER_PORT.")),
+            ))
+            .when(self.port_saved, |this| this.child(
+                div().text_size(TEXT).child(t("Port saved. Restart CodeAny to apply it.")),
+            ))
+            .when_some(self.port_error.clone(), |this, err| this.child(Self::error_banner(err, cx)))
+            .when_some(peer::listen_error(), |this, err| this.child(Self::error_banner(
+                format!("{} {err}", t("Could not listen for device connections.")),
+                cx,
+            )))
+            .child(login)
+            .when_some(
+                self.autostart_error.clone().or_else(|| self.autostart.as_ref()?.as_ref().err().cloned()),
+                |this, err| this.child(Self::error_banner(err, cx)),
+            );
+        Self::card(content, cx).mt_4()
     }
 
     /// A small picture of a theme: sidebar strip, accent dot and text lines.
@@ -590,7 +687,7 @@ impl Settings {
         div().child(Self::subheading("Typography", cx).mt_0()).child(Self::card(rows, cx))
     }
 
-    fn open_agent_editor(&mut self, agent: &str, detected: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_agent_editor(&mut self, agent: &str, name: &str, detected: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         // The executable in use: the one chosen here, else the one found.
         let custom = crate::agl_bridge::agent_command(agent);
         let custom_command = custom.is_some();
@@ -618,8 +715,17 @@ impl Settings {
             input.set_value(env_text, window, cx);
             input
         });
+        let name_input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(name.to_string(), window, cx);
+            input
+        });
         self.agent_editor = Some(AgentEditor {
             id: agent.to_string(),
+            source: None,
+            new_protocol: None,
+            name: name_input,
+            original_name: name.to_string(),
             path,
             args: args_input,
             env: env_input,
@@ -629,7 +735,47 @@ impl Settings {
             icon: IconChoice::Keep,
             error: None,
             saving: false,
+            confirm_delete: false,
         });
+        cx.notify();
+    }
+
+    fn add_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = format!("custom-{}", uuid::Uuid::new_v4());
+        self.open_agent_editor(&id, "", None, window, cx);
+        if let Some(editor) = &mut self.agent_editor {
+            editor.new_protocol = Some(agl::agents::Protocol::Acp);
+            editor.name.update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
+    fn duplicate_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.agent_editor else { return };
+        if editor.saving || editor.source.is_some() {
+            return;
+        }
+        let source = editor.id.clone();
+        let base = source.split_once("-profile-").map_or(source.as_str(), |(base, _)| base);
+        editor.id = format!("{base}-profile-{}", uuid::Uuid::new_v4());
+        editor.source = Some(source.clone());
+        let title = tf("{name} (copy)", &[("name", editor.name.read(cx).value().trim().to_string())]);
+        editor.name.update(cx, |input, cx| {
+            input.set_value(title, window, cx);
+            input.focus(window, cx);
+        });
+        // Keep the variable names visible without activating any source credentials.
+        let template = editor.env.read(cx).value().lines().filter_map(|line| {
+            let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+            let key = line.split('=').next()?.trim();
+            (!key.is_empty() && !key.starts_with('#')).then(|| format!("# {key}="))
+        }).collect::<Vec<_>>().join("\n");
+        editor.env.update(cx, |input, cx| input.set_value(template, window, cx));
+        if matches!(editor.icon, IconChoice::Keep) {
+            if let Some(path) = crate::agent_icons::custom_icon(&source) {
+                editor.icon = IconChoice::Picked(path);
+            }
+        }
+        editor.error = None;
         cx.notify();
     }
 
@@ -659,7 +805,20 @@ impl Settings {
     fn save_agent(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = &mut self.agent_editor else { return };
         let id = editor.id.clone();
+        let source = editor.source.clone();
+        let new_protocol = editor.new_protocol;
+        let name = editor.name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            editor.error = Some(t("Enter an agent name.").into());
+            cx.notify();
+            return;
+        }
         let command = editor.path.read(cx).value().trim().to_string();
+        if new_protocol.is_some() && command.is_empty() {
+            editor.error = Some(t("Enter an executable path or command.").into());
+            cx.notify();
+            return;
+        }
         let args: Vec<String> = editor
             .args
             .read(cx)
@@ -687,12 +846,12 @@ impl Settings {
             cx.notify();
             return;
         }
-        if let Some(panel) = self.agent_panel.upgrade() {
-            panel.update(cx, |panel, cx| panel.set_agent_args(&id, args, cx));
-        }
         let command_changed = command != editor.original_command;
         let env_changed = env != editor.original_env;
-        if !command_changed && !env_changed {
+        if new_protocol.is_none() && source.is_none() && !command_changed && !env_changed && name == editor.original_name {
+            if let Some(panel) = self.agent_panel.upgrade() {
+                panel.update(cx, |panel, cx| panel.set_agent_args(&id, args, cx));
+            }
             self.agent_editor = None;
             self.agent_tests.remove(&id);
             cx.refresh_windows();
@@ -702,8 +861,9 @@ impl Settings {
         editor.saving = true;
         editor.error = None;
         // An executable found on the PATH and left alone stays looked up.
-        let command = (command_changed || editor.custom_command).then_some(command);
-        let save = crate::agl_bridge::set_agent_launch(id.clone(), command, env);
+        let created = source.is_some() || new_protocol.is_some();
+        let command = (created || command_changed || editor.custom_command).then_some(command);
+        let save = crate::agl_bridge::set_agent_launch(id.clone(), source, new_protocol, name, command, env);
         cx.spawn(async move |this, cx| {
             let result = save.await;
             this.update(cx, |this, cx| {
@@ -712,7 +872,13 @@ impl Settings {
                         this.agent_editor = None;
                         this.agent_tests.remove(&id);
                         if let Some(panel) = this.agent_panel.upgrade() {
-                            panel.update(cx, |panel, cx| panel.redetect_local_agents(cx));
+                            panel.update(cx, |panel, cx| {
+                                panel.set_agent_args(&id, args, cx);
+                                if created {
+                                    panel.set_agent_enabled(&id, true, cx);
+                                }
+                                panel.redetect_local_agents(cx);
+                            });
                         }
                     }
                     Err(err) => {
@@ -728,6 +894,43 @@ impl Settings {
             .ok();
         })
         .detach();
+        cx.notify();
+    }
+
+    fn delete_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &mut self.agent_editor else { return };
+        if editor.saving || !editor.confirm_delete || editor.is_draft() {
+            return;
+        }
+        let id = editor.id.clone();
+        editor.saving = true;
+        editor.error = None;
+        let delete = crate::agl_bridge::delete_agent(id.clone());
+        cx.spawn(async move |this, cx| {
+            let result = delete.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.agent_editor = None;
+                        this.agent_tests.remove(&id);
+                        if let Some(panel) = this.agent_panel.upgrade() {
+                            panel.update(cx, |panel, cx| {
+                                panel.set_agent_args(&id, Vec::new(), cx);
+                                panel.set_agent_enabled(&id, false, cx);
+                                panel.redetect_local_agents(cx);
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(editor) = &mut this.agent_editor {
+                            editor.saving = false;
+                            editor.error = Some(format!("{err:#}"));
+                        }
+                    }
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
         cx.notify();
     }
 
@@ -778,6 +981,22 @@ impl Settings {
                 panel.update(cx, |panel, cx| panel.redetect_local_agents(cx)).ok();
             });
         }
+        let heading = div()
+            .flex()
+            .items_start()
+            .justify_between()
+            .child(Self::heading("Agents", cx))
+            .child(
+                Button::new("agent-add")
+                    .outline()
+                    .app_icon(IconName::Plus)
+                    .app_label(t("Add agent"))
+                    .disabled(self.agent_editor.as_ref().is_some_and(|editor| editor.saving || editor.is_draft()))
+                    .on_click(cx.listener(|this, _, window, cx| this.add_agent(window, cx))),
+            );
+        let draft = self.agent_editor.as_ref()
+            .filter(|editor| editor.is_draft())
+            .map(|editor| self.render_agent_editor(&editor.id, cx));
         let intro = div()
             .mb_2()
             .text_size(TEXT)
@@ -789,7 +1008,8 @@ impl Settings {
             Some(Err(err)) => {
                 let panel = self.agent_panel.clone();
                 return div()
-                    .child(Self::heading("Agents", cx))
+                    .child(heading)
+                    .children(draft)
                     .child(intro)
                     .child(
                         div()
@@ -812,17 +1032,21 @@ impl Settings {
             }
             None => {
                 return div()
-                    .child(Self::heading("Agents", cx))
+                    .child(heading)
+                    .children(draft)
                     .child(intro)
                     .child(div().text_size(TEXT).text_color(theme.muted_foreground).child(t("Detecting agents…")))
                     .into_any_element();
             }
         };
-        agents.sort_by_key(|a| !a.available);
+        agents.sort_by_key(|agent| {
+            let builtin = crate::agl_bridge::builtin_agent_ids().contains(&agent.id);
+            (builtin, builtin && !agent.available)
+        });
         let mut rows = div();
         for (ix, agent) in agents.into_iter().enumerate() {
             let id = agent.id.clone();
-            let editing = self.agent_editor.as_ref().is_some_and(|e| e.id == id);
+            let editing = self.agent_editor.as_ref().is_some_and(|e| !e.is_draft() && e.id == id);
             let enabled = self.agent_panel.upgrade().is_some_and(|p| p.read(cx).agent_enabled(&id));
             // The version says it runs; the executable is under Edit.
             let detail = match &agent.version {
@@ -882,10 +1106,11 @@ impl Settings {
                             Button::new(("edit-agent", ix))
                                 .outline()
                                 .app_label(t("Edit"))
-                                .disabled(editing)
+                                .disabled(editing || self.agent_editor.as_ref().is_some_and(|editor| editor.saving))
                                 .on_click(cx.listener({
                                     let id = id.clone();
-                                    move |this, _, window, cx| this.open_agent_editor(&id, detected.clone(), window, cx)
+                                    let name = agent.name.clone();
+                                    move |this, _, window, cx| this.open_agent_editor(&id, &name, detected.clone(), window, cx)
                                 })),
                         ),
                 );
@@ -895,8 +1120,9 @@ impl Settings {
             rows = rows.child(row);
         }
         div()
-            .child(Self::heading("Agents", cx))
+            .child(heading)
             .child(intro)
+            .children(draft)
             .child(Self::card(rows, cx))
             .into_any_element()
     }
@@ -914,8 +1140,14 @@ impl Settings {
         let testing = matches!(test, Some(AgentTest::Running));
         let env_changed = parse_env(&editor.env.read(cx).value()).ok().as_ref() != Some(&editor.original_env);
         // The test runs what agl has saved.
-        let path_changed = editor.path.read(cx).value().trim() != editor.original_command.trim() || env_changed;
+        let path_changed = editor.new_protocol.is_some() || editor.source.is_some() || editor.path.read(cx).value().trim() != editor.original_command.trim() || env_changed;
         let test_line: AnyElement = match test {
+            _ if editor.new_protocol.is_some() => div().into_any_element(),
+            _ if editor.source.is_some() => div()
+                .text_size(TEXT)
+                .text_color(theme.muted_foreground)
+                .child(t("Save the copy before testing."))
+                .into_any_element(),
             _ if path_changed => div()
                 .text_size(TEXT)
                 .text_color(theme.muted_foreground)
@@ -958,7 +1190,8 @@ impl Settings {
             IconChoice::Keep => crate::agent_icons::custom_icon(agent).is_some(),
         };
         div()
-            .ml(px(44.))
+            .when(!editor.is_draft(), |this| this.ml(px(44.)))
+            .when(editor.is_draft(), |this| this.mb_3())
             .p_3()
             .rounded_lg()
             .border_1()
@@ -967,6 +1200,45 @@ impl Settings {
             .flex()
             .flex_col()
             .gap_3()
+            .when_some(editor.new_protocol, |this, selected| {
+                use agl::agents::Protocol;
+                let protocols = [
+                    ("ACP", Protocol::Acp),
+                    ("Claude Code", Protocol::Claude),
+                    ("Codex", Protocol::Codex),
+                    ("Cursor Agent", Protocol::Cursor),
+                    ("Pi", Protocol::Pi),
+                ];
+                let name = protocols.iter().find(|(_, protocol)| *protocol == selected)
+                    .map(|(name, _)| *name).unwrap_or("ACP");
+                let settings = cx.entity().downgrade();
+                this.child(
+                    div().flex().items_start().gap_2()
+                        .child(label("Connection method"))
+                        .child(
+                            Button::new("agent-protocol")
+                                .outline()
+                                .app_label(name)
+                                .dropdown_caret(true)
+                                .disabled(editor.saving)
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for (name, protocol) in protocols {
+                                        let settings = settings.clone();
+                                        menu = menu.item(style::menu_item(name).checked(protocol == selected)
+                                            .on_click(move |_, _, cx| {
+                                                settings.update(cx, |this, cx| {
+                                                    if let Some(editor) = &mut this.agent_editor {
+                                                        editor.new_protocol = Some(protocol);
+                                                    }
+                                                    cx.notify();
+                                                }).ok();
+                                            }));
+                                    }
+                                    menu
+                                }),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -998,6 +1270,11 @@ impl Settings {
                                 )
                             }),
                     ),
+            )
+            .child(
+                div().flex().items_start()
+                    .child(label("Name"))
+                    .child(div().flex_1().min_w_0().child(Input::new(&editor.name).text_size(TEXT))),
             )
             .child(
                 div()
@@ -1097,11 +1374,36 @@ impl Settings {
                                 move |this, _, _, cx| this.test_agent(id.clone(), cx)
                             })),
                     )
+                    .when(editor.new_protocol.is_none() && editor.source.is_none() && editable, |this| {
+                        this.child(
+                            Button::new("agent-duplicate")
+                                .outline()
+                                .app_label(t("Duplicate agent"))
+                                .disabled(editor.saving)
+                                .on_click(cx.listener(|this, _, window, cx| this.duplicate_agent(window, cx))),
+                        )
+                    })
+                    .when(!editor.is_draft() && !crate::agl_bridge::builtin_agent_ids().contains(agent), |this| {
+                        this.child(
+                            Button::new("agent-delete")
+                                .danger()
+                                .outline()
+                                .app_label(t("Delete"))
+                                .disabled(editor.saving || editor.confirm_delete)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(editor) = &mut this.agent_editor {
+                                        editor.confirm_delete = true;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(div().flex_1().min_w_0().child(test_line))
                     .child(
                         Button::new("agent-cancel")
                             .ghost()
                             .app_label(t("Cancel"))
+                            .disabled(editor.saving)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.agent_editor = None;
                                 cx.notify();
@@ -1115,6 +1417,31 @@ impl Settings {
                             .on_click(cx.listener(|this, _, _, cx| this.save_agent(cx))),
                     ),
             )
+            .when(editor.confirm_delete, |this| {
+                this.child(
+                    div().flex().items_center().gap_2()
+                        .child(div().flex_1().text_size(TEXT).child(t("Delete this agent configuration? Conversation history is kept.")))
+                        .child(
+                            Button::new("agent-delete-cancel")
+                                .ghost()
+                                .app_label(t("Cancel"))
+                                .disabled(editor.saving)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(editor) = &mut this.agent_editor {
+                                        editor.confirm_delete = false;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("agent-delete-confirm")
+                                .danger()
+                                .app_label(t("Delete"))
+                                .disabled(editor.saving)
+                                .on_click(cx.listener(|this, _, _, cx| this.delete_agent(cx))),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -1387,7 +1714,7 @@ impl Render for Settings {
             self.verify_input = Some(input);
         }
         let content = match self.section {
-            Section::General => self.render_general(cx),
+            Section::General => self.render_general(window, cx),
             Section::Appearance => self.render_appearance(window, cx),
             Section::Agents => self.render_agents(window, cx),
             Section::Devices => self.render_devices(window, cx),
@@ -1569,10 +1896,7 @@ impl Settings {
             return;
         }
         input.update(cx, |input, cx| input.set_value("", window, cx));
-        let server = remote::termany_account()
-            .map(|(server, _)| server)
-            .unwrap_or_else(|| remote::DEFAULT_RELAY.to_string());
-        self.device_action(remote::join(server, code, true), cx);
+        self.device_action(remote::join(remote::DEFAULT_RELAY.to_string(), code, true), cx);
     }
 
     fn create_pairing_code(&mut self, cx: &mut Context<Self>) {
@@ -2058,7 +2382,7 @@ impl Settings {
                 .child(
                     Button::new("sign-in")
                         .primary()
-                        .app_label(if pending_login { t("Open the browser again") } else { t("Sign in with termany.sh") })
+                        .app_label(if pending_login { t("Open the browser again") } else { t("Sign in with codeany.ai") })
                         .disabled(busy)
                         .on_click(cx.listener(|this, _, _, cx| this.sign_in_browser(cx))),
                 )
@@ -2093,23 +2417,6 @@ impl Settings {
 
         // Signed out: other ways into an account.
         if ACCOUNTS && status.is_none() {
-            if let Some((server, account)) = remote::termany_account() {
-                let hint = match account {
-                    Some(account) => tf("Termany on this machine is signed in as {account}.", &[("account", account.to_string())]),
-                    None => tf("Termany on this machine is linked to {server}.", &[("server", server.to_string())]),
-                };
-                card = card.child(Self::row(
-                    "Use Termany's account",
-                    Some(hint),
-                    Button::new("join-termany")
-                        .outline()
-                        .app_label(t("Use it"))
-                        .disabled(busy || pending_login)
-                        .on_click(cx.listener(|this, _, _, cx| this.device_action(remote::join_termany(true), cx)))
-                        .into_any_element(),
-                    cx,
-                ));
-            }
             let code_input = self.code_input.clone();
             card = card.child(Self::row(
                 "Join with an account code",
@@ -2585,8 +2892,10 @@ impl Settings {
         }
 
         // Both ways to it, as round trips: LAN 3 ms · Cloud 180 ms.
+        // A device of the account that is not paired shows its direct way
+        // only while it answers there: most are on another network.
         let mut routes = Vec::new();
-        if paired && !pending {
+        if !pending && (paired || device.direct_ok()) {
             let direct = device.direct.as_ref();
             let network = direct
                 .and_then(|d| d.endpoint.as_ref())
@@ -2597,11 +2906,11 @@ impl Settings {
                     Some(ms) => format!("{network} {ms} ms"),
                     None => format!("{network} —"),
                 },
-                direct.is_some_and(|d| d.rtt_ms.is_some()),
+                device.uses_direct(),
             ));
         }
         if device.via_account && device.account_online {
-            let direct_in_use = routes.first().is_some_and(|(_, used)| *used);
+            let direct_in_use = device.uses_direct();
             routes.push((
                 match device.relay_rtt {
                     Some(ms) => tf("Cloud {ms} ms", &[("ms", ms.to_string())]),

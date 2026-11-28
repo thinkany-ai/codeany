@@ -117,6 +117,7 @@ pub fn agent_icon(agent: &str, size: Pixels, cx: &App) -> AnyElement {
 
 /// An agent's own logo, ignoring any picked in Settings.
 pub fn builtin_icon(agent: &str, size: Pixels, cx: &App) -> AnyElement {
+    let agent = agent.split_once("-profile-").map_or(agent, |(base, _)| base);
     let Some(image) = logo(agent) else {
         return Icon::new(IconName::Bot)
             .size(size)

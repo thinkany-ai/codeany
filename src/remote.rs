@@ -7,12 +7,16 @@
 //! its agl daemon (`agl`) and its threads (`codeany`), and then the
 //! conversation runs on a laptop while the agents run here.
 //!
-//! [`connect`] picks the way to a device: a paired device's LAN / tailnet
-//! address when it answers, else the relay — end-to-end encrypted for a
-//! paired device, plain otherwise.
+//! Signing in is with a codeany.ai account: every CodeAny signed in to it
+//! is a device of one relay account, and those reach each other with no
+//! pairing.
+//!
+//! [`connect`] picks the way to a device: its LAN / tailnet address when it
+//! answers there and is not clearly slower than the relay, else the relay —
+//! end-to-end encrypted for a paired device, plain otherwise.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{LazyLock, Mutex},
     time::{Duration, Instant},
@@ -37,7 +41,8 @@ pub const SERVICE: &str = "agl";
 /// devices in (and so exposes no plain `agl`).
 const HOST_MARKER: &str = "codeany.host";
 const APP: &str = "codeany";
-/// The relay Termany signs in to; the default for a new account here.
+/// The relay codeany.ai signs devices in to, for joining with an account
+/// code (a browser sign-in is told its relay).
 pub const DEFAULT_RELAY: &str = "https://api.nex.surf";
 
 /// A WebSocket to a service, however it is carried.
@@ -59,7 +64,7 @@ struct Account {
     /// which also covers paired devices while signed out).
     #[serde(default)]
     host: bool,
-    /// The account's sign-in (an email), when it came from Termany.
+    /// The account's sign-in (an email), when it came from codeany.ai.
     #[serde(default)]
     account: Option<String>,
 }
@@ -123,6 +128,21 @@ pub fn init() {
             measure_relay().await;
             tokio::time::sleep(Duration::from_secs(45)).await;
         }
+    });
+}
+
+/// Sign in to an account no relay knows, or out of it.
+#[cfg(test)]
+pub(crate) fn set_test_account(signed_in: bool) {
+    STATE.lock().unwrap().account = signed_in.then(|| Account {
+        server: "http://127.0.0.1:9".into(),
+        credential: DeviceCredential {
+            account_id: "acc_test".into(),
+            device_id: "dev_test".into(),
+            device_token: "token".into(),
+        },
+        host: true,
+        account: None,
     });
 }
 
@@ -225,6 +245,7 @@ fn link(server: String, credential: DeviceCredential, account: Option<String>, h
     };
     save(&account)?;
     STATE.lock().unwrap().account = Some(account);
+    peer::reset_tickets();
     if host && peer::share().is_none() {
         peer::set_share(true);
     }
@@ -241,43 +262,6 @@ pub async fn join(server: String, code: String, host: bool) -> Result<()> {
     })
     .await?;
     link(server, credential, None, host)
-}
-
-#[derive(Deserialize)]
-struct TermanyConfig {
-    server: String,
-    credential: DeviceCredential,
-    #[serde(default)]
-    account: Option<String>,
-}
-
-fn termany_config() -> Option<TermanyConfig> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let text = std::fs::read_to_string(home.join(".termany").join("nex.json")).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-/// The account Termany on this machine is signed in to: relay and email.
-pub fn termany_account() -> Option<(String, Option<String>)> {
-    termany_config().map(|c| (c.server, c.account))
-}
-
-/// Join the account Termany on this machine is signed in to: Termany's own
-/// device asks the relay for a pairing code, which this CodeAny claims as a
-/// device of its own. Termany's credential is only read, never kept.
-pub async fn join_termany(host: bool) -> Result<()> {
-    let config = termany_config().ok_or_else(|| anyhow!("Termany is not signed in on this machine"))?;
-    let server = config.server.clone();
-    let credential = agl_bridge::spawn({
-        let server = server.clone();
-        async move {
-            let termany = NexClient::new(&server, config.credential)?;
-            let code = termany.create_pairing_code().await?;
-            NexClient::claim(&server, &code.code, &device_name(), Some(APP)).await
-        }
-    })
-    .await?;
-    link(server, credential, config.account, host)
 }
 
 /// Rename a device: this one everywhere (on the relay too), any other one on
@@ -330,6 +314,8 @@ pub async fn sign_out() -> Result<()> {
     }
     STATE.lock().unwrap().account = None;
     let _ = std::fs::remove_file(path());
+    peer::reset_tickets();
+    DIRECT_CAPABLE.lock().unwrap().clear();
     DEVICES.lock().unwrap().retain(|d| !d.via_account || d.peer.is_some());
     Ok(())
 }
@@ -400,6 +386,10 @@ async fn services() -> Result<Vec<ExposedService>> {
     ];
     if let Some(port) = peer::port() {
         out.push(ExposedService::tcp(peer::E2E_SERVICE, &format!("127.0.0.1:{port}"))?);
+        // The account's devices may come straight over the LAN or tailnet.
+        if !peer::strict() {
+            out.push(ExposedService { name: peer::DIRECT_SERVICE.into(), target: Target::Echo });
+        }
     }
     if hosting() {
         out.push(ExposedService { name: HOST_MARKER.into(), target: Target::Echo });
@@ -484,8 +474,18 @@ impl Device {
         self.peer.as_ref().is_some_and(|p| p.pending)
     }
 
+    /// Answers over the LAN or tailnet: paired, or as a device of the account.
     pub fn direct_ok(&self) -> bool {
-        self.paired() && self.direct.as_ref().is_some_and(|d| d.rtt_ms.is_some())
+        !self.pending() && self.direct.as_ref().is_some_and(|d| d.rtt_ms.is_some())
+    }
+
+    /// Whether connections to it go directly, not through the relay.
+    pub fn uses_direct(&self) -> bool {
+        self.direct_ok()
+            && direct_wins(
+                self.direct.as_ref().and_then(|d| d.rtt_ms),
+                self.relay_rtt.filter(|_| self.account_online),
+            )
     }
 
     /// Reachable some way right now.
@@ -504,6 +504,40 @@ impl Device {
 
 static DEVICES: Mutex<Vec<Device>> = Mutex::new(Vec::new());
 static RELAY_RTT: LazyLock<Mutex<HashMap<String, (u32, Instant)>>> = LazyLock::new(Default::default);
+/// Account devices that are online, hand out tickets for a direct
+/// connection, and are not paired (those have a direct way of their own).
+static DIRECT_CAPABLE: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+/// A measurement older than this says nothing about the relay now.
+const RTT_FRESH: Duration = Duration::from_secs(180);
+
+/// The last round trip through the relay to a device, while it is fresh.
+pub fn relay_rtt(device: &str) -> Option<u32> {
+    RELAY_RTT
+        .lock()
+        .unwrap()
+        .get(device)
+        .filter(|(_, at)| at.elapsed() < RTT_FRESH)
+        .map(|(ms, _)| *ms)
+}
+
+/// Which way to a device that answers both ways: the direct one, unless it
+/// takes more than twice as long as the relay (as Termany picks). Direct
+/// wins ties and near-ties: it also spares the relay's limits and bandwidth,
+/// and two measurements a moment apart differ by more than that.
+pub fn direct_wins(direct_ms: Option<u32>, relay_ms: Option<u32>) -> bool {
+    match (direct_ms, relay_ms) {
+        (Some(direct), Some(relay)) => direct <= relay.saturating_mul(2),
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+fn direct_capable(info: &DeviceInfo, peers: &[peer::Peer]) -> bool {
+    !info.is_self
+        && info.online
+        && has_service(info, peer::DIRECT_SERVICE)
+        && !peers.iter().any(|p| !p.pending && p.nex_device_id.as_deref() == Some(info.id.as_str()))
+}
 
 /// The devices as last listed.
 pub fn cached_devices() -> Vec<Device> {
@@ -532,11 +566,12 @@ pub async fn devices() -> Result<Vec<Device>> {
         Err(_) => None,
     };
     let peers = peer::peers();
-    let rtts = RELAY_RTT.lock().unwrap().clone();
     let mut out = Vec::new();
-    let mut matched = std::collections::HashSet::new();
+    let mut matched = HashSet::new();
     match relay {
         Some(Ok(list)) => {
+            *DIRECT_CAPABLE.lock().unwrap() =
+                list.iter().filter(|d| direct_capable(d, &peers)).map(|d| d.id.clone()).collect();
             for info in list {
                 let peer = peers
                     .iter()
@@ -553,6 +588,11 @@ pub async fn devices() -> Result<Vec<Device>> {
                 }
                 let paired = peer.as_ref().is_some_and(|p| !p.pending);
                 let shares = has_service(&info, SERVICE) || has_service(&info, HOST_MARKER);
+                // A paired device answers by its key, any other by its ticket.
+                let direct = match &peer {
+                    Some(p) => peer::direct_status(&p.public_key),
+                    None => peer::direct_status(&info.id),
+                };
                 let name = if info.is_self {
                     info.name.clone()
                 } else {
@@ -563,8 +603,8 @@ pub async fn devices() -> Result<Vec<Device>> {
                 };
                 out.push(Device {
                     requires_pairing: info.online && shares && !has_service(&info, SERVICE) && !paired && !info.is_self,
-                    direct: peer.as_ref().and_then(|p| peer::direct_status(&p.public_key)),
-                    relay_rtt: rtts.get(&info.id).filter(|(_, at)| at.elapsed() < Duration::from_secs(180)).map(|(ms, _)| *ms),
+                    direct,
+                    relay_rtt: relay_rtt(&info.id),
                     id: info.id.clone(),
                     name,
                     app: info.app.clone(),
@@ -621,6 +661,9 @@ pub async fn devices() -> Result<Vec<Device>> {
 async fn measure_relay() {
     let Ok(client) = client() else { return };
     let Ok(list) = client.devices().await else { return };
+    let peers = peer::peers();
+    let direct: Vec<String> = list.iter().filter(|d| direct_capable(d, &peers)).map(|d| d.id.clone()).collect();
+    *DIRECT_CAPABLE.lock().unwrap() = direct.iter().cloned().collect();
     let probes = list
         .into_iter()
         .filter(|d| !d.is_self && d.online && has_service(d, "echo"))
@@ -645,7 +688,9 @@ async fn measure_relay() {
                 }
             }
         });
-    let results = futures::future::join_all(probes).await;
+    // Both ways to every device at once: which one a connection takes
+    // follows from the two.
+    let (results, ()) = tokio::join!(futures::future::join_all(probes), peer::measure_account(direct));
     let mut rtts = RELAY_RTT.lock().unwrap();
     for (id, ms) in results.into_iter().flatten() {
         rtts.insert(id, (ms, Instant::now()));
@@ -661,8 +706,9 @@ pub async fn remeasure() -> Result<()> {
     .await
 }
 
-/// A WebSocket to `service` on `device`: directly or end-to-end encrypted
-/// through the relay when paired, plainly through the relay otherwise.
+/// A WebSocket to `service` on `device`, over the faster way that works:
+/// its LAN / tailnet address, or the relay (end-to-end encrypted when
+/// paired, plain otherwise).
 pub async fn connect(device: &str, service: &str) -> Result<Ws> {
     if let Some(p) = peer::find(device) {
         let (ws, _) = peer::connect(&p, service).await?;
@@ -672,6 +718,18 @@ pub async fn connect(device: &str, service: &str) -> Result<Ws> {
         anyhow::bail!(t("that device is no longer connected to this one"));
     }
     let client = client().map_err(|e| anyhow!(e))?;
+    if DIRECT_CAPABLE.lock().unwrap().contains(device) && peer::account_direct_due(device) {
+        let measured = peer::direct_status(device).and_then(|s| s.rtt_ms);
+        // Not measured yet counts as worth a try: on one network it is the
+        // faster way by far.
+        if measured.is_none() || direct_wins(measured, relay_rtt(device)) {
+            // Never long enough for falling back to the relay to feel like a hang.
+            let direct = tokio::time::timeout(Duration::from_secs(4), peer::connect_account(device, service));
+            if let Ok(Ok(ws)) = direct.await {
+                return Ok(ws);
+            }
+        }
+    }
     let ws = client.connect(device, service).await.map_err(|e| {
         let requires = DEVICES.lock().unwrap().iter().any(|d| d.id == device && d.requires_pairing);
         if requires {
@@ -742,10 +800,10 @@ pub fn serve_cli(args: &[String]) -> i32 {
     }
 }
 
-// ---- "Sign in with termany.sh" ------------------------------------------
+// ---- "Sign in with codeany.ai" ------------------------------------------
 //
-// The same OAuth-style loopback sign-in Termany uses: termany.sh's
-// /connect/termany page only sends its link code back to a loopback callback
+// The same OAuth-style loopback sign-in Termany uses: codeany.ai's
+// /connect/codeany page only sends its link code back to a loopback callback
 // (`http://127.0.0.1:PORT/api/nex/login/callback`), so CodeAny serves that
 // callback itself for the few minutes a sign-in takes, then trades code +
 // state for a device credential in the user's account at POST
@@ -755,12 +813,12 @@ pub fn serve_cli(args: &[String]) -> i32 {
 const CALLBACK_PATH: &str = "/api/nex/login/callback";
 const LOGIN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// termany.sh, or `TERMANY_SITE_URL` for a local site.
+/// codeany.ai, or `CODEANY_SITE_URL` for a local site.
 fn site_url() -> String {
-    std::env::var("TERMANY_SITE_URL")
+    std::env::var("CODEANY_SITE_URL")
         .ok()
         .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| "https://termany.sh".into())
+        .unwrap_or_else(|| "https://codeany.ai".into())
         .trim_end_matches('/')
         .to_string()
 }
@@ -793,7 +851,7 @@ pub fn cancel_login() {
     login.0 = Login::Idle;
 }
 
-/// Start "Sign in with termany.sh": listen on a loopback port and return
+/// Start "Sign in with codeany.ai": listen on a loopback port and return
 /// the page to open in the browser. [`login_status`] follows it.
 pub async fn start_login(host: bool) -> Result<String> {
     cancel_login();
@@ -804,7 +862,7 @@ pub async fn start_login(host: bool) -> Result<String> {
         async move {
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
             let port = listener.local_addr()?.port();
-            let mut url = url::Url::parse(&format!("{}/connect/termany", site_url()))?;
+            let mut url = url::Url::parse(&format!("{}/connect/codeany", site_url()))?;
             url.query_pairs_mut()
                 .append_pair("callback", &format!("http://127.0.0.1:{port}{CALLBACK_PATH}"))
                 .append_pair("state", &state)
@@ -903,22 +961,22 @@ async fn exchange(code: &str, state: &str) -> Result<(String, DeviceCredential, 
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
-        .map_err(|e| anyhow!("cannot reach termany.sh: {e}"))?;
+        .map_err(|e| anyhow!("cannot reach codeany.ai: {e}"))?;
     let status = resp.status();
     let body: Option<ExchangeBody> = resp.json().await.ok();
     let body = match body {
         Some(body) if status.is_success() && body.code == Some(0) => body,
         Some(ExchangeBody { message: Some(message), .. }) if !message.is_empty() => anyhow::bail!(message),
-        _ => anyhow::bail!("termany.sh answered HTTP {}", status.as_u16()),
+        _ => anyhow::bail!("codeany.ai answered HTTP {}", status.as_u16()),
     };
-    let data = body.data.ok_or_else(|| anyhow!("termany.sh returned no credential"))?;
+    let data = body.data.ok_or_else(|| anyhow!("codeany.ai returned no credential"))?;
     match (data.server, data.credential) {
         (Some(server), Some(credential))
             if !credential.device_id.is_empty() && !credential.device_token.is_empty() =>
         {
             Ok((server, credential, data.account.filter(|a| !a.is_empty())))
         }
-        _ => anyhow::bail!("termany.sh returned an incomplete credential"),
+        _ => anyhow::bail!("codeany.ai returned an incomplete credential"),
     }
 }
 
