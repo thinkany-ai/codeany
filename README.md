@@ -1,26 +1,43 @@
 # CodeAny
 
-A lightweight coding-agent app with an editor window, built with [GPUI](https://gpui.rs) and
-[gpui-kit](https://gpui-kit.com).
+A local-first desktop app for working with coding agents across projects and devices.
+Run Claude Code, Codex, Gemini, OpenCode, Kimi, Cursor, and other agents from one workspace.
+
+[Download CodeAny](https://codeany.ai/download) · [Website](https://codeany.ai)
+
+![CodeAny desktop workspace with project conversations and an agent chat](assets/screenshots/desktop-light.webp)
+
+## Features
 
 - **Agent mode** (default): threads per project, talking to the coding agents installed on the
-  machine (Claude Code, Codex, Gemini, OpenCode, Kimi, Cursor, …) through the embedded
-  [agl](https://github.com/thinkany-ai/agl) session manager: warm sessions, approvals, steering.
+  machine through the embedded [agl](https://github.com/thinkany-ai/agl) session manager:
+  warm sessions, approvals, and steering.
 - **Editor window** (⌘E, or the editor icon at the bottom of the sidebar): the project in a
-  separate window with file tree, tabbed code editor, git diff panel and terminal. No completion,
-  no LSP. Files the agent or a surface opens land there.
+  separate window with a file tree, tabbed code editor, Git diff panel, and terminal.
 - **Surfaces** (⌥⌘T): panels that open beside a conversation: browser, terminal, files, diff,
-  pull request and device.
+  pull request, and device. Drag a file from the local project tree into the chat composer
+  to attach it to your next message.
+- **Remote devices**: access shared agents and conversations on another machine over
+  a direct connection or the CodeAny cloud relay.
 - **Search palette** (⌘K): run a command, open a thread or switch project from one box.
 - **Settings** (⌘, or the gear at the bottom of the sidebar): a modal over a dimmed window with
   General, Appearance, Agents, Shortcuts and About sections. Appearance has 13 themes
   (Codex, Default Dark, Solarized Dark, Daylight, Meadow, Charcoal, Gruvbox Dark/Light,
   Rosé Pine / Dawn, Aurora, Horizon, Phosphor) plus System, which follows macOS.
 
+![CodeAny editor window with a project file tree and source code](assets/screenshots/editor-light.webp)
+
+## Development
+
+CodeAny is built with [GPUI](https://gpui.rs) and [gpui-kit](https://gpui-kit.com).
+On macOS, use the following commands to build and preview the app.
+
 ```sh
-make dev                       # dev preview; rebuilds and restarts on every save
+make dev                       # rebuild and restart on source changes
 make dev PROJECT=~/code/foo    # …opened on another project
-make run | make release | make test
+make run                       # build and open the debug app once
+make release                   # build the release app
+make test                      # run the test suite
 ```
 
 `make dev` launches the bundled dev app and logs to the terminal. Saving a file
@@ -44,12 +61,17 @@ the error and keeps the running app. Ctrl-C stops both.
 
 ## Devices
 
-Settings → Devices connects your machines, like Termany's device management:
+Manage connections in **Settings → Devices**.
+
+![CodeAny device settings for connecting and sharing machines](assets/screenshots/devices-pane.webp)
 
 - **Account**: sign in with codeany.ai on each machine. While signed in a machine is online
   on the nex relay, and the account's machines reach each other with no pairing: directly
   over the same Wi-Fi or Tailscale network when that answers (the relay hands out a
   short-lived key for it), through the relay otherwise or when it is clearly faster.
+- **Account invitation**: use **Add a device to the account** to generate a one-time
+  code. On a machine that has yet to sign in, choose **Join with an account code**
+  to register it as a separate device under the same account.
 - **Authorization code**: connect two machines without an account, or end-to-end encrypt
   two in the same account. Paste one machine's authorization code into **Connect a device**
   on the other, then type the connection code it shows into **Verify access** on the first.
@@ -66,9 +88,11 @@ Each device row shows how it is reached (LAN / Tailscale and cloud round trips, 
 ping), and lets you rename it here, turn end-to-end encryption on or off, or remove it.
 Keys and paired devices live in `nex-identity.json` and `nex-peers.json` (mode 0600).
 
-Data lives in `~/.codeany` (override with `CODEANY_HOME`): threads, settings and favorites in
-`codeany.db` (SQLite, WAL), screenshots in `images/`, and the agent engine's sessions and
-history in `agent/`. `make dev` keeps its own data in `~/.codeany-dev` and serves on port 18022.
+Release builds store data in `~/.codeany`. Debug builds, including `make run` and
+`make dev`, use `~/.codeany-dev`. Each directory holds its own settings, threads,
+and device credentials, so both builds can sign in to the same account and stay
+online as separate devices. Set `CODEANY_HOME` to use a custom directory.
+`make dev` serves on port 18022.
 
 ## macOS distribution
 
@@ -156,6 +180,4 @@ to the local paths: remove the file and run `cargo check` before committing, aft
 
 ## License
 
-[AGPL-3.0](LICENSE) © 2026 ThinkAny, LLC. Network use is distribution: if you run a modified
-version as a service, you must offer users its source. For commercial licensing
-outside the AGPL, contact support@thinkany.ai.
+[MIT](LICENSE) © 2026 ThinkAny, LLC.

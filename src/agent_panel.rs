@@ -30,6 +30,7 @@ use crate::hub::{Hub, HubEvent, PromptState, Shared};
 use crate::{
     agent_icons::{agent_color, agent_icon},
     agl_bridge,
+    file_tree::DraggedFile,
     git::ProjectGit,
     chat_tabs::TabSet,
     i18n::{t, tf},
@@ -150,7 +151,7 @@ pub struct AgentPanel {
     /// The answer last copied, to show a check.
     copied: Option<(u64, usize)>,
     composer: Entity<TextareaState>,
-    /// Images pasted into the composer, sent with the next message.
+    /// Files attached to the composer, sent with the next message.
     attachments: Vec<PathBuf>,
     git_project: Option<(Option<String>, PathBuf)>,
     project_git: Option<ProjectGit>,
@@ -887,17 +888,18 @@ impl AgentPanel {
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else { return };
-            this.update(cx, |this, cx| {
-                for path in paths {
-                    if !this.attachments.contains(&path) {
-                        this.attachments.push(path);
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |this, cx| this.attach_files(paths, cx)).ok();
         })
         .detach();
+    }
+
+    fn attach_files(&mut self, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
+        for path in paths {
+            if !self.attachments.contains(&path) {
+                self.attachments.push(path);
+            }
+        }
+        cx.notify();
     }
 
     fn remove_attachment(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -4066,6 +4068,7 @@ impl AgentPanel {
             });
 
         let input_box = div()
+            .id("composer")
             .w_full()
             .min_w_0()
             .rounded(layout::BUBBLE_RADIUS)
@@ -4077,6 +4080,11 @@ impl AgentPanel {
             .flex()
             .flex_col()
             .gap(layout::SPACE_2)
+            .drag_over::<DraggedFile>(|style, _, _, cx| style.border_color(cx.theme().primary))
+            .on_drop(cx.listener(|this, file: &DraggedFile, window, cx| {
+                this.attach_files([file.path.clone()], cx);
+                this.focus_composer(window, cx);
+            }))
             .when(!self.attachments.is_empty(), |this| {
                 this.child(
                     div()

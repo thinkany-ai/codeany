@@ -1,7 +1,7 @@
 //! The user's other machines: through a nex relay account, and directly to
 //! paired devices (see [`crate::peer`]).
 //!
-//! This CodeAny is one nex device (`~/.codeany/nex.json`, mode 0600). While
+//! This CodeAny is one nex device (`nex.json` in its data directory, mode 0600). While
 //! signed in it stays online on the relay, so the account's other devices
 //! see it and can pair with it end to end; with sharing on it also exposes
 //! its agl daemon (`agl`) and its threads (`codeany`), and then the

@@ -39,6 +39,27 @@ pub enum FileTreeEvent {
     OpenFile(PathBuf),
 }
 
+#[derive(Clone)]
+pub(crate) struct DraggedFile {
+    pub path: PathBuf,
+    name: SharedString,
+}
+
+impl Render for DraggedFile {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().foreground)
+            .px_2()
+            .py_1()
+            .text_size(TEXT)
+            .child(self.name.clone())
+    }
+}
+
 pub struct FileTree {
     /// The device `root` is on; `None` is this one.
     machine: Option<String>,
@@ -462,6 +483,12 @@ impl FileTree {
                                 .text_size(TEXT)
                                 .text_color(Self::status_color(status, cx))
                                 .child(status.letter()),
+                        )
+                    })
+                    .when(!entry.is_dir && self.machine.is_none(), |this| {
+                        this.on_drag(
+                            DraggedFile { path: entry.path.clone(), name: entry.name.clone() },
+                            |file, _, _, cx| cx.new(|_| file.clone()),
                         )
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.on_click_row(ix, cx)))

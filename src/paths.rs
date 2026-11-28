@@ -1,4 +1,5 @@
-//! Where CodeAny keeps its data: `~/.codeany` (or `$CODEANY_HOME`).
+//! Where CodeAny keeps its data: `~/.codeany` for releases and
+//! `~/.codeany-dev` for debug builds. `$CODEANY_HOME` overrides either.
 
 use std::path::PathBuf;
 
@@ -6,7 +7,12 @@ pub fn home() -> PathBuf {
     if let Some(dir) = std::env::var_os("CODEANY_HOME") {
         return PathBuf::from(dir);
     }
-    user_home().join(".codeany")
+    let directory = if cfg!(debug_assertions) {
+        ".codeany-dev"
+    } else {
+        ".codeany"
+    };
+    user_home().join(directory)
 }
 
 pub fn database() -> PathBuf {
