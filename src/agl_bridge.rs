@@ -90,11 +90,35 @@ pub fn agent_env(agent: &str) -> Vec<(String, String)> {
     env
 }
 
-/// Whether an agent's executable can be chosen here: agl's custom agents
-/// speak ACP, Claude's or Codex's protocol, not the one-shot ones.
+/// Whether an agent's executable and environment can be chosen here: they
+/// live in an agl `custom_agents` entry, which must keep how the agent is
+/// driven. An agl from before its one-shot agents (Cursor, Pi) could be
+/// moved reads such an entry as ACP, so those stay as found there.
 pub fn agent_command_editable(agent: &str) -> bool {
+    let Some(def) = builtin_agent(agent) else { return true };
+    let probe = agl::config::CustomAgent {
+        id: def.id.clone(),
+        name: None,
+        command: String::new(),
+        args: Vec::new(),
+        protocol: protocol_name(def.protocol).into(),
+        env: Default::default(),
+        icon: None,
+    };
+    let cfg = agl::config::Config { custom_agents: vec![probe], ..agl::config::Config::default() };
+    agl::agents::registry(&cfg).iter().any(|d| d.id == def.id && d.protocol == def.protocol)
+}
+
+/// A protocol's name in a `custom_agents` entry.
+fn protocol_name(protocol: agl::agents::Protocol) -> &'static str {
     use agl::agents::Protocol;
-    builtin_agent(agent).is_none_or(|d| matches!(d.protocol, Protocol::Claude | Protocol::Codex | Protocol::Acp))
+    match protocol {
+        Protocol::Claude => "claude",
+        Protocol::Codex => "codex",
+        Protocol::Acp => "acp",
+        Protocol::Cursor => "cursor",
+        Protocol::Pi => "pi",
+    }
 }
 
 fn builtin_agent(agent: &str) -> Option<agl::agents::AgentDef> {
@@ -110,7 +134,6 @@ pub fn set_agent_launch(
     env: Vec<(String, String)>,
 ) -> impl Future<Output = Result<()>> + Send + 'static {
     spawn(async move {
-        use agl::agents::Protocol;
         let command = command
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty())
@@ -122,12 +145,10 @@ pub fn set_agent_launch(
         cfg.custom_agents.retain(|c| c.id != agent);
         if command.is_some() || !env.is_empty() {
             let def = builtin_agent(&agent).ok_or_else(|| anyhow!("unknown agent {agent}"))?;
-            let protocol = match def.protocol {
-                Protocol::Claude => "claude",
-                Protocol::Codex => "codex",
-                Protocol::Acp => "acp",
-                Protocol::Cursor | Protocol::Pi => bail!("this agent's executable and environment cannot be changed"),
-            };
+            if !agent_command_editable(&agent) {
+                bail!("this agent's executable and environment cannot be changed");
+            }
+            let protocol = protocol_name(def.protocol);
             // No executable chosen: the agent's own command name, the first
             // one found on the PATH, as agl would pick.
             let command = command
@@ -826,6 +847,17 @@ impl Shared {
                 self.pending.lock().unwrap().remove(&id);
                 Err(anyhow!("{} did not answer `{method}`", self.label()))
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    /// Every agent agl knows can have its executable chosen in Settings.
+    #[test]
+    fn every_built_in_agents_executable_can_be_chosen() {
+        for def in agl::agents::registry(&agl::config::Config::default()) {
+            assert!(super::agent_command_editable(&def.id), "{}", def.id);
         }
     }
 }

@@ -8,8 +8,8 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, kbd::Kbd,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, kbd::Kbd,
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     input::{Editor, EditorState, Input, InputEvent, InputState},
     menu::ContextMenuExt as _,
     notification::{Notification, NotificationType},
@@ -25,7 +25,7 @@ use crate::{
     CloseTab, NewTab, NewThread, NextTab, OpenFolder, PrevTab, ReopenTab, SelectLastTab,
     SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, OpenSettings, OpenSurface, RefreshProject, Save, Search,
     OpenEditor, ToggleGitPanel, ToggleSidebar, ToggleTerminal,
-    agent_panel::{AgentPanel, AgentPanelEvent},
+    agent_panel::{AgentPanel, AgentPanelEvent, SidebarTab},
     search_palette::{self, Badge, SearchPalette, SearchPaletteEvent, Target},
     file_tree::{FileTree, FileTreeEvent},
     git::{self, RepoSnapshot},
@@ -1382,6 +1382,97 @@ impl Workspace {
             .on_click(cx.listener(|this, _, window, cx| this.new_thread(&NewThread, window, cx)))
     }
 
+    fn render_sidebar_navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.agent_panel.read(cx).sidebar_tab();
+        let theme = cx.theme().clone();
+        let tab = |id, title, icon, tab| {
+            let selected = current == tab;
+            div().flex_1().min_w_0().child(
+                chrome_button(id)
+                    .w_full()
+                    .rounded(layout::CONTROL)
+                    .app_icon(icon)
+                    .text_color(theme.muted_foreground)
+                    .when(selected, |button| {
+                        button
+                            .custom(ButtonCustomVariant::new(cx).active(theme.list_active))
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_color(theme.foreground)
+                    })
+                    .selected(selected)
+                    .toggled(selected)
+                    .accessibility_label(t(title))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.agent_panel.update(cx, |panel, cx| panel.set_sidebar_tab(tab, cx));
+                        cx.notify();
+                    }))
+                    .app_tooltip(t(title)),
+            )
+        };
+        let group = || {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .p_1()
+                .rounded_full()
+                .border_1()
+                .border_color(theme.sidebar_border)
+                .bg(theme.foreground.opacity(0.035))
+        };
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(layout::SPACE_2)
+            .child(
+                group()
+                    .flex_1()
+                    .min_w_0()
+                    .child(tab("sidebar-projects", "Projects", IconName::LayoutGrid, SidebarTab::Projects))
+                    .child(tab("sidebar-chats", "Chats", IconName::MessageSquare, SidebarTab::Chats)),
+            )
+            .child(
+                group()
+                    .flex_none()
+                    .child(
+                        chrome_button("open-settings")
+                            .rounded(layout::CONTROL)
+                            .text_color(theme.muted_foreground)
+                            .app_icon(IconName::Settings)
+                            .accessibility_label(t("Settings"))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_settings(&OpenSettings, window, cx)))
+                            .app_tooltip(t("Settings (⌘,)")),
+                    )
+                    .child(
+                        chrome_button("sidebar-search")
+                            .rounded(layout::CONTROL)
+                            .text_color(theme.muted_foreground)
+                            .child(crate::icons::search().size(ICON))
+                            .accessibility_label(t("Search"))
+                            .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
+                            .app_tooltip(t("Search (⌘P)")),
+                    )
+                    .child(
+                        div()
+                            .rounded_full()
+                            .bg(theme.primary.opacity(0.16))
+                            .hover(|this| this.bg(theme.primary.opacity(0.24)))
+                            .child(
+                                chrome_button("sidebar-new-chat")
+                                    .rounded(layout::CONTROL)
+                                    .text_color(theme.primary)
+                                    .app_icon(IconName::SquarePen)
+                                    .on_click(cx.listener(|this, _, window, cx| this.new_thread(&NewThread, window, cx)))
+                                    .accessibility_label(t("New Chat"))
+                                    .app_tooltip(t("New Chat")),
+                            ),
+                    ),
+            )
+    }
+
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let content = match self.mode {
@@ -1421,27 +1512,18 @@ impl Workspace {
                     .child(div().flex_1().min_w_0().child(header))
                     .when(self.mode == Mode::Editor, |this| this.child(Self::drag_region("sidebar-drag"))),
             )
-            .child(
-                div().flex_none().px(layout::SIDEBAR_INSET).pt(layout::SPACE_3)
-                    .flex().items_center().gap(layout::SPACE_1)
-                    .child(div().flex_1().min_w_0().flex().flex_col().child(self.render_new_chat_button(cx)))
-                    .when(self.mode == Mode::Agent, |this| {
-                        this.child(
-                            chrome_button("sidebar-search")
-                                .child(crate::icons::search().size(ICON))
-                                .text_color(theme.muted_foreground)
-                                .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
-                                .app_tooltip(t("Search (⌘P)")),
-                        )
-                    }),
-            )
+            .when(self.mode == Mode::Editor, |this| {
+                this.child(
+                    div().flex_none().px(layout::SIDEBAR_INSET).pt(layout::SPACE_3)
+                        .child(self.render_new_chat_button(cx)),
+                )
+            })
             .child(div().flex_1().min_h_0().min_w_0().child(content));
 
         sidebar.child(self.render_sidebar_footer(cx))
     }
 
-    /// The sidebar's foot: settings, and, when one is ready, the update on
-    /// the right.
+    /// Sidebar navigation in the agent window and settings in the editor.
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let mode = self.mode;
@@ -1453,25 +1535,26 @@ impl Workspace {
         #[cfg(not(target_os = "macos"))]
         let update: Option<String> = None;
         div()
-            .h(px(52.))
+            .h(if mode == Mode::Agent { px(60.) } else { px(52.) })
             .flex_none()
-            .px(layout::SIDEBAR_INSET)
+            .px(if mode == Mode::Agent { layout::SPACE_3 } else { layout::SIDEBAR_INSET })
             .flex()
             .items_center()
-            .gap(layout::SPACE_1)
-            .child(
-                Button::new("open-settings")
-                    .ghost()
-                    .h(layout::CONTROL)
-                    .px_2()
-                    .gap_2()
-                    .text_color(theme.muted_foreground)
-                    .app_icon(IconName::Settings)
-                    .app_label(t("Settings"))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(&OpenSettings, window, cx)))
-                    .app_tooltip(t("Settings (⌘,)")),
-            )
-            .child(div().flex_1())
+            .gap(layout::SPACE_2)
+            .when(mode == Mode::Editor, |this| {
+                this.child(
+                    Button::new("open-settings")
+                        .ghost()
+                        .h(layout::CONTROL)
+                        .px_2()
+                        .gap_2()
+                        .text_color(theme.muted_foreground)
+                        .app_icon(IconName::Settings)
+                        .app_label(t("Settings"))
+                        .on_click(cx.listener(|this, _, window, cx| this.open_settings(&OpenSettings, window, cx)))
+                        .app_tooltip(t("Settings (⌘,)")),
+                )
+            })
             .when_some(update, |this, version| {
                 // The settings icon's size, filled so a waiting update is noticed.
                 let size = crate::style::size::icon_pixels(cx);
@@ -1494,6 +1577,7 @@ impl Workspace {
                         .app_tooltip(crate::i18n::tf("Update to v{version}", &[("version", version)])),
                 )
             })
+            .when(mode == Mode::Agent, |this| this.child(self.render_sidebar_navigation(cx)))
     }
 
     /// The agent window's tabs, one per open thread, drawn like a browser's:
@@ -1737,13 +1821,22 @@ impl Workspace {
                     })
             }))
             .child(
-                div().h_full().flex_none().flex().items_center().pl_1().child(
-                    chrome_button("new-chat-tab")
-                        .text_color(theme.muted_foreground)
-                        .child(Icon::new(IconName::Plus).size(TAB_ACTION_ICON))
-                        .on_click(cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)))
-                        .app_tooltip(t("New Tab (⌘T)")),
-                ),
+                div().h_full().flex_none().flex().items_center().pl_1()
+                    .child(
+                        chrome_button("new-chat-tab")
+                            .text_color(theme.muted_foreground)
+                            .child(Icon::new(IconName::Plus).size(TAB_ACTION_ICON))
+                            .on_click(cx.listener(|this, _, window, cx| this.new_tab(&NewTab, window, cx)))
+                            .app_tooltip(t("New Tab (⌘T)")),
+                    )
+                    .child(
+                        chrome_button("chat-tab-search")
+                            .child(crate::icons::search().size(ICON))
+                            .text_color(theme.muted_foreground)
+                            .accessibility_label(t("Search"))
+                            .on_click(cx.listener(|this, _, window, cx| this.search(&Search, window, cx)))
+                            .app_tooltip(t("Search (⌘P)")),
+                    ),
             )
             // The strip past the tabs drags the window.
             .child(Self::drag_region("chat-tabs-drag"))

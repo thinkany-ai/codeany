@@ -50,10 +50,9 @@ use crate::style::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SidebarSection {
+pub(crate) enum SidebarTab {
     Projects,
-    Recent,
-    Archived,
+    Chats,
 }
 
 /// Threads listed per project before "Show more".
@@ -132,8 +131,7 @@ pub struct AgentPanel {
     picker_open: bool,
     /// Threads of closed tabs, most recent last, for reopening.
     closed_tabs: Vec<u64>,
-    projects_expanded: bool,
-    recent_expanded: bool,
+    sidebar_tab: SidebarTab,
     /// Archived threads are listed at the foot of the sidebar, folded.
     archived_expanded: bool,
     sort_repositories_by_name: bool,
@@ -316,8 +314,7 @@ impl AgentPanel {
             picker,
             picker_open: false,
             closed_tabs: Vec::new(),
-            projects_expanded: true,
-            recent_expanded: true,
+            sidebar_tab: SidebarTab::Projects,
             archived_expanded: false,
             sort_repositories_by_name: false,
             navigation_history: Vec::new(),
@@ -1808,67 +1805,43 @@ impl AgentPanel {
             .into_any_element()
     }
 
-    fn toggle_section(&mut self, section: SidebarSection, cx: &mut Context<Self>) {
-        let expanded = match section {
-            SidebarSection::Projects => &mut self.projects_expanded,
-            SidebarSection::Recent => &mut self.recent_expanded,
-            SidebarSection::Archived => &mut self.archived_expanded,
-        };
-        *expanded = !*expanded;
-        cx.notify();
+    pub(crate) fn sidebar_tab(&self) -> SidebarTab {
+        self.sidebar_tab
     }
 
-    fn render_section_header(&self, section: SidebarSection, action: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn set_sidebar_tab(&mut self, tab: SidebarTab, cx: &mut Context<Self>) {
+        if self.sidebar_tab != tab {
+            self.sidebar_tab = tab;
+            self.project_filter_open = false;
+            cx.notify();
+        }
+    }
+
+    fn render_project_filter(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let (title, expanded) = match section {
-            SidebarSection::Projects => ("Projects", self.projects_expanded),
-            SidebarSection::Recent => ("Chats", self.recent_expanded),
-            SidebarSection::Archived => ("Archived", self.archived_expanded),
-        };
-        div()
-            .mt(layout::SPACE_4)
-            .mb(layout::SPACE_2)
-            .h(layout::SIDEBAR_ROW)
-            .flex_none()
-            .px(layout::SIDEBAR_ROW_INSET)
-            .flex()
-            .items_center()
-            .child(
-                div().id(title).flex_1().h_full().flex().items_center().gap(layout::SPACE_1)
-                    .text_size(TEXT).text_color(theme.muted_foreground).cursor_pointer()
-                    .child(t(title))
-                    .when(!expanded, |this| this.child(Icon::new(IconName::ChevronRight).size(ICON)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx))),
+        let filtering = self.shown_project.is_some();
+        let filter = self.project_filter.clone();
+        Popover::new("project-filter")
+            .anchor(Anchor::TopRight)
+            .open(self.project_filter_open)
+            .on_open_change(cx.listener(|this, open: &bool, window, cx| {
+                this.project_filter_open = *open;
+                if *open {
+                    let projects = this.device_projects();
+                    let (shown, by_name) = (this.shown_project.clone(), this.sort_repositories_by_name);
+                    this.project_filter.update(cx, |filter, cx| filter.open(projects, shown, by_name, window, cx));
+                }
+                cx.notify();
+            }))
+            .p_0()
+            .trigger(
+                crate::style::chrome_button("project-filter-button")
+                    .child(Icon::new(IconName::ListFilter).size(ICON))
+                    // Showing one project: say so.
+                    .text_color(if filtering { theme.primary } else { theme.muted_foreground })
+                    .accessibility_label(t("Filter projects")),
             )
-            .when(section == SidebarSection::Projects, |this| {
-                let filtering = self.shown_project.is_some();
-                let filter = self.project_filter.clone();
-                this.child(
-                    Popover::new("project-filter")
-                        .anchor(Anchor::TopRight)
-                        .open(self.project_filter_open)
-                        .on_open_change(cx.listener(|this, open: &bool, window, cx| {
-                            this.project_filter_open = *open;
-                            if *open {
-                                let projects = this.device_projects();
-                                let (shown, by_name) = (this.shown_project.clone(), this.sort_repositories_by_name);
-                                this.project_filter.update(cx, |filter, cx| filter.open(projects, shown, by_name, window, cx));
-                            }
-                            cx.notify();
-                        }))
-                        .p_0()
-                        .trigger(
-                            crate::style::chrome_button("project-filter-button")
-                                .child(Icon::new(IconName::ListFilter).size(ICON))
-                                // Showing one project: say so.
-                                .text_color(if filtering { theme.primary } else { theme.muted_foreground })
-                                .accessibility_label(t("Filter projects")),
-                        )
-                        .content(move |_, _, _| filter.clone()),
-                )
-            })
-            .child(action)
-            .into_any_element()
+            .content(move |_, _, _| filter.clone())
     }
 
     /// The projects of the device the sidebar shows, most recently active
@@ -2155,74 +2128,33 @@ impl AgentPanel {
                 }
             }
         }
-        // Ordered, so equal timestamps never reshuffle from one frame to the next.
-        let mut groups: std::collections::BTreeMap<Option<PathBuf>, Vec<Entry>> = Default::default();
         // One workspace at a time, picked at the top: its projects and chats.
         let shared = self.shared.clone();
         let shared = shared.borrow();
-        for thread in shared.store.threads.iter().filter(|t| !t.settled && self.in_active_workspace(t)) {
-            groups.entry(thread.project.clone()).or_default().push(Entry::Thread(thread));
-        }
-        for entries in groups.values_mut() {
-            entries.sort_by(|a, b| {
-                let key = |e: &Entry| match e {
-                    Entry::Thread(t) => t.id.to_string(),
-                };
-                b.updated().cmp(&a.updated()).then_with(|| key(a).cmp(&key(b)))
-            });
-        }
+        let active_threads = || {
+            shared.store.threads.iter().filter(|t| !t.settled && self.in_active_workspace(t))
+        };
         let icon_button = |id: &'static str, icon: IconName| {
             crate::style::chrome_button(id)
                 .child(Icon::new(icon).size(ICON))
                 .text_color(theme.muted_foreground)
         };
 
-        // ---- Projects, most recently active first; the open one leads.
-        // The workspace's own, and the folders its threads work in.
-        let mut projects: Vec<PathBuf> = self.s().store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref()).map(|w| w.projects.clone()).unwrap_or_default();
-        for project in groups.keys().flatten() {
-            if !projects.contains(project) {
-                projects.push(project.clone());
-            }
-        }
-        let activity = |p: &PathBuf| {
-            groups
-                .get(&Some(p.clone()))
-                .and_then(|entries| entries.first())
-                .map(Entry::updated)
-                .unwrap_or(0)
-        };
-        // By last activity, so opening a project never moves it. The path
-        // breaks ties: without it the list reorders on every hover.
-        projects.sort_by(|a, b| {
-            let rank = |p: &PathBuf| std::cmp::Reverse(activity(p).max(u64::from(self.s().store.projects.contains(p))));
-            if self.sort_repositories_by_name {
-                a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b))
-            } else {
-                rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
-            }
-        });
         // One project picked in the filter menu: only it, opened.
-        let filtered = self.shown_project.clone();
-        if let Some(shown) = &filtered {
-            projects.retain(|p| p == shown);
-            if projects.is_empty() {
-                projects.push(shown.clone());
-            }
-        }
-        let hidden_projects = if self.all_projects || filtered.is_some() {
-            0
-        } else {
-            projects.len().saturating_sub(5)
+        let filtered = match self.sidebar_tab {
+            SidebarTab::Projects => self.shown_project.clone(),
+            SidebarTab::Chats => None,
         };
-        projects.truncate(projects.len() - hidden_projects);
-
         let mut list = div()
-            .id("thread-list")
+            .id(match self.sidebar_tab {
+                SidebarTab::Projects => "project-list",
+                SidebarTab::Chats => "chat-list",
+            })
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .px(layout::SIDEBAR_INSET)
+            .pt(layout::SPACE_2)
             .pb(layout::SPACE_2)
             .flex()
             .flex_col()
@@ -2272,182 +2204,243 @@ impl AgentPanel {
             list
         };
 
-        {
-            list = list.child(self.render_section_header(
-                SidebarSection::Projects,
-                icon_button("add-project", IconName::FolderPlus)
-                    .on_click(cx.listener(|this, _, window, cx| match this.machine.clone() {
-                        None => cx.emit(AgentPanelEvent::OpenFolder),
-                        // A folder on that device: pick it for a new thread.
-                        Some(machine) => {
-                            this.new_thread(window, cx);
-                            let dir = this.s().store.remote_dirs.get(&machine).cloned();
-                            this.folders.update(cx, |folders, cx| folders.open(machine, dir, cx));
-                            this.folders_open = true;
-                            cx.notify();
-                        }
-                    }))
-                    .app_tooltip(t("Open Folder (⌘O)"))
-                    .into_any_element(),
-                cx,
-            ));
-            if self.projects_expanded {
-                if projects.is_empty() {
-                    list = list.child(
-                        div()
-                            .px(layout::SIDEBAR_ROW_INSET)
-                            .py_1()
-                            .text_size(TEXT)
-                            .text_color(theme.muted_foreground.opacity(0.7))
-                            .child(t("Open a folder to start a project")),
-                    );
-                }
-                for project in &projects {
-                    let key = Some(project.clone());
-                    let entries: &[Entry] = groups.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-                    let name: SharedString = project
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| project.display().to_string())
-                        .into();
-                    let expanded = filtered.is_some() || self.expanded_projects.contains(project);
-                    let current = self.project.as_ref() == Some(project);
-                    let live = entries.iter().any(|e| match e {
-                        Entry::Thread(t) => self.s().running.contains(&t.id),
-                    });
-                    let count = entries.len();
-                    let path = project.clone();
-                    let new_thread_path = path.clone();
-                    list = list.child(
-                        div()
-                            .id(SharedString::from(format!("project-{}", project.display())))
-                            .group("project")
-                            .mt(layout::SPACE_1)
-                            .h(layout::SIDEBAR_NAV_ROW)
-                            .flex_none()
-                            .pl(layout::SIDEBAR_ROW_INSET)
-                            .pr(layout::SPACE_2)
-                            .flex()
-                            .items_center()
-                            .gap(layout::SPACE_2)
-                            .rounded(layout::RADIUS)
-                            .cursor_pointer()
-                            .text_size(TEXT)
-                            .when(current && self.active.is_none(), |this| this.bg(theme.list_active))
-                            .hover(|this| this.bg(theme.list_hover))
-                            .child(ProjectAvatar {
-                                project: project.clone(),
-                                name: name.clone(),
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_color(theme.foreground)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(name),
-                            )
-                            .when(live, |this| {
-                                this.child(div().flex_none().size(px(6.)).rounded_full().bg(theme.success))
-                            })
-                            .child(
-                                div()
-                                    .relative()
-                                    .size(layout::CONTROL)
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(count > 0 && !expanded, |this| {
-                                        this.child(
-                                            div().id("project-thread-count")
-                                                .text_color(theme.muted_foreground)
-                                                .group_hover("project", |this| this.invisible())
-                                                .child(count.to_string()),
-                                        )
-                                    })
-                                    .child(
-                                        div().id("project-new-thread")
-                                            .absolute().inset_0()
-                                            .invisible()
-                                            .group_hover("project", |this| this.visible())
-                                            .child(
-                                                icon_button("new-project-thread", IconName::SquarePen)
-                                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        this.new_thread_in_project(Some(new_thread_path.clone()), window, cx);
-                                                    }))
-                                                    .app_tooltip(t("New Thread")),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                    .size(ICON)
-                                    .flex_none()
-                                    .text_color(theme.muted_foreground.opacity(0.7)),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.expanded_projects.insert(path.clone()) {
-                                    this.expanded_projects.remove(&path);
-                                }
-                                cx.notify();
-                            })),
-                    );
-                    if expanded {
-                        list = push_entries(self, list, key, entries, true, cx);
-                    }
-                }
-                if hidden_projects > 0 {
-                    list = list.child(
-                        div()
-                            .id("show-more-projects")
-                            .h(layout::SIDEBAR_ROW)
-                            .flex_none()
-                            .px(layout::SIDEBAR_ROW_INSET)
-                            .flex()
-                            .items_center()
-                            .text_size(TEXT)
-                            .text_color(theme.muted_foreground)
-                            .cursor_pointer()
-                            .hover(|this| this.text_color(theme.foreground))
-                            .child(tf("More projects ({n})", &[("n", hidden_projects.to_string())]))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.all_projects = true;
-                                cx.notify();
-                            })),
-                    );
-                }
-            }
-        }
+        let title = match self.sidebar_tab {
+            SidebarTab::Projects => "Projects",
+            SidebarTab::Chats => "Chats",
+        };
+        list = list.child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .py_1()
+                .px(layout::SIDEBAR_ROW_INSET)
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(TEXT)
+                        .text_color(theme.muted_foreground)
+                        .child(t(title)),
+                )
+                .when(self.sidebar_tab == SidebarTab::Projects, |this| {
+                    this
+                        .child(self.render_project_filter(cx))
+                        .child(
+                            icon_button("add-project", IconName::FolderPlus)
+                                .on_click(cx.listener(|this, _, window, cx| match this.machine.clone() {
+                                    None => cx.emit(AgentPanelEvent::OpenFolder),
+                                    // A folder on that device: pick it for a new thread.
+                                    Some(machine) => {
+                                        this.new_thread(window, cx);
+                                        let dir = this.s().store.remote_dirs.get(&machine).cloned();
+                                        this.folders.update(cx, |folders, cx| folders.open(machine, dir, cx));
+                                        this.folders_open = true;
+                                        cx.notify();
+                                    }
+                                }))
+                                .app_tooltip(t("Open Folder (⌘O)"))
+                        )
+                }),
+        );
 
-        // ---- Conversations without a repository (not while one project is shown)
-        if filtered.is_none() && groups.get(&None).is_some_and(|entries| !entries.is_empty()) {
-            list = list.child(self.render_section_header(
-                SidebarSection::Recent,
-                icon_button("new-chat", IconName::SquarePen)
-                    .on_click(cx.listener(|this, _, window, cx| this.new_thread_in_project(None, window, cx)))
-                    .app_tooltip(t("New Chat"))
-                    .into_any_element(),
-                cx,
-            ));
-            if self.recent_expanded {
-                let entries = groups.get(&None).map(Vec::as_slice).unwrap_or(&[]);
-                if entries.is_empty() {
-                    list = list.child(
-                        div()
-                            .px(layout::SIDEBAR_ROW_INSET)
-                            .py_1()
-                            .text_size(TEXT)
-                            .text_color(theme.muted_foreground.opacity(0.7))
-                            .child(t("No chats yet")),
-                    );
-                }
-                list = push_entries(self, list, None, entries, false, cx);
+        if self.sidebar_tab == SidebarTab::Projects {
+            // Ordered, so equal timestamps never reshuffle from one frame to the next.
+            let mut groups: std::collections::BTreeMap<Option<PathBuf>, Vec<Entry>> = Default::default();
+            for thread in active_threads() {
+                groups.entry(thread.project.clone()).or_default().push(Entry::Thread(thread));
             }
+            for entries in groups.values_mut() {
+                entries.sort_by(|a, b| {
+                    let key = |e: &Entry| match e {
+                        Entry::Thread(t) => t.id.to_string(),
+                    };
+                    b.updated().cmp(&a.updated()).then_with(|| key(a).cmp(&key(b)))
+                });
+            }
+
+            // Projects, most recently active first.
+            // The workspace's own, and the folders its threads work in.
+            let mut projects: Vec<PathBuf> = self.s().store.workspaces.iter().find(|w| Some(&w.id) == self.workspace.as_ref()).map(|w| w.projects.clone()).unwrap_or_default();
+            for project in groups.keys().flatten() {
+                if !projects.contains(project) {
+                    projects.push(project.clone());
+                }
+            }
+            let activity = |p: &PathBuf| {
+                groups
+                    .get(&Some(p.clone()))
+                    .and_then(|entries| entries.first())
+                    .map(Entry::updated)
+                    .unwrap_or(0)
+            };
+            // By last activity, so opening a project never moves it. The path
+            // breaks ties: without it the list reorders on every hover.
+            projects.sort_by(|a, b| {
+                let rank = |p: &PathBuf| std::cmp::Reverse(activity(p).max(u64::from(self.s().store.projects.contains(p))));
+                if self.sort_repositories_by_name {
+                    a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b))
+                } else {
+                    rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+                }
+            });
+            if let Some(shown) = &filtered {
+                projects.retain(|p| p == shown);
+                if projects.is_empty() {
+                    projects.push(shown.clone());
+                }
+            }
+            let hidden_projects = if self.all_projects || filtered.is_some() {
+                0
+            } else {
+                projects.len().saturating_sub(5)
+            };
+            projects.truncate(projects.len() - hidden_projects);
+
+            if projects.is_empty() {
+                list = list.child(
+                    div()
+                        .px(layout::SIDEBAR_ROW_INSET)
+                        .py_1()
+                        .text_size(TEXT)
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .child(t("Open a folder to start a project")),
+                );
+            }
+            for project in &projects {
+                let key = Some(project.clone());
+                let entries: &[Entry] = groups.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+                let name: SharedString = project
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| project.display().to_string())
+                    .into();
+                let expanded = filtered.is_some() || self.expanded_projects.contains(project);
+                let current = self.project.as_ref() == Some(project);
+                let live = entries.iter().any(|e| match e {
+                    Entry::Thread(t) => self.s().running.contains(&t.id),
+                });
+                let count = entries.len();
+                let path = project.clone();
+                let new_thread_path = path.clone();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("project-{}", project.display())))
+                        .group("project")
+                        .mt(layout::SPACE_1)
+                        .h(layout::SIDEBAR_NAV_ROW)
+                        .flex_none()
+                        .pl(layout::SIDEBAR_ROW_INSET)
+                        .pr(layout::SPACE_2)
+                        .flex()
+                        .items_center()
+                        .gap(layout::SPACE_2)
+                        .rounded(layout::RADIUS)
+                        .cursor_pointer()
+                        .text_size(TEXT)
+                        .when(current && self.active.is_none(), |this| this.bg(theme.list_active))
+                        .hover(|this| this.bg(theme.list_hover))
+                        .child(ProjectAvatar {
+                            project: project.clone(),
+                            name: name.clone(),
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_color(theme.foreground)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name),
+                        )
+                        .when(live, |this| {
+                            this.child(div().flex_none().size(px(6.)).rounded_full().bg(theme.success))
+                        })
+                        .child(
+                            div()
+                                .relative()
+                                .size(layout::CONTROL)
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(count > 0 && !expanded, |this| {
+                                    this.child(
+                                        div().id("project-thread-count")
+                                            .text_color(theme.muted_foreground)
+                                            .group_hover("project", |this| this.invisible())
+                                            .child(count.to_string()),
+                                    )
+                                })
+                                .child(
+                                    div().id("project-new-thread")
+                                        .absolute().inset_0()
+                                        .invisible()
+                                        .group_hover("project", |this| this.visible())
+                                        .child(
+                                            icon_button("new-project-thread", IconName::SquarePen)
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.new_thread_in_project(Some(new_thread_path.clone()), window, cx);
+                                                }))
+                                                .app_tooltip(t("New Thread")),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                .size(ICON)
+                                .flex_none()
+                                .text_color(theme.muted_foreground.opacity(0.7)),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.expanded_projects.insert(path.clone()) {
+                                this.expanded_projects.remove(&path);
+                            }
+                            cx.notify();
+                        })),
+                );
+                if expanded {
+                    list = push_entries(self, list, key, entries, true, cx);
+                }
+            }
+            if hidden_projects > 0 {
+                list = list.child(
+                    div()
+                        .id("show-more-projects")
+                        .h(layout::SIDEBAR_ROW)
+                        .flex_none()
+                        .px(layout::SIDEBAR_ROW_INSET)
+                        .flex()
+                        .items_center()
+                        .text_size(TEXT)
+                        .text_color(theme.muted_foreground)
+                        .cursor_pointer()
+                        .hover(|this| this.text_color(theme.foreground))
+                        .child(tf("More projects ({n})", &[("n", hidden_projects.to_string())]))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.all_projects = true;
+                            cx.notify();
+                        })),
+                );
+            }
+        } else {
+            let mut entries: Vec<_> = active_threads().map(Entry::Thread).collect();
+            entries.sort_by_key(|entry| match entry {
+                Entry::Thread(thread) => (std::cmp::Reverse(thread.updated_at), thread.id),
+            });
+            if entries.is_empty() {
+                list = list.child(
+                    div()
+                        .px(layout::SIDEBAR_ROW_INSET)
+                        .py_1()
+                        .text_size(TEXT)
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .child(t("No chats yet")),
+                );
+            }
+            list = push_entries(self, list, None, &entries, false, cx);
         }
 
         // ---- Archived threads: out of the lists above, kept until deleted.
@@ -2461,12 +2454,31 @@ impl AgentPanel {
                 .collect();
         if !archived.is_empty() {
             archived.sort_by(|a, b| b.updated().cmp(&a.updated()));
-            let count = div()
-                .text_size(TEXT)
-                .text_color(theme.muted_foreground.opacity(0.7))
-                .child(archived.len().to_string())
-                .into_any_element();
-            list = list.child(self.render_section_header(SidebarSection::Archived, count, cx));
+            list = list.child(
+                div()
+                    .id("archived")
+                    .mt(layout::SPACE_4)
+                    .mb(layout::SPACE_2)
+                    .h(layout::SIDEBAR_ROW)
+                    .flex_none()
+                    .px(layout::SIDEBAR_ROW_INSET)
+                    .flex()
+                    .items_center()
+                    .gap(layout::SPACE_1)
+                    .text_size(TEXT)
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .child(t("Archived"))
+                    .when(!self.archived_expanded, |this| {
+                        this.child(Icon::new(IconName::ChevronRight).size(ICON))
+                    })
+                    .child(div().flex_1())
+                    .child(archived.len().to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.archived_expanded = !this.archived_expanded;
+                        cx.notify();
+                    })),
+            );
             if self.archived_expanded {
                 list = push_entries(self, list, Some(PathBuf::from("archived:")), &archived, false, cx);
             }
@@ -2810,7 +2822,14 @@ impl AgentPanel {
                     .min_w_0()
                     .text_size(TEXT)
                     .line_height(relative(1.6))
-                    .child(crate::style::markdown(("msg", ix), text.into_owned(), cx).selectable(true))
+                    .child(
+                        crate::style::markdown(
+                            ("msg", ix),
+                            normalize_message_bold(&text).into_owned(),
+                            cx,
+                        )
+                        .selectable(true),
+                    )
                     .into_any_element()
             }
             ChatItem::Thinking(text) => {
@@ -4362,6 +4381,23 @@ mod group_tests {
     use super::{Block, group_items, split_turns, summarize_group, tool_line, worked_for};
     use crate::threads::{ChatItem, ToolStatus};
 
+    #[test]
+    fn message_bold_before_chinese_prose() {
+        use super::normalize_message_bold;
+
+        let source = "- **已暂停：**每天检查\n- **周一 09:00 可能有两个任务：**10 月 26 日创建";
+        let expected = "- **已暂停：** 每天检查\n- **周一 09:00 可能有两个任务：** 10 月 26 日创建";
+        assert_eq!(normalize_message_bold(source), expected);
+        for source in [
+            "`**已暂停：**每天`",
+            "```text\n**已暂停：**每天\n```",
+            r"\**已暂停：**每天",
+            "**已暂停：** 每天",
+        ] {
+            assert_eq!(normalize_message_bold(source), source);
+        }
+    }
+
     fn tool(title: &str, status: ToolStatus) -> ChatItem {
         ChatItem::Tool {
             id: "c".into(),
@@ -4495,6 +4531,61 @@ fn without_control_lines(text: &str) -> std::borrow::Cow<'_, str> {
         return text.into();
     }
     text.lines().filter(|line| !is_control(line)).collect::<Vec<_>>().join("\n").into()
+}
+
+/// Let the Markdown parser close bold after a colon when Chinese prose
+/// or a number immediately follows. Only repair literal markers.
+fn normalize_message_bold(text: &str) -> std::borrow::Cow<'_, str> {
+    use markdown::{ParseOptions, mdast::Node, to_mdast};
+    use std::sync::LazyLock;
+
+    static BOLD: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\*\*[^\s*\\][^*\\\r\n]*[:：]\*\*([\p{Han}0-9])").unwrap()
+    });
+
+    fn collect_insertions(node: &Node, text: &str, insertions: &mut Vec<usize>) {
+        if let Node::Text(node) = node {
+            let Some(position) = &node.position else {
+                return;
+            };
+            let start = position.start.offset;
+            let source = &text[start..position.end.offset];
+            for captures in BOLD.captures_iter(source) {
+                let opening = start + captures.get(0).unwrap().start();
+                let preceding = &text[..opening];
+                let backslashes = preceding.bytes().rev().take_while(|&byte| byte == b'\\').count();
+                if !preceding.ends_with('*') && backslashes % 2 == 0 {
+                    insertions.push(start + captures.get(1).unwrap().start());
+                }
+            }
+        } else if let Some(children) = node.children() {
+            for child in children {
+                collect_insertions(child, text, insertions);
+            }
+        }
+    }
+
+    if !BOLD.is_match(text) {
+        return text.into();
+    }
+    let Ok(root) = to_mdast(text, &ParseOptions::gfm()) else {
+        return text.into();
+    };
+    let mut insertions = Vec::new();
+    collect_insertions(&root, text, &mut insertions);
+    if insertions.is_empty() {
+        return text.into();
+    }
+
+    let mut normalized = String::with_capacity(text.len() + insertions.len());
+    let mut start = 0;
+    for end in insertions {
+        normalized.push_str(&text[start..end]);
+        normalized.push(' ');
+        start = end;
+    }
+    normalized.push_str(&text[start..]);
+    normalized.into()
 }
 
 fn render_working(cx: &App) -> AnyElement {
