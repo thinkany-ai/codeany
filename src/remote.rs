@@ -91,12 +91,16 @@ struct State {
     account: Option<Account>,
     host: HostStatus,
     host_cancel: Option<CancellationToken>,
+    /// The task holding (or that last held) the relay connection. The next
+    /// one waits for it to end, so two never go online at once.
+    host_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     account: None,
     host: HostStatus::Off,
     host_cancel: None,
+    host_task: None,
 });
 
 fn path() -> PathBuf {
@@ -403,6 +407,13 @@ async fn services() -> Result<Vec<ExposedService>> {
     Ok(out)
 }
 
+/// The relay lets one connection per device stay online and closes the
+/// older one with this. `nex` reports it as final.
+const REPLACED: &str = "another process went online with this device's credential";
+/// How long to wait before going online again after being replaced. Past
+/// these, another process really is using this device's credential.
+const REPLACED_RETRIES: [Duration; 3] = [Duration::from_secs(2), Duration::from_secs(8), Duration::from_secs(30)];
+
 fn start_host() {
     stop_host();
     let client = match client() {
@@ -413,27 +424,53 @@ fn start_host() {
         }
     };
     let cancel = CancellationToken::new();
-    {
-        let mut state = STATE.lock().unwrap();
-        state.host = HostStatus::On;
-        state.host_cancel = Some(cancel.clone());
-    }
-    agl_bridge::runtime().spawn(async move {
-        let result = async {
-            let services = services().await?;
-            Host::new(client, services).run(cancel.clone()).await
+    let mut state = STATE.lock().unwrap();
+    state.host = HostStatus::On;
+    state.host_cancel = Some(cancel.clone());
+    let previous = state.host_task.take();
+    state.host_task = Some(agl_bridge::runtime().spawn(async move {
+        // A connection that is being stopped must be gone first: were it to
+        // reach the relay after this one, the relay would keep it and close
+        // this one as replaced, and then it would hang up, leaving no one.
+        if let Some(previous) = previous {
+            let _ = previous.await;
         }
-        .await;
-        if let Err(err) = result {
+        let mut replaced = 0;
+        loop {
+            let started = Instant::now();
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return,
+                result = async {
+                    let services = services().await?;
+                    Host::new(client.clone(), services).run(cancel.clone()).await
+                } => result,
+            };
+            let Err(err) = result else { return };
+            if cancel.is_cancelled() {
+                return;
+            }
             let message = format!("{err:#}");
             eprintln!("codeany: the relay connection stopped: {message}");
+            if message.contains(REPLACED) {
+                if started.elapsed() > Duration::from_secs(120) {
+                    replaced = 0;
+                }
+                if let Some(wait) = REPLACED_RETRIES.get(replaced) {
+                    replaced += 1;
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(*wait) => continue,
+                    }
+                }
+            }
             let mut state = STATE.lock().unwrap();
             if !cancel.is_cancelled() {
                 state.host = HostStatus::Failed(message);
                 state.host_cancel = None;
             }
+            return;
         }
-    });
+    }));
 }
 
 // ---- Devices --------------------------------------------------------------
