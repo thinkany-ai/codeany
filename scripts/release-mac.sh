@@ -10,7 +10,9 @@ CDN=https://cdn.codeany.ai
 BUCKET=codeany-desktop
 SPARKLE_VERSION=2.10.1
 SPARKLE_SHA=1a856d2a9edb8e628de88121d7be04cf0e2167f8641650b78fca00b14244cf27
-SDK="$PWD/target/sparkle-sdk/$SPARKLE_VERSION"
+# Cargo's CI cache may restore only part of the SDK under target/.
+SDK_ROOT="${RUNNER_TEMP:-$PWD/target}/sparkle-sdk"
+SDK="$SDK_ROOT/$SPARKLE_VERSION"
 RELEASES="$PWD/target/distribution"
 VERSION=$(cargo pkgid --locked | sed 's/.*[#@]//')
 DIST="$RELEASES/$VERSION"
@@ -21,7 +23,7 @@ fail() { echo "release: $*" >&2; exit 1; }
 
 fetch_sparkle() {
     local download
-    download=$(mktemp -d "$PWD/target/sparkle-sdk/.download.XXXXXX")
+    download=$(mktemp -d "$SDK_ROOT/.download.XXXXXX")
     (
         trap 'rm -rf "$download"' EXIT
         curl -fsSL --retry 3 \
